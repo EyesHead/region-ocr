@@ -53,7 +53,7 @@ LOCAL_SCHEMA = 6
 TEXT_CLEANUP_SCHEMA = 6
 TABLE_RECOVERY_SCHEMA = 21
 TABLE_JOIN_SCHEMA = 14
-TABLE_CELL_SCHEMA = 36
+TABLE_CELL_SCHEMA = 37
 # Whole source-image fallbacks retain one actual rendered pixel beyond owned
 # glyph extents; this is geometry only and never supplies editable PDF text.
 SOURCE_IMAGE_BOUNDS_HALO_PIXELS = 1
@@ -4663,7 +4663,14 @@ class NativeTableReader:
                 if (not source_text_unreliable and not override and not graphic
                         and (y < header_rows or c['column'] not in graphic_columns | dimension_columns)):
                     from docling_pdf_text_cells import positioned_text_proof
-                    proof=positioned_text_proof(content,c['glyphs'],mask,region,c['bbox'],1/sx,1/sy)
+                    if not source_grid_ink_checked:
+                        from docling_pdf_table_layout import grid_ink
+                        source_grid_ink=grid_ink(source_image,region,xs)
+                        source_grid_ink_checked=True
+                    # Measured table rules and their fringe are not text ink.
+                    # Use the same original-table mask as empty-cell detection.
+                    text_ink=source_grid_ink['nongrid'] if source_grid_ink is not None else mask
+                    proof=positioned_text_proof(content,c['glyphs'],text_ink,region,c['bbox'],1/sx,1/sy)
                     if proof:c['positioned_source_text']=proof
                 node.append(BeautifulSoup(content,'html.parser'));row.append(node)
         fragment=clean_table_html(str(soup.table));profile=table_profile(fragment,len(xs)-1)
@@ -8947,26 +8954,41 @@ def export_local_html(args, result, normalized, orientation, source):
                               column_header=cell["header"]) for cell in profile["cells"]
                 ])
             else:
-                method = "source_image"
-                actual_source_image_bbox = list(bbox)
-                if getattr(args, 'pdf_source_image_bounds', True) and not primary_region_guard:
-                    if native_reader is None:
-                        try:
-                            native_reader = NativeTableReader(normalized)
-                        except (OSError, ValueError, RuntimeError):
-                            pass
-                    image, actual_source_image_bbox = _source_image_bounds_crop(image, bbox,
-                        page_no, item.self_ref, doc, native_reader, regions, manifest)
-                content = image_html(image, actual_source_image_bbox[2] - actual_source_image_bbox[0], "table")
-                profile = chosen[3] if chosen else {"issues": [primary_region_guard['reason'] if primary_region_guard else
-                                                       'source_cell_ownership_not_proven' if source_cell_fallback else 'no_candidate'],
-                                                   "columns": 0, "rows": 0, "text": ""}
-                # Never persist rejected cell contents as the repaired table data.
-                item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
-                diagnostic_event('TABLE_SOURCE_IMAGE_FALLBACK', page_no=page_no, ref=item.self_ref, bbox=bbox,
-                                 selected_method=chosen[1] if chosen else None, issues=profile.get('issues',[]),
-                                 numeric_conflict=conflict, retry_stop_reason=retry_stop_reason,
-                                 attempted_reads=len(candidates), crop_width=image.width, crop_height=image.height)
+                text_region = None
+                if (args.primary_ocr_only and not chosen and native is None and not source_graphics
+                        and not primary_region_guard and not source_cell_fallback and not conflict
+                        and pdf_repair_enabled(args, 'boundaries')):
+                    from docling_pdf_primary_text_region import recover_primary_text_region
+                    text_region = recover_primary_text_region(image, bbox, records, page_no, sys.modules[__name__])
+                if text_region is not None:
+                    content, text_proof = text_region
+                    method = 'primary_text_region'
+                    profile = dict(issues=[], columns=0, rows=0, text=semantic_ocr_text(content))
+                    item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
+                    text_proof['ref'] = item.self_ref
+                    manifest.setdefault('primary_text_regions', []).append(text_proof)
+                    diagnostic_event('PRIMARY_TEXT_REGION_RESTORED', **text_proof)
+                else:
+                    method = "source_image"
+                    actual_source_image_bbox = list(bbox)
+                    if getattr(args, 'pdf_source_image_bounds', True) and not primary_region_guard:
+                        if native_reader is None:
+                            try:
+                                native_reader = NativeTableReader(normalized)
+                            except (OSError, ValueError, RuntimeError):
+                                pass
+                        image, actual_source_image_bbox = _source_image_bounds_crop(image, bbox,
+                            page_no, item.self_ref, doc, native_reader, regions, manifest)
+                    content = image_html(image, actual_source_image_bbox[2] - actual_source_image_bbox[0], "table")
+                    profile = chosen[3] if chosen else {"issues": [primary_region_guard['reason'] if primary_region_guard else
+                                                           'source_cell_ownership_not_proven' if source_cell_fallback else 'no_candidate'],
+                                                       "columns": 0, "rows": 0, "text": ""}
+                    # Never persist rejected cell contents as the repaired table data.
+                    item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
+                    diagnostic_event('TABLE_SOURCE_IMAGE_FALLBACK', page_no=page_no, ref=item.self_ref, bbox=bbox,
+                                     selected_method=chosen[1] if chosen else None, issues=profile.get('issues',[]),
+                                     numeric_conflict=conflict, retry_stop_reason=retry_stop_reason,
+                                     attempted_reads=len(candidates), crop_width=image.width, crop_height=image.height)
             diagnostic_event('TABLE_CHOSEN', phase='final', page_no=page_no, ref=item.self_ref, method=method,
                              rows=profile.get('rows'), columns=profile.get('columns'), score=profile.get('score'),
                              issues=profile.get('issues',[]), warnings=profile.get('warnings',[]), numeric_conflict=conflict,

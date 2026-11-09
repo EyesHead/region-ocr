@@ -45,7 +45,7 @@ class Installer:
         self.completed = 0
         self.total = sum(p['bytes'] for p in plan['packages'] + plan['desktop_packages']
                          + plan['torch'][profile] + plan['models'])
-        self.total += plan['pip']['bytes'] + plan['tcltk']['bytes'] + plan['native'][profile]['bytes']
+        self.total += plan['pip']['bytes'] + plan['native'][profile]['bytes']
 
     def report(self, message, current=0):
         progress = min(95, 8 + int(87 * (self.completed + current) / max(1, self.total)))
@@ -59,7 +59,7 @@ class Installer:
                 digest = hashlib.sha256()
                 count = 0
                 tick = 0.0
-                req = urllib.request.Request(item['url'], headers={'User-Agent': 'REGION-OCR-Setup/1.8.1'})
+                req = urllib.request.Request(item['url'], headers={'User-Agent': 'REGION-OCR-Setup/1.8.2'})
                 with urllib.request.urlopen(req, timeout=90) as response, target.open('wb') as output:
                     while block := response.read(1024 * 1024):
                         output.write(block)
@@ -138,9 +138,6 @@ class Installer:
                 else:
                     self.pip(archive, target=self.vendor)
                 archive.unlink()
-            tk = self.download(self.plan['tcltk'])
-            extract_zip(tk, self.root)
-            tk.unlink()
             native = self.download(self.plan['native'][self.profile])
             extract_zip(native, self.root / '.runtime/llamacpp')
             native.unlink()
@@ -162,7 +159,6 @@ class Installer:
                 "import sys; from pathlib import Path; import portable_runtime; portable_runtime.configure_runtime(); "
                 "import torch,docling,numpy,PIL,pypdfium2,onnxruntime; "
                 "from local_web.desktop import prepare_runtime; prepare_runtime(); import webview; "
-                "import tkinter; t=tkinter.Tcl(); assert t.eval('info patchlevel'); "
                 "from huggingface_hub import snapshot_download; "
                 "assert Path(snapshot_download('docling-project/docling-layout-heron',local_files_only=True)).is_dir(); "
                 "assert Path(snapshot_download('docling-project/docling-models',revision='v2.3.0',local_files_only=True)).is_dir(); "

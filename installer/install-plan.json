@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "version": "1.8.1",
+  "version": "1.8.2",
   "python_version": "3.12.10",
   "python": {
     "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
@@ -1205,11 +1205,5 @@
       "bytes": 272317752,
       "sha256": "c7857c6b20284d40e648486bcc7f342bbbc6dfcd603cc5d27bbcd9ecc3bb66d6"
     }
-  },
-  "tcltk": {
-    "url": "https://github.com/EyesHead/region-ocr/releases/download/v1.8.1/REGION-OCR-TclTk-8.6.15.zip",
-    "filename": "REGION-OCR-TclTk-8.6.15.zip",
-    "bytes": 4034068,
-    "sha256": "10c5db951d283e492a3769297615d3205fceadc88aa08feaaeda432b9d21755a"
   }
 }

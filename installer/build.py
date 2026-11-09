@@ -8,13 +8,12 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-import urllib.request
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VERSION = '1.8.1'
+VERSION = '1.8.2'
 
 
 def build(output):
@@ -30,7 +29,8 @@ def build(output):
     files.update(f for f in HERE.rglob('*') if f.is_file() and '__pycache__' not in f.parts
                  and f.name != 'environment-snapshot.json')
     files.add(ROOT / 'DocumentConverter.exe')
-    files = {f for f in files if f.suffix != '.pyc' and f.name != 'environment-snapshot.json'}
+    files = {f for f in files if f.suffix != '.pyc' and f.name != 'environment-snapshot.json'
+             and f.relative_to(ROOT).parts[0] not in {'regression', 'tests', 'docs'}}
     compiler = Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
     if not compiler.is_file():
         raise FileNotFoundError('The system .NET Framework C# compiler was not found')
@@ -54,7 +54,7 @@ def build(output):
         (work / 'app.config').write_text(config, encoding='utf-8')
         (work / 'installer.manifest').write_text('''<?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.8.1.0" name="EyesHead.RegionOCR.Setup"/>
+  <assemblyIdentity version="1.8.2.0" name="EyesHead.RegionOCR.Setup"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
   </requestedPrivileges></security></trustInfo>
@@ -80,12 +80,7 @@ def build(output):
         subprocess.run([str(exe), '--verify', str(report)], check=True, timeout=30)
         verified = json.loads(report.read_text('utf-8'))
         print('Embedded payload verified:', verified)
-    assets = [exe, output / plan['tcltk']['filename']]
-    if not assets[1].is_file():
-        with urllib.request.urlopen(plan['tcltk']['url'], timeout=60) as response:
-            assets[1].write_bytes(response.read())
-    if not assets[1].is_file() or hashlib.sha256(assets[1].read_bytes()).hexdigest() != plan['tcltk']['sha256']:
-        raise ValueError('Place the pinned Tcl/Tk component beside the installer before publication')
+    assets = [exe]
     sums = ''.join(hashlib.sha256(file.read_bytes()).hexdigest() + '  ' + file.name + '\n' for file in assets)
     (output / 'SHA256SUMS').write_text(sums, encoding='ascii')
     print('Installer:', exe, exe.stat().st_size, 'bytes')

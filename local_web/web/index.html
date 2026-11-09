@@ -9,7 +9,6 @@
   <link rel="stylesheet" href="/app.css">
   <link rel="stylesheet" href="/workspace.css">
   <script src="/app.js" defer></script>
-  <script src="/review.js" defer></script>
 </head>
 <body>
   <header class="brand-header">
@@ -104,24 +103,6 @@
     <p id="duplicate-message"></p>
     <p id="duplicate-details" class="duplicate-details"></p>
     <div class="duplicate-actions"><button type="button" class="button button-outline" id="duplicate-cancel">Отмена</button><button type="button" class="button button-danger" id="duplicate-replace">Заменить</button><button type="button" class="button button-primary" id="duplicate-reuse" autofocus>Использовать прежний</button></div>
-  </dialog>
-  <dialog id="review-dialog" class="review-dialog" aria-labelledby="review-title" aria-describedby="review-file">
-    <header class="review-header"><div><h2 id="review-title">Проверка расхождений</h2><p id="review-file"></p></div><button type="button" id="review-close" class="icon-button" aria-label="Закрыть проверку расхождений">×</button></header>
-    <p class="review-intro">Проверка по желанию. Отметьте найденные ошибки — их можно отправить разработчику одной жалобой. Результат доступен для просмотра и скачивания в любое время.</p>
-    <div id="review-loading" class="review-message" role="status">Загрузка фрагментов…</div>
-    <div id="review-workflow" hidden>
-      <div class="review-navigation"><div><strong id="review-position" tabindex="-1"></strong><span id="review-pages"></span></div><div class="review-navigation-actions"><button type="button" class="button button-outline" id="review-prev" aria-label="Предыдущий фрагмент">Назад</button><button type="button" class="button button-outline" id="review-next" aria-label="Следующий фрагмент">Далее</button><button type="button" class="text-button" id="review-summary-button">Итоги</button></div></div>
-      <div class="review-progress"><span id="review-progress-label" role="status" aria-live="polite"></span><progress id="review-progress" max="1" value="0" aria-label="Просмотренные фрагменты"></progress></div>
-      <div class="review-mobile-tabs" role="group" aria-label="Представление фрагмента"><button type="button" class="selected" id="review-tab-original" aria-pressed="true">Оригинал</button><button type="button" id="review-tab-result" aria-pressed="false">Результат</button></div>
-      <div id="review-comparison" class="review-comparison" data-mobile-view="original">
-        <section class="review-pane review-original-pane" aria-labelledby="review-original-label"><div class="review-pane-title"><h3 id="review-original-label">Оригинал</h3><span>Снимок из PDF</span></div><div class="review-source-window" id="review-source-images"></div><p class="review-missing" id="review-source-missing" hidden>Снимок этого фрагмента недоступен. Можно открыть исходный документ.</p><button type="button" class="text-button" id="review-open-original" hidden>Открыть оригинал</button></section>
-        <section class="review-pane review-result-pane" aria-labelledby="review-result-label"><div class="review-pane-title"><h3 id="review-result-label">Результат</h3><span id="review-result-scope">HTML</span></div><p id="review-result-notice" class="review-scope-note" hidden></p><iframe id="review-result-frame" title="Результат конвертации выбранного фрагмента" sandbox="" referrerpolicy="no-referrer"></iframe><p class="review-missing" id="review-result-missing" hidden>Представление этого фрагмента недоступно. Вы можете сообщить об ошибке в документе.</p></section>
-      </div>
-      <div class="review-decision"><p id="review-current-decision">Выберите решение для этого фрагмента</p><div><button type="button" class="button review-error-button" id="review-mark-error">Есть ошибка</button><button type="button" class="button review-correct-button" id="review-mark-correct">Всё верно</button></div></div>
-    </div>
-    <section class="review-summary" id="review-summary" hidden aria-labelledby="review-summary-title"><h3 id="review-summary-title" tabindex="-1">Итоги просмотра</h3><p id="review-summary-text"></p><p class="review-summary-note">Ваши отметки сохраняются. Они не изменяют документ и не мешают его скачать.</p><div class="review-summary-actions"><button type="button" class="button button-outline" id="review-return">К фрагментам</button><button type="button" class="button button-primary" id="review-complaint-button">Отправить жалобу</button><button type="button" class="text-button" id="review-keep">Оставить как есть</button></div></section>
-    <form class="review-complaint" id="review-complaint" hidden><h3>Сообщить об ошибке</h3><p id="review-complaint-context"></p><label for="review-comment">Комментарий <span>Необязательно</span></label><textarea id="review-comment" rows="3" maxlength="3000" placeholder="Что отличается от оригинала?"></textarea><p class="review-recipient"><strong>Разработчику в Telegram</strong></p><p class="review-attachments">Приложение автоматически приложит исходный PDF, HTML результата с отмеченными фрагментами и полный журнал конвертации в TXT. Если обработка не создала один из файлов, в отчёт попадут доступные материалы.</p><div class="review-complaint-actions"><button type="button" class="button button-outline" id="review-complaint-cancel">Отмена</button><button type="submit" class="button button-primary" id="review-send">Отправить жалобу</button></div></form>
-    <p class="review-feedback" id="review-feedback" role="status" aria-live="polite" hidden></p>
   </dialog>
 </body>
 </html>

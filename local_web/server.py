@@ -31,17 +31,13 @@ if __package__:
     from .file_paths import native_path, normal_path
     from .saved_results import SavedResults
     from .conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
-    from . import discrepancies
-    from .reporting import ReportOutbox
 else:
     from file_paths import native_path, normal_path
     from saved_results import SavedResults
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
-    import discrepancies
-    from reporting import ReportOutbox
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -118,16 +114,10 @@ class JobStore:
         self.engine = {"available": False, "message": "Проверка окружения…"}
         self.engine_host = None
         self.engine_probe_done = threading.Event()
-        self.reports = ReportOutbox(self.root / 'reports')
-        self.report_wakeup = threading.Event()
         self._load()
         self._backfill_saved_html()
         self.worker = threading.Thread(target=self._work, name="conversion-queue", daemon=True)
         self.worker.start()
-        self.report_worker = None
-        if converter is None:
-            self.report_worker = threading.Thread(target=self._deliver_reports, name='report-delivery', daemon=True)
-            self.report_worker.start()
         if converter is None:
             threading.Thread(target=self._probe_engine, daemon=True).start()
         else:
@@ -218,7 +208,7 @@ class JobStore:
                     and job['id'] not in self.scheduled and Path(job['name']).suffix.lower() == '.pdf'
                     and type(job.get('source_page_count')) is int and job['source_page_count'] > 0)
         result = {key: value for key, value in job.items()
-                  if key not in {"source", "source_pdf", "artifacts", "packages", "replay_html", "attempt_id"}
+                  if key not in {"source", "source_pdf", "artifacts", "packages", "replay_html", "attempt_id", "review_count", "reviewed_count", "review_error_count"}
                   and not key.startswith(('_', 'technical_'))}
         result['warnings'] = [text for text in result.get('warnings', [])
                               if 'Движок пометил результат для визуальной проверки таблиц' not in str(text)]
@@ -228,167 +218,6 @@ class JobStore:
             # queue releases it, otherwise an immediate export gets skipped.
             result.update(status='running', progress=99, stage='Завершение обработки')
         return result | {"artifacts": list(job.get("artifacts", {})), 'pages_editable': editable}
-
-    @staticmethod
-    def _review_error(error):
-        if isinstance(error, KeyError):
-            raise APIError('Фрагмент для сравнения не найден.', 404) from None
-        if isinstance(error, FileNotFoundError):
-            raise APIError('Не удалось найти исходник или результат для сравнения.', 404) from None
-        if isinstance(error, ValueError):
-            raise APIError('Список фрагментов изменился. Откройте сравнение заново.', 409) from None
-        LOG.warning('Discrepancy review unavailable: %s', type(error).__name__)
-        raise APIError('Не удалось подготовить сравнение. Повторите попытку.', 409) from None
-
-    def review(self, ident):
-        with self.lock:
-            job = copy.deepcopy(self._get(ident))
-            self._owned_job_folder(ident)
-            if job.get('status') != 'done' or job.get('legacy_export'):
-                raise APIError('Сравнение доступно после завершения обработки.', 409)
-        try:
-            result = discrepancies.get_review(self.root / ident, job)
-        except (KeyError, ValueError, OSError) as error:
-            return self._review_error(error)
-        with self.lock:
-            current = self._get(ident)
-            if current.get('attempt_id') != job.get('attempt_id') or current.get('status') != 'done':
-                raise APIError('Документ обрабатывается заново. Откройте сравнение после завершения.', 409)
-            self._cache_review_counts(current, result)
-        return result
-
-    @staticmethod
-    def _cache_review_counts(job, review):
-        job.update(review_count=review.get('total', len(review.get('items', []))),
-                   reviewed_count=review.get('reviewed_count', 0),
-                   review_error_count=review.get('error_count', 0))
-
-    def review_decision(self, ident, data):
-        if data.get('decision') not in {'error', 'correct'}:
-            raise APIError('Выберите «Есть ошибка» или «Всё верно».')
-        if not isinstance(data.get('revision'), str) or not isinstance(data.get('item_id'), str):
-            raise APIError('Не выбран фрагмент сравнения.')
-        comment = data.get('comment', '')
-        if not isinstance(comment, str) or len(comment) > 3000:
-            raise APIError('Комментарий должен содержать не более 3000 символов.')
-        with self.lock:
-            job = self._get(ident)
-            self._owned_job_folder(ident)
-            if job.get('status') != 'done':
-                raise APIError('Документ ещё обрабатывается.', 409)
-            try:
-                review = discrepancies.set_decision(self.root / ident, copy.deepcopy(job),
-                    data['item_id'], data['decision'], data['revision'], comment=comment)
-            except (KeyError, ValueError, OSError) as error:
-                return self._review_error(error)
-            self._cache_review_counts(job, review)
-            self._save()
-        return review
-
-    def review_resource(self, ident, item_id, revision, *, region=None):
-        with self.lock:
-            job = copy.deepcopy(self._get(ident))
-            self._owned_job_folder(ident)
-            if job.get('status') != 'done':
-                raise APIError('Сравнение доступно после завершения обработки.', 409)
-        if not isinstance(revision, str) or not revision:
-            raise APIError('Обновите список фрагментов сравнения.', 409)
-        try:
-            if region is not None:
-                return discrepancies.source_image(self.root / ident, job, item_id, region, revision)
-            document = discrepancies.result_html(self.root / ident, job, item_id, revision)
-        except (KeyError, ValueError, OSError) as error:
-            return self._review_error(error)
-        # Preview HTML has no executable content; images remain on the owned
-        # application asset endpoint, even when the table contains cell figures.
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(document, 'html.parser')
-        for image in soup.find_all('img'):
-            value = str(image.get('src', ''))
-            if value.startswith('src/') and re.fullmatch(r'[A-Za-z0-9._-]+', value[4:]):
-                image['src'] = f'/api/assets/{ident}/{quote(value[4:])}'
-            elif value and not re.fullmatch(r'/api/assets/' + re.escape(ident) + r'/[A-Za-z0-9._-]+', value):
-                image.attrs.pop('src', None)
-        return str(soup)
-
-    def complain(self, ident, data):
-        comment = data.get('comment', '')
-        key = data.get('idempotency_key')
-        if not isinstance(comment, str) or len(comment) > 3000:
-            raise APIError('Комментарий должен содержать не более 3000 символов.')
-        if key is not None and (not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', key)):
-            raise APIError('Некорректный идентификатор жалобы.')
-        if any(key in data for key in ('recipient', 'to', 'chat_id', 'bot_token', 'message_thread_id', 'telegram_settings', 'transport')):
-            raise APIError('Чат Telegram для отчётов задаётся владельцем приложения.')
-        with self.lock:
-            job = copy.deepcopy(self._get(ident))
-            self._owned_job_folder(ident)
-            if job.get('status') != 'done':
-                raise APIError('Жалоба на результат доступна после обработки документа.', 409)
-            job['application_version'] = VERSION
-            try:
-                context = discrepancies.report_context(self.root / ident, job, revision=data.get('revision'))
-                report = self.reports.enqueue(job, self.root / ident, 'user_complaint',
-                    review_context=context, comment=comment, idempotency_key=key)
-            except (KeyError, ValueError, OSError) as error:
-                return self._review_error(error)
-        self.report_wakeup.set()
-        return {'report': report}
-
-    def report_status(self, ident):
-        try:
-            return self.reports.get(ident)
-        except (KeyError, ValueError, FileNotFoundError):
-            raise APIError('Отчёт не найден.', 404) from None
-
-    def _deliver_reports(self):
-        while not self.stopping.is_set():
-            try:
-                self.reports.send_pending()
-            except Exception:
-                # Delivery failures stay in the outbox; neither credentials nor
-                # Telegram responses are copied into user-facing conversion messages.
-                LOG.warning('Report delivery deferred; see owner Telegram configuration.')
-            self.report_wakeup.wait(15)
-            self.report_wakeup.clear()
-
-    def _prepare_report(self, ident, *, export_only=False):
-        with self.lock:
-            job = copy.deepcopy(self._get(ident))
-        job['application_version'] = VERSION
-        if job.get('status') not in {'done', 'error'}:
-            return
-        try:
-            context = {}
-            review = {'total': 0, 'reviewed_count': 0, 'error_count': 0}
-            if job['status'] == 'done':
-                try:
-                    review = discrepancies.review_summary(self.root / ident, job)
-                    context = discrepancies.report_context(self.root / ident, job)
-                except Exception as error:
-                    # Diagnostics must not suppress a report about diagnostics.
-                    job['technical_review_error'] = type(error).__name__
-                    context = {'discovery_error': type(error).__name__}
-                    append_job_log(self.root / ident, 'Не удалось подготовить сравнение: ' + type(error).__name__)
-            with self.lock:
-                current = self.jobs.get(ident)
-                if current is not None:
-                    self._cache_review_counts(current, review)
-            trigger = ('automatic_error' if job['status'] == 'error' else
-                       'automatic_quality' if review.get('total', 0) or job.get('technical_status') == 'REVIEW' or job.get('technical_review_error') else None)
-            if trigger and not export_only:
-                if job['status'] == 'error':
-                    job.update(replay_html=None, artifacts={}, packages={})
-                report = self.reports.enqueue(job, self.root / ident, trigger, review_context=context)
-                with self.lock:
-                    if ident in self.jobs:
-                        self.jobs[ident]['technical_report_id'] = report['id']
-                self.report_wakeup.set()
-        except Exception:
-            LOG.exception('Cannot prepare technical report for %s', ident)
-            with self.lock:
-                if ident in self.jobs:
-                    self.jobs[ident]['technical_report_state'] = 'preparation_failed'
 
     def snapshot(self):
         with self.lock:
@@ -637,8 +466,7 @@ class JobStore:
                     continue
                 selected_pages = chosen_pages[ident]
                 if not export_only:
-                    job.update(attempt_id=uuid.uuid4().hex, review_count=0,
-                               reviewed_count=0, review_error_count=0,
+                    job.update(attempt_id=uuid.uuid4().hex,
                                artifacts={}, packages={}, replay_html=None, stats={}, warnings=[])
                     job.pop('completed_at', None)
                     job.pop('export_schema', None)
@@ -912,9 +740,6 @@ class JobStore:
                         job.update(status="error", stage="Ошибка обработки", error=str(exc)[:2000])
                         append_job_log(self.root / ident, 'ОШИБКА: ' + traceback.format_exc())
             finally:
-                # Preserve a self-contained diagnostic package before allowing
-                # deletion/reprocessing. Telegram delivery runs in its worker.
-                self._prepare_report(ident, export_only=bool(job.get('_replay')))
                 with self.lock:
                     self.scheduled.discard(ident)
                     try:
@@ -925,7 +750,6 @@ class JobStore:
 
     def stop(self):
         self.stopping.set()
-        self.report_wakeup.set()
         with self.lock:
             for event in self.events.values():
                 event.set()
@@ -935,8 +759,6 @@ class JobStore:
                     append_job_log(self.root / job['id'], 'Задание отменено при завершении приложения.')
             self._save()
         self.worker.join(timeout=15)
-        if self.report_worker is not None:
-            self.report_worker.join(timeout=2)
         if self.engine_host is not None:
             self.engine_host.close()
 
@@ -1034,22 +856,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(store.snapshot())
             if path == '/api/installed':
                 return self._json({'items': store.history(), 'output_dir': str(store.saved.root)})
-            match = re.fullmatch(r'/api/reports/([0-9a-f]{32})', path)
-            if match:
-                return self._json({'report': store.report_status(match[1])})
-            match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/review', path)
-            if match:
-                return self._json(store.review(match[1]))
-            match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/review/([0-9a-f]{24})/source/(\d{1,4})\.png', path)
-            if match:
-                file = store.review_resource(match[1], match[2], query.get('revision', [''])[0], region=int(match[3]))
-                return self._file(file, 'image/png')
-            match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/review/([0-9a-f]{24})/result\.html', path)
-            if match:
-                document = store.review_resource(match[1], match[2], query.get('revision', [''])[0])
-                body = document.encode('utf-8')
-                self._headers(200, 'text/html; charset=utf-8', len(body))
-                return self.wfile.write(body)
             match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/log', path)
             if match:
                 return self._json({'content': store.job_log(match[1])})
@@ -1098,7 +904,6 @@ class Handler(BaseHTTPRequestHandler):
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                       "/app.css": ("app.css", "text/css; charset=utf-8"),
                       "/workspace.css": ("workspace.css", "text/css; charset=utf-8"),
-                      "/review.js": ("review.js", "text/javascript; charset=utf-8"),
                       "/brand-logo.png": ("brand-logo.png", "image/png"),
                       "/favicon.svg": ("favicon.svg", "image/svg+xml"),
                       "/app-icon.png": ("app-icon.png", "image/png"),
@@ -1106,12 +911,6 @@ class Handler(BaseHTTPRequestHandler):
             if path in static and (WEB / static[path][0]).is_file():
                 return self._file(WEB / static[path][0], static[path][1])
         elif self.command == "POST":
-            match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/review', path)
-            if match:
-                return self._json(store.review_decision(match[1], self._body()))
-            match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/complaints', path)
-            if match:
-                return self._json(store.complain(match[1], self._body()), 201)
             if path == '/api/upload-check':
                 return self._json(store.upload_check(self._body().get('name', '')))
             if path == '/api/upload-existing':

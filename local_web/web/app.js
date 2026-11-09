@@ -92,9 +92,6 @@
     remove.setAttribute('aria-label', `Удалить файл и все результаты конвертации: ${record.name}`);
     return remove;
   }
-  function reviewButton(jobId, name) {
-    return button('Проверка расхождений', 'button button-outline review-job-button', () => window.RegionReview?.open(jobId, name));
-  }
   function additionalActions(job, record) {
     const details = element('details', 'job-more');
     const summary = element('summary', '', '⋯');
@@ -331,14 +328,14 @@
         const disabled = state.opening.has(record.id) || state.deleting.has(deletionKey(record));
         const open = button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/installed/${encodeURIComponent(record.id)}/view/document.html`));
         open.disabled = disabled;
-        actions.append(open, reviewButton(job.id, job.name), additionalActions(job, record));
+        actions.append(open, additionalActions(job, record));
       } else {
         actions.append(button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/view/${encodeURIComponent(job.id)}/document.html`)));
         const download = button(state.saving.has(job.id) ? 'Сохранение…' : 'Скачать', 'button button-outline', () => saveResult(job.id));
         download.disabled = state.saving.has(job.id) || state.savingAll;
         download.title = 'Сохранить исходник, HTML, выбранный результат и изображения в ocr_output';
         download.setAttribute('aria-label', `Скачать ${job.name} в формате ${formats[convertedFormat]}`);
-        actions.append(download, reviewButton(job.id, job.name), additionalActions(job));
+        actions.append(download, additionalActions(job));
       }
     } else if (status === 'running') {
       actions.append(button('Остановить', 'button button-outline', () => cancelJobs([job.id])));
@@ -423,7 +420,7 @@
     }
     $('#screen-title').textContent = 'Документы';
     $('#queue-summary').textContent = jobs.length ? `${countText(jobs.length, ['документ', 'документа', 'документов'])}${completed.length ? ` · Готово: ${completed.length}` : ''}${needsExport.length ? ` · Нужен экспорт: ${needsExport.length}` : ''}${queued.length ? ` · В очереди: ${queued.length}` : ''}` : 'Файлы появятся здесь после загрузки';
-    $('#results-footnote').textContent = completed.length ? 'Проверка расхождений — по желанию. Готовые документы можно сразу открыть или сохранить.' : active ? 'Документы обрабатываются последовательно. Можно продолжать добавлять файлы.' : 'Файлы и результаты доступны в «Истории»';
+    $('#results-footnote').textContent = completed.length ? 'Готовые документы можно открыть или сохранить.' : active ? 'Документы обрабатываются последовательно. Можно продолжать добавлять файлы.' : 'Файлы и результаты доступны в «Истории»';
     const notes = {
       markdown: 'Для заметок и текстовых редакторов. Сохраняет структуру документа.',
       html: 'Для просмотра в браузере. Сохраняет таблицы, формулы и изображения.',
@@ -641,11 +638,9 @@
           const download = button(state.saving.has(item.job_id) ? 'Сохранение…' : 'Скачать', 'button button-primary', () => saveResult(item.job_id));
           download.disabled = disabled || state.saving.has(item.job_id) || state.savingAll;
           actions.append(download);
-          actions.append(reviewButton(item.job_id, item.name));
         }
       } else {
         actions.append(...savedActions(item, disabled, true));
-        if (state.jobs.some(job => job.id === item.job_id && job.status === 'done' && !job.legacy_export)) actions.append(reviewButton(item.job_id, item.name));
       }
       const copy = button('Копировать лог', 'button button-outline', () => copySavedLog(item));
       actions.append(copy, deleteButton(item));

@@ -54,13 +54,17 @@
         <div><h1 id="screen-title">Документы</h1><p id="screen-subtitle">Документы и сканы в удобном формате</p></div>
         <button type="button" class="button button-primary" id="add-files-button">Добавить файлы</button>
       </div>
+      <div class="output-location" aria-label="Место сохранения результатов">
+        <div class="output-location-text"><span class="output-caption">Папка сохранения</span><p id="output-directory">Подключение…</p><p id="output-storage-error" class="output-storage-error" role="status" hidden></p></div>
+        <button type="button" class="button button-outline" id="output-change" aria-haspopup="dialog" aria-controls="output-dialog">Изменить</button>
+      </div>
       <div class="document-list-toolbar">
         <div class="document-filters" role="group" aria-label="Состояние документов"><button type="button" class="document-filter selected" data-job-filter="all" aria-pressed="true">Все <span id="filter-all-count">0</span></button><button type="button" class="document-filter" data-job-filter="active" aria-pressed="false">В работе <span id="filter-active-count">0</span></button><button type="button" class="document-filter" data-job-filter="done" aria-pressed="false">Готовые <span id="filter-done-count">0</span></button></div>
         <label class="document-search"><span class="sr-only">Найти документ</span><input id="job-search" type="search" placeholder="Найти документ" autocomplete="off" aria-controls="job-list"></label>
       </div>
       <div class="queue-toolbar">
         <p id="queue-summary" role="status">Файлы появятся здесь после загрузки</p>
-        <div class="toolbar-actions"><button class="text-button" id="clear-button" title="Убрать строки из списка. Все файлы останутся в Истории" hidden>Очистить список</button><button type="button" class="button button-primary" id="download-all" title="Сохранить все готовые результаты в ocr_output" hidden>Скачать всё</button></div>
+        <div class="toolbar-actions"><button class="text-button" id="clear-button" title="Убрать строки из списка. Все файлы останутся в Истории" hidden>Очистить список</button><button type="button" class="button button-primary" id="download-all" title="Сохранить все готовые результаты в выбранную папку" hidden>Скачать всё</button></div>
       </div>
       <div id="connection-error" class="connection-error" role="status" hidden><span>Нет связи с локальным приложением.</span><button class="text-button" id="reconnect-button">Повторить</button></div>
       <div class="job-list" id="job-list" role="list" aria-label="Очередь документов"></div>
@@ -68,20 +72,30 @@
         <svg viewBox="0 0 92 110" width="82" height="98" fill="none" aria-hidden="true"><path d="M15 3h39l25 25v76H15zM53 3v27h26M29 48h36M29 61h36M29 74h25" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 108h77" stroke="currentColor" stroke-width="2"/></svg>
         <h3>Добавьте документы</h3><p>Перетащите файлы в область слева или выберите их на компьютере</p><span class="empty-detail">Текст, таблицы, формулы и изображения<br>в одном структурированном документе</span>
       </div>
-      <div class="results-footnote" id="results-footnote">Готовые документы сохраняются в ocr_output рядом с программой</div>
+      <div class="results-footnote" id="results-footnote">Готовые документы можно открыть или сохранить в выбранную папку</div>
     </section>
   </main>
   <footer class="status-bar">
     <div class="local-status"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="1" stroke="currentColor" stroke-width="1.5"/><path d="M8 22h8M12 17v5" stroke="currentColor" stroke-width="1.5"/></svg><span>Обработка на этом компьютере</span></div>
     <div class="engine-status" id="engine-status"><span class="status-dot"></span><span id="engine-label">Подключение…</span></div>
   </footer>
+  <dialog id="output-dialog" class="output-dialog" aria-labelledby="output-title" aria-describedby="output-description">
+    <form id="output-form">
+      <h2 id="output-title">Папка сохранения</h2>
+      <p id="output-description">Новые результаты будут сохраняться в этой папке. Уже сохранённые файлы останутся на своих местах и будут доступны в Истории.</p>
+      <label for="output-path">Путь к папке на компьютере</label>
+      <div class="output-path-controls"><input type="text" id="output-path" required autocomplete="off" spellcheck="false" aria-describedby="output-description output-error"><button type="button" class="button button-outline" id="output-browse" hidden>Выбрать папку…</button></div>
+      <p id="output-error" class="output-error" role="alert" hidden></p>
+      <div class="output-dialog-actions"><button type="button" class="button button-outline" id="output-cancel">Отмена</button><button type="submit" class="button button-primary" id="output-save">Сохранить</button></div>
+    </form>
+  </dialog>
   <dialog id="installed-dialog" class="installed-dialog" aria-labelledby="installed-title">
     <div class="preview-header"><div><p class="preview-eyebrow">Результаты на этом компьютере</p><h2 id="installed-title">История</h2></div><button type="button" class="icon-button" id="close-installed" aria-label="Закрыть историю">×</button></div>
-    <div class="installed-toolbar"><div><p class="installed-caption">Файлы и результаты</p><p class="installed-root" id="installed-root">ocr_output рядом с программой</p></div><button type="button" class="button button-outline" id="installed-refresh">Обновить</button></div>
+    <div class="installed-toolbar"><div><p class="installed-caption">Текущая папка сохранения</p><p class="installed-root" id="installed-root">ocr_output рядом с программой</p></div><button type="button" class="button button-outline" id="installed-refresh">Обновить</button></div>
     <div class="installed-search"><label for="installed-search">Поиск по названию</label><input type="search" id="installed-search" placeholder="Название файла" autocomplete="off" aria-controls="installed-list"></div>
     <p class="installed-message" id="installed-message" role="status">Загрузка сохранённых результатов…</p>
     <div class="installed-list" id="installed-list" role="list" aria-label="История сохранённых результатов"></div>
-    <div class="installed-footer"><span id="installed-summary">Папки с исходником, HTML, выбранным результатом и изображениями</span></div>
+    <div class="installed-footer"><span id="installed-summary">Выбранный формат и ресурсы документа</span></div>
   </dialog>
   <dialog id="log-dialog" class="log-dialog" aria-labelledby="log-title">
     <div class="preview-header"><div><p class="preview-eyebrow">Полный лог конвертации</p><h2 id="log-title"></h2></div><button type="button" class="icon-button" id="close-log" aria-label="Закрыть лог">×</button></div>

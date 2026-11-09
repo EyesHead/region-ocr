@@ -12,9 +12,10 @@ if __package__:
 else:
     from file_paths import native_path, normal_path
 
-EXPORT_SCHEMA = 9
+EXPORT_SCHEMA = 10
 CANONICAL_MANIFEST_SCHEMA = 1
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
+FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
 
 
 def _components():
@@ -179,17 +180,13 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
     artifacts, packages = {}, {}
     selected = list(EXTENSIONS) if output_format is None else [output_format]
     for fmt in selected:
-        folder = destination / f'{source.stem}_ocr'
+        folder = destination / f'{source.stem}_{FOLDER_SUFFIXES[fmt]}'
         if native_path(folder).exists():
             # Keep an earlier completed package intact while building a new
             # version; its assets cannot leak into the next downloaded folder.
             folder = destination / '.versions' / uuid.uuid4().hex / folder.name
         folder = native_path(folder)
-        src_dir = folder / 'src'
-        src_dir.mkdir(parents=True, exist_ok=True)
-        original = folder / f'{source.stem}_source{source.suffix}'
-        if normal_path(source) != normal_path(original):
-            shutil.copy2(native_path(source), original)
+        folder.mkdir(parents=True, exist_ok=True)
         # Copy only referenced assets, never a stale file from an earlier export.
         for asset in media.get('assets', []):
             relative, origin = _asset_path(replay, asset['path'])
@@ -208,9 +205,6 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         else:
             value = structured.to_plaintext(soup)
         converted = folder / f'{source.stem}_converted{EXTENSIONS[fmt]}'
-        # Every delivery contains the exact HTML used for its selected export.
-        # Relative src/ references work when that HTML is opened from disk.
-        (folder / f'{source.stem}_converted.html').write_bytes(canonical_bytes)
         if fmt == 'html':
             # Exact canonical bytes, including its newline/encoding choice.
             converted.write_bytes(canonical_bytes)

@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VERSION = '1.8.2'
+VERSION = '1.8.3'
 
 
 def build(output):
@@ -54,7 +54,7 @@ def build(output):
         (work / 'app.config').write_text(config, encoding='utf-8')
         (work / 'installer.manifest').write_text('''<?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.8.2.0" name="EyesHead.RegionOCR.Setup"/>
+  <assemblyIdentity version="1.8.3.0" name="EyesHead.RegionOCR.Setup"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
   </requestedPrivileges></security></trustInfo>

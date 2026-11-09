@@ -29,15 +29,15 @@ import tempfile
 
 if __package__:
     from .file_paths import native_path, normal_path
-    from .saved_results import SavedResults
+    from .result_storage import ResultStorage
     from .conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 else:
     from file_paths import native_path, normal_path
-    from saved_results import SavedResults
+    from result_storage import ResultStorage
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -102,7 +102,7 @@ class JobStore:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest = self.root / "jobs.json"
-        self.saved = SavedResults(output_dir or self.root / 'ocr_output')
+        self.saved = ResultStorage(self.root, output_dir or self.root / 'ocr_output', application_root=HERE.parent)
         self.lock = threading.RLock()
         self.jobs = {}
         self.events = {}
@@ -235,7 +235,7 @@ class JobStore:
                     "engine": "convert_docling · local", "engine_ready": runtime.get('phase') == 'ready' if runtime else bool(self.engine.get("available")),
                     "engine_message": runtime['message'] if runtime else self.engine.get("message", ""),
                     "engine_runtime": runtime,
-                    "jobs": jobs}
+                    "jobs": jobs, "output_dir": str(self.saved.root), "storage_error": self.saved.storage_error}
 
     def history(self):
         """Saved deliveries and retained uploads share a recoverable history."""
@@ -263,6 +263,19 @@ class JobStore:
             removed = self.saved_call('prune_missing', protected_job_ids=protected)
             return {'items': self.history(), 'output_dir': str(self.saved.root), 'removed': len(removed)}
 
+    def settings(self):
+        with self.lock:
+            return self.saved.settings()
+
+    def change_output_dir(self, value):
+        with self.lock:
+            try:
+                return self.saved.change_root(value)
+            except ValueError as error:
+                raise APIError(str(error)) from None
+            except OSError as error:
+                raise APIError('Не удалось выбрать папку сохранения. Проверьте путь и права доступа: ' + str(error), 409) from None
+
     def hide(self, ident):
         """Remove only a queue row; files, logs and history remain available."""
         with self.lock:
@@ -284,10 +297,9 @@ class JobStore:
             job = self._get(ident)
             folder = self._owned_job_folder(ident)
             if target == 'source':
-                if ident in self.saved.pending_uploads or any(r['job_id'] == ident for r in self.saved.records.values()):
+                path = folder / 'input' / safe_filename(job['name'])
+                if not native_path(path).is_file():
                     path = self.saved_call('upload_source', ident)
-                else:
-                    path = folder / 'input' / safe_filename(job['name'])
             elif target == 'converted':
                 path = normal_path(self.artifact(ident, job.get('format', 'html'))[0])
             elif target == 'folder':
@@ -370,8 +382,6 @@ class JobStore:
                    'pages': '', 'source_available': True, **source_page_metadata(path)}
             with self.lock:
                 previous = guard.validate_commit(ticket)
-                output = self.saved_call('reserve_source', ident, name, path)
-                job['output_folder'] = str(output)
                 self.jobs[ident] = job
                 append_job_log(self.root / ident, f'Загружен файл: {name}; размер: {size} байт.')
                 self._save()
@@ -400,7 +410,9 @@ class JobStore:
             if not committed:
                 with self.lock:
                     self.jobs.pop(ident, None)
-                    self.saved_call('delete_job', ident)
+                    # New uploads exist only in private job storage. No saved
+                    # reservation needs cleanup, even if an old output drive
+                    # is unavailable and complete saved-result deletion blocks.
                 target = self._owned_job_folder(ident)
                 if native_path(target).exists():
                     shutil.rmtree(native_path(target))
@@ -569,14 +581,13 @@ class JobStore:
         with self.lock:
             job = self._get(ident)
             package = self.package(ident)
-            companion = package / (Path(job['name']).stem + '_converted.html')
-            if not native_path(companion).is_file():
-                # v1.2 selected-format packages did not carry HTML. Produce a
-                # new delivery without rewriting their immutable old files.
-                if __package__:
-                    from .export_bundle import build_exports
-                else:
-                    from export_bundle import build_exports
+            if __package__:
+                from .export_bundle import EXPORT_SCHEMA, build_exports
+            else:
+                from export_bundle import EXPORT_SCHEMA, build_exports
+            if job.get('export_schema') != EXPORT_SCHEMA:
+                # Rebuild legacy deliveries from private canonical HTML without
+                # OCR so newly saved folders contain only the selected format.
                 try:
                     result = build_exports(None, Path(job['source']), self.root / ident / 'result',
                                            output_format=job.get('format', 'html'),
@@ -598,10 +609,10 @@ class JobStore:
                 append_job_log(self.root / ident, 'Папка результата обновлена из сохранённого HTML без повторного OCR.')
                 self._save()
                 package = self.package(ident)
-            append_job_log(self.root / ident, 'Сохранение результата в ocr_output.')
+            append_job_log(self.root / ident, 'Сохранение результата в ' + str(self.saved.root) + '.')
             content = assemble_conversion_log(job, self.root / ident)
             saved = self.saved_call('save', package, job_id=ident, name=job['name'],
-                                    format=job.get('format', 'html'), log=content)
+                                    format=job.get('format', 'html'), log=content, canonical=self.canonical(ident))
             job['saved_result_id'] = saved['id']
             self._save()
             return saved
@@ -625,6 +636,30 @@ class JobStore:
                         raise APIError('Не удалось полностью удалить рабочие файлы. Закройте открытые файлы и повторите удаление: '
                                        + str(error), 409) from None
                 self.saved_call('delete_job', job_id)
+
+    def saved_document(self, ident, target):
+        with self.lock:
+            record = self.saved_call('get', ident)
+            job_id = record['job_id']
+            if target == 'source' and job_id in self.jobs:
+                job = self._get(job_id)
+                folder = self._owned_job_folder(job_id)
+                path = folder / 'input' / safe_filename(job['name'])
+                if native_path(path).is_file():
+                    return native_path(path)
+            return self.saved_call('target_file', ident, target)
+
+    def open_saved(self, ident, target):
+        if target == 'source':
+            path = self.saved_document(ident, target)
+            if os.name == 'nt':
+                os.startfile(str(path))
+            else:
+                import subprocess
+                subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(path)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        return self.saved_call('open_target', ident, target)
 
     def saved_call(self, operation, *args, **kwargs):
         try:
@@ -854,6 +889,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"app": APP_ID, "version": VERSION})
             if path == "/api/status":
                 return self._json(store.snapshot())
+            if path == '/api/settings':
+                return self._json(store.settings())
             if path == '/api/installed':
                 return self._json({'items': store.history(), 'output_dir': str(store.saved.root)})
             match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/log', path)
@@ -866,7 +903,7 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 job_id, saved_id, resource = match.groups()
                 if resource == 'document.html':
-                    file = (store.saved_call('target_file', saved_id, 'html') if saved_id
+                    file = (store.saved_document(saved_id, 'html') if saved_id
                             else store.canonical(job_id))
                     return self._file(file, 'text/html; charset=utf-8')
                 name = unquote(resource[4:])
@@ -911,6 +948,8 @@ class Handler(BaseHTTPRequestHandler):
             if path in static and (WEB / static[path][0]).is_file():
                 return self._file(WEB / static[path][0], static[path][1])
         elif self.command == "POST":
+            if path == '/api/settings':
+                return self._json(store.change_output_dir(self._body().get('output_dir')))
             if path == '/api/upload-check':
                 return self._json(store.upload_check(self._body().get('name', '')))
             if path == '/api/upload-existing':
@@ -945,7 +984,7 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 data = self._body()
                 if 'target' in data:
-                    store.saved_call('open_target', match[1], data['target'])
+                    store.open_saved(match[1], data['target'])
                 else:
                     store.saved_call('open_folder', match[1])
                 return self._json({'ok': True})

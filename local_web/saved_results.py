@@ -26,6 +26,7 @@ else:
 
 
 FORMATS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
+FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
 
 
 def _is_link(path):
@@ -61,6 +62,7 @@ class SavedResults:
         native_path(self.root).mkdir(parents=True, exist_ok=True)
         self.index_dir = self.root / '.index'
         self.logs_dir = self.index_dir / 'logs'
+        self.previews_dir = self.index_dir / 'previews'
         self.index = self.index_dir / 'results.json'
         self.lock = threading.RLock()
         self.records = {}
@@ -74,7 +76,7 @@ class SavedResults:
     def _check_root(self):
         if _is_link(self.root) or normal_path(native_path(self.root).resolve()) != self.root:
             raise ValueError('Каталог сохранённых результатов был заменён ссылкой')
-        for path in (self.index_dir, self.logs_dir, self.index):
+        for path in (self.index_dir, self.logs_dir, self.previews_dir, self.index):
             if _is_link(path):
                 raise ValueError('Служебные файлы сохранённых результатов не могут быть ссылками')
 
@@ -131,8 +133,11 @@ class SavedResults:
     def _folder(self, record, *, verify_identity=True):
         self._check_root()
         name = record['folder_name']
-        base = Path(_source_name(record['name'])).stem + '_ocr'
-        if not isinstance(name, str) or not re.fullmatch(re.escape(base) + r'(?: \((?:[2-9]|[1-9]\d+)\))?', name):
+        stem = Path(_source_name(record['name'])).stem
+        counter = r'(?: \((?:[2-9]|[1-9]\d+)\))?'
+        legacy = re.escape(stem + '_ocr') + counter
+        selected = re.escape(stem) + counter + '_' + FOLDER_SUFFIXES[record['format']] if 'format' in record else ''
+        if not isinstance(name, str) or not re.fullmatch('(?:' + legacy + '|' + selected + ')', name):
             raise ValueError('Некорректная папка сохранённого результата')
         path = self.root / name
         if _is_link(path):
@@ -146,6 +151,22 @@ class SavedResults:
             if verify_identity and _identity(path) != record.get('directory_identity'):
                 raise ValueError('Папка результата была заменена; удаление и открытие отклонены')
         return path
+
+    def _preview_folder(self, record):
+        self._check_root()
+        path = self.previews_dir / record['id']
+        if (_is_link(path) or normal_path(native_path(path).resolve()).parent != self.previews_dir):
+            raise ValueError('Служебная папка предпросмотра была заменена ссылкой')
+        if native_path(path).exists():
+            self._check_tree(path)
+            if _identity(path) != record.get('preview_identity'):
+                raise ValueError('Служебная папка предпросмотра была заменена')
+        return path
+
+    def _delete_preview(self, record):
+        folder = self._preview_folder(record)
+        if native_path(folder).exists():
+            shutil.rmtree(native_path(folder))
 
     @staticmethod
     def _check_tree(folder):
@@ -197,6 +218,7 @@ class SavedResults:
                     log = self.logs_dir / (record['id'] + '.log')
                     if _is_link(log):
                         raise ValueError('Файл лога был заменён ссылкой')
+                    self._preview_folder(record)
                     removed.append(record)
             if not removed:
                 return []
@@ -216,6 +238,7 @@ class SavedResults:
                 log = self.logs_dir / (record['id'] + '.log')
                 if not _is_link(log):
                     native_path(log).unlink(missing_ok=True)
+                self._delete_preview(record)
             return [record['id'] for record in removed]
 
     def get(self, ident):
@@ -228,21 +251,23 @@ class SavedResults:
     def upload_source(self, job_id):
         return self.uploads.source(job_id)
 
-    def save(self, package: Path, *, job_id, name, format, log: str):
+    def save(self, package: Path, *, job_id, name, format, log: str, canonical=None):
         name = _source_name(name)
         if format not in FORMATS:
             raise ValueError('Неизвестный формат результата')
         original_package = normal_path(package).absolute()
         package = self._check_tree(original_package)
         source = Path(name)
-        expected = {source.stem + '_source' + source.suffix, source.stem + '_converted' + FORMATS[format],
-                    source.stem + '_converted.html', 'src'}
+        expected = {source.stem + '_converted' + FORMATS[format]}
         children = {entry.name for entry in native_path(package).iterdir()}
-        if children != expected or not native_path(package / 'src').is_dir():
-            raise ValueError('Пакет должен содержать исходник, выбранный результат, HTML и папку src')
-        for filename in expected - {'src'}:
+        if children not in (expected, expected | {'src'}):
+            raise ValueError('Пакет должен содержать только выбранный результат и ресурсы src')
+        if 'src' in children and (not native_path(package / 'src').is_dir()
+                                  or not any(native_path(package / 'src').iterdir())):
+            raise ValueError('Папка src должна содержать ресурсы результата')
+        for filename in expected:
             if not native_path(package / filename).is_file():
-                raise ValueError('В пакете отсутствует исходник или выбранный результат')
+                raise ValueError('В пакете отсутствует выбранный результат')
         package_key = hashlib.sha256(os.path.normcase(str(package)).encode('utf-8')).hexdigest()
         with self.lock:
             self._check_root()
@@ -252,19 +277,17 @@ class SavedResults:
                         raise ValueError('Этот пакет уже связан с другим результатом')
                     if native_path(self._folder(record)).is_dir():
                         return self._public(record)
-            if job_id in self.pending_uploads:
-                return self.uploads.complete(package, job_id=job_id, name=name, format=format,
-                                             log=log, package_key=package_key)
             ident = uuid.uuid4().hex
-            base = source.stem + '_ocr'
+            base = source.stem + '_' + FOLDER_SUFFIXES[format]
             used = {entry.name.casefold() for entry in native_path(self.root).iterdir()}
             folder_name, number = base, 2
             while folder_name.casefold() in used:
-                folder_name = f'{base} ({number})'
+                folder_name = f'{source.stem} ({number})_{FOLDER_SUFFIXES[format]}'
                 number += 1
             target = self.root / folder_name
             staging = self.root / ('.stage-' + ident)
             log_path = self.logs_dir / (ident + '.log')
+            preview_folder = self.previews_dir / ident
             published = False
             try:
                 # Recheck every copied file; source paths are never interpreted
@@ -280,13 +303,22 @@ class SavedResults:
                 if _is_link(log_path):
                     raise ValueError('Файл лога не может быть ссылкой')
                 native_path(log_path).write_text(str(log), encoding='utf-8')
+                preview_identity = None
+                if format != 'html' and canonical is not None:
+                    canonical = normal_path(canonical).absolute()
+                    if _is_link(canonical) or not native_path(canonical).is_file():
+                        raise ValueError('Канонический HTML предпросмотра не найден')
+                    native_path(preview_folder).mkdir(parents=True, exist_ok=False)
+                    shutil.copy2(native_path(canonical), native_path(preview_folder / 'document.html'))
+                    preview_identity = _identity(preview_folder)
                 if target.parent != self.root or native_path(target).exists():
                     raise ValueError('Назначение сохранения изменилось')
                 native_path(staging).rename(native_path(target))
                 published = True
                 record = dict(id=ident, name=name, format=format, folder_name=folder_name,
                               created_at=datetime.now(timezone.utc).isoformat(), size=size,
-                              job_id=str(job_id), package_key=package_key, directory_identity=_identity(target))
+                              job_id=str(job_id), package_key=package_key, directory_identity=_identity(target),
+                              delivery_schema=10, preview_identity=preview_identity)
                 self.records[ident] = record
                 self._persist()
                 return self._public(record)
@@ -297,6 +329,9 @@ class SavedResults:
                 if cleanup.parent == self.root and native_path(cleanup).exists() and not _is_link(cleanup):
                     shutil.rmtree(native_path(cleanup))
                 native_path(log_path).unlink(missing_ok=True)
+                if native_path(preview_folder).exists() and not _is_link(preview_folder):
+                    self._check_tree(preview_folder)
+                    shutil.rmtree(native_path(preview_folder))
                 raise
 
     def read_log(self, ident):
@@ -316,6 +351,8 @@ class SavedResults:
 
         with self.lock:
             record = self._record(ident)
+            if record.get('delivery_schema', 0) >= 10:
+                return False
             folder = self._folder(record)
             target = folder / (Path(record['name']).stem + '_converted.html')
             if native_path(target).exists() or _is_link(target):
@@ -396,11 +433,13 @@ class SavedResults:
             log_path = self.logs_dir / (ident + '.log')
             if _is_link(log_path):
                 raise ValueError('Файл лога был заменён ссылкой')
+            self._preview_folder(record)
             if native_path(folder).exists():
                 self._check_tree(folder)
                 # _folder establishes the exact direct root child and identity.
                 shutil.rmtree(native_path(folder))
             native_path(log_path).unlink(missing_ok=True)
+            self._delete_preview(record)
             del self.records[ident]
             try:
                 self._persist()
@@ -420,6 +459,7 @@ class SavedResults:
                     self._check_tree(folder)
                 if _is_link(self.logs_dir / (ident + '.log')):
                     raise ValueError('Файл лога был заменён ссылкой')
+                self._preview_folder(self._record(ident))
             return ids
 
     def delete_job(self, job_id):
@@ -452,7 +492,11 @@ class SavedResults:
                      'html': source.stem + '_converted.html'}
             if not isinstance(target, str) or target not in names:
                 raise ValueError('Неизвестный файл результата')
-            path = folder / names[target]
+            if target == 'html' and record.get('delivery_schema', 0) >= 10 and record['format'] != 'html':
+                folder = self._preview_folder(record)
+                path = folder / 'document.html'
+            else:
+                path = folder / names[target]
             if _is_link(path) or normal_path(native_path(path).resolve()).parent != folder:
                 raise ValueError('Файл результата был заменён ссылкой')
             if not native_path(path).is_file():

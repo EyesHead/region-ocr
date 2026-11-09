@@ -3,7 +3,7 @@
   const $ = (selector) => document.querySelector(selector);
   const formats = { markdown: 'Markdown', html: 'HTML', json: 'JSON', plaintext: 'Текст' };
   const supported = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'webp', 'gif']);
-  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '' };
+  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', outputDir: '', storageBusy: false };
   let toastTimer;
   let activeDismissHint;
   let deleteConfirmation;
@@ -107,8 +107,10 @@
       }
       const folder = button('Открыть папку результата', 'button button-outline', () => openSavedResult(record.id, 'folder'));
       folder.disabled = disabled; menu.append(folder, deleteButton(record));
+    } else {
+      menu.append(deleteButton({...job, kind: 'job', job_id: job.id}));
     }
-    menu.append(dismissControl(job));
+    menu.append(dismissControl(job, true));
     details.append(summary, menu);
     details.addEventListener('toggle', () => {
       if (!details.open) { if (typeof menu.hidePopover === 'function' && menu.matches(':popover-open')) menu.hidePopover(); menu.hidden = true; return; }
@@ -129,7 +131,13 @@
     if (typeof hint.hidePopover === 'function' && hint.matches(':popover-open')) hint.hidePopover();
     hint.hidden = true;
   }
-  function dismissControl(job) {
+  function dismissControl(job, inMenu = false) {
+    if (inMenu) {
+      const action = button('Убрать из списка', 'button button-outline dismiss-menu-action', () => removeJob(job.id));
+      action.title = 'Скрыть строку. Документ и результаты останутся в Истории.';
+      action.setAttribute('aria-label', `Убрать из списка: ${job.name}`);
+      return action;
+    }
     const wrapper = element('div', 'dismiss-job');
     const trigger = button('×', 'icon-button', () => removeJob(job.id));
     trigger.setAttribute('aria-label', `Убрать из списка: ${job.name}`);
@@ -333,7 +341,7 @@
         actions.append(button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/view/${encodeURIComponent(job.id)}/document.html`)));
         const download = button(state.saving.has(job.id) ? 'Сохранение…' : 'Скачать', 'button button-outline', () => saveResult(job.id));
         download.disabled = state.saving.has(job.id) || state.savingAll;
-        download.title = 'Сохранить исходник, HTML, выбранный результат и изображения в ocr_output';
+        download.title = 'Сохранить выбранный формат и ресурсы в папку результата';
         download.setAttribute('aria-label', `Скачать ${job.name} в формате ${formats[convertedFormat]}`);
         actions.append(download, additionalActions(job));
       }
@@ -343,7 +351,7 @@
       actions.append(button('Повторить', 'button button-outline', () => startJobs([job.id])));
     }
     if (status !== 'running' && status !== 'uploading' && !(status === 'done' && !job.legacy_export)) {
-      actions.append(dismissControl(job));
+      actions.append(additionalActions(job));
     }
     row.append(actions);
     return row;
@@ -429,11 +437,69 @@
     };
     $('#format-note').textContent = notes[state.format];
   }
+  function updateOutputDirectory(value, error = null) {
+    if (!value) return;
+    state.outputDir = value;
+    if (error !== null) { $('#output-storage-error').textContent = error; $('#output-storage-error').hidden = !error; }
+    $('#output-directory').textContent = value;
+    $('#output-directory').title = value;
+    $('#installed-root').textContent = value;
+    $('#download-all').title = `Сохранить все готовые результаты в ${value}`;
+  }
+  async function openOutputSettings() {
+    $('#output-error').hidden = true;
+    if (!state.outputDir) {
+      try { updateOutputDirectory((await api('/api/settings')).output_dir); }
+      catch (error) { toast(error.message); return; }
+    }
+    $('#output-path').value = state.outputDir;
+    $('#output-browse').hidden = !window.pywebview?.api?.choose_output_directory;
+    $('#output-dialog').showModal();
+    $('#output-path').focus();
+  }
+  function outputError(error) {
+    $('#output-error').textContent = error.message || String(error);
+    $('#output-error').hidden = false;
+  }
+  async function saveOutputSettings(event) {
+    event.preventDefault();
+    if (state.storageBusy) return;
+    state.storageBusy = true;
+    $('#output-save').disabled = true;
+    $('#output-save').textContent = 'Сохранение…';
+    $('#output-cancel').disabled = true;
+    $('#output-browse').disabled = true;
+    $('#output-error').hidden = true;
+    try {
+      const settings = await post('/api/settings', {output_dir: $('#output-path').value.trim()});
+      updateOutputDirectory(settings.output_dir);
+      $('#output-dialog').close();
+      toast('Папка сохранения изменена. Существующие файлы остались на своих местах.');
+      await refresh();
+    } catch (error) { outputError(error); }
+    finally {
+      state.storageBusy = false;
+      $('#output-save').disabled = false;
+      $('#output-save').textContent = 'Сохранить';
+      $('#output-cancel').disabled = false;
+      $('#output-browse').disabled = false;
+    }
+  }
+  async function browseOutputDirectory() {
+    $('#output-browse').disabled = true;
+    $('#output-error').hidden = true;
+    try {
+      const selected = await window.pywebview.api.choose_output_directory();
+      if (selected) $('#output-path').value = selected;
+    } catch (error) { outputError(error); }
+    finally { $('#output-browse').disabled = false; }
+  }
   async function refresh() {
     clearTimeout(state.timer);
     try {
       const result = await api('/api/status');
       state.jobs = result.jobs || [];
+      updateOutputDirectory(result.output_dir, result.storage_error || '');
       state.connected = true;
       $('#connection-error').hidden = true;
       const label = result.engine_ready ? 'Готов к обработке' : ['starting', 'warming'].includes(result.engine_runtime?.phase) ? 'Подготовка к обработке…' : 'Обработка пока недоступна';
@@ -663,7 +729,7 @@
       const result = reconcile ? await post('/api/installed/refresh', {}) : await api('/api/installed');
       if (token !== state.installedToken) return;
       state.installed = result.items || [];
-      $('#installed-root').textContent = result.output_dir || 'ocr_output рядом с программой';
+      updateOutputDirectory(result.output_dir);
       renderInstalled();
     } catch (error) {
       if (token !== state.installedToken) return;
@@ -791,6 +857,11 @@
   $('#reconnect-button').addEventListener('click', refresh);
   $('#download-all').addEventListener('click', saveAllResults);
   $('#installed-button').addEventListener('click', openInstalled);
+  $('#output-change').addEventListener('click', openOutputSettings);
+  $('#output-form').addEventListener('submit', saveOutputSettings);
+  $('#output-cancel').addEventListener('click', () => $('#output-dialog').close());
+  $('#output-browse').addEventListener('click', browseOutputDirectory);
+  $('#output-dialog').addEventListener('close', () => $('#output-change').focus({preventScroll: true}));
   $('#installed-refresh').addEventListener('click', () => loadInstalled(true));
   $('#duplicate-cancel').addEventListener('click', () => finishDuplicate('cancel'));
   $('#duplicate-replace').addEventListener('click', () => finishDuplicate('replace'));

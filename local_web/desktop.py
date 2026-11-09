@@ -96,6 +96,10 @@ class Bridge:
     def __init__(self, url, webview):
         self._url, self._webview = url, webview
 
+    def choose_output_directory(self):
+        selected = self._webview.windows[0].create_file_dialog(self._webview.FileDialog.FOLDER)
+        return str(selected[0]) if selected else None
+
     def open_html(self, value):
         import re
         url = urljoin(self._url + '/', value)

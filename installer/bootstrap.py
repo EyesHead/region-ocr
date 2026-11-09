@@ -59,7 +59,7 @@ class Installer:
                 digest = hashlib.sha256()
                 count = 0
                 tick = 0.0
-                req = urllib.request.Request(item['url'], headers={'User-Agent': 'REGION-OCR-Setup/1.8.0'})
+                req = urllib.request.Request(item['url'], headers={'User-Agent': 'REGION-OCR-Setup/1.8.1'})
                 with urllib.request.urlopen(req, timeout=90) as response, target.open('wb') as output:
                     while block := response.read(1024 * 1024):
                         output.write(block)

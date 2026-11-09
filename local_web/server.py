@@ -41,7 +41,7 @@ else:
     from reporting import ReportOutbox
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -1252,9 +1252,10 @@ def main(argv=None):
     args.data_dir.mkdir(parents=True, exist_ok=True)
     if args.desktop:
         if __package__:
-            from .desktop import native_runtime_available
+            from .desktop import native_runtime_available, prepare_runtime
         else:
-            from desktop import native_runtime_available
+            from desktop import native_runtime_available, prepare_runtime
+        prepare_runtime()
         if not native_runtime_available():
             args.desktop = False
             args.open_browser = True

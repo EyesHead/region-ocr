@@ -12,6 +12,31 @@ from urllib.request import Request, urlopen
 _runtime_prepared = False
 
 
+def native_runtime_available():
+    """Use the browser UI when a Windows machine has no WebView2 runtime."""
+    if sys.platform != 'win32':
+        return True
+    import ctypes
+    import importlib.util
+    spec = importlib.util.find_spec('webview')
+    if spec is None or not spec.origin:
+        return False
+    loader = Path(spec.origin).parent / 'lib/runtimes/win-x64/native/WebView2Loader.dll'
+    try:
+        library = ctypes.WinDLL(str(loader))
+        query = library.GetAvailableCoreWebView2BrowserVersionString
+        query.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+        query.restype = ctypes.c_long
+        version = ctypes.c_void_p()
+        result = query(None, ctypes.byref(version))
+        if version.value:
+            ctypes.windll.ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ctypes.windll.ole32.CoTaskMemFree(version)
+        return result == 0
+    except (OSError, AttributeError):
+        return False
+
+
 def prepare_runtime():
     """Select the installed desktop ABI before PDF parsing imports CFFI.
 

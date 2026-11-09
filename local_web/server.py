@@ -1238,16 +1238,26 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
+    installed = (HERE.parent / '.region-ocr-install.json').is_file()
+    user_home = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'RegionDocumentConverter'
     parser = argparse.ArgumentParser(description="Локальный конвертер документов")
     parser.add_argument("--port", type=int, default=0)
-    parser.add_argument("--data-dir", type=Path, default=HERE / "data")
-    parser.add_argument('--output-dir', type=Path, default=HERE.parent / 'ocr_output')
+    parser.add_argument("--data-dir", type=Path, default=user_home / 'data' if installed else HERE / "data")
+    parser.add_argument('--output-dir', type=Path, default=user_home / 'Output' if installed else HERE.parent / 'ocr_output')
     parser.add_argument("--open-browser", action="store_true")
     parser.add_argument('--desktop', action='store_true')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("Порт должен быть от 0 до 65535.")
     args.data_dir.mkdir(parents=True, exist_ok=True)
+    if args.desktop:
+        if __package__:
+            from .desktop import native_runtime_available
+        else:
+            from desktop import native_runtime_available
+        if not native_runtime_available():
+            args.desktop = False
+            args.open_browser = True
     instance = None
     if args.desktop:
         if __package__:

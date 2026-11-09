@@ -1,0 +1,36 @@
+# Reconstructed for convert_docling.py from its imports and installed packages.
+# Python 3.12
+# Install: python -m pip install -r requirements-docling-surya.txt
+# NVIDIA CUDA 12.8: install CUDA PyTorch first, with this command:
+# python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+
+# Docling and Surya: the script requires these exact Surya versions.
+docling==2.141.0
+docling-core==2.103.1
+docling-surya-ocr==0.2.0
+surya-ocr==0.22.1
+torch==2.8.0
+torchvision==0.23.0
+
+# PDF rendering and coordinate-based table recovery.
+pypdfium2==5.10.1
+pdfplumber==0.11.4
+
+# Conservative Russian word-wrap repair, using a local word-form dictionary.
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+
+# Page orientation and image processing.
+rapidocr==3.10.0
+# Exactly one ONNX distribution: CUDA 12 build also supplies the CPU provider.
+onnxruntime-gpu==1.23.2; (sys_platform == 'win32' or sys_platform == 'linux') and (platform_machine == 'AMD64' or platform_machine == 'x86_64')
+onnxruntime==1.23.2; sys_platform == 'darwin' or (platform_machine != 'AMD64' and platform_machine != 'x86_64')
+opencv-python-headless==4.11.0.86
+numpy==2.5.4
+Pillow==10.4.0
+
+# HTML, formulas, runtime paths, and memory diagnostics.
+beautifulsoup4==4.15.0
+latex2mathml==3.81.1
+platformdirs==4.13.5
+psutil==7.2.2

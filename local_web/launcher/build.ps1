@@ -10,18 +10,21 @@ if (-not (Test-Path -LiteralPath $compiler)) {
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 }
 if (-not (Test-Path -LiteralPath $compiler)) {
-    throw 'Не найден системный компилятор C# .NET Framework. Новые компоненты автоматически не устанавливаются.'
+    throw 'The system .NET Framework C# compiler was not found.'
 }
 
 $source = Join-Path $PSScriptRoot 'DocumentConverterLauncher.cs'
 $target = [IO.Path]::GetFullPath($OutputPath)
 $converterRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 if ([IO.Path]::GetDirectoryName($target) -ne $converterRoot) {
-    throw "EXE должен находиться непосредственно в папке конвертера: $converterRoot"
+    throw "EXE must be placed directly in the converter folder: $converterRoot"
 }
 
 $icon = Join-Path $PSScriptRoot '..\assets\app-icon.ico'
 & $compiler /nologo /target:winexe /platform:anycpu /optimize+ /utf8output "/win32icon:$icon" "/out:$target" /reference:System.Windows.Forms.dll $source
-if ($LASTEXITCODE -ne 0) { throw "Компиляция завершилась с кодом $LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE" }
 Get-Item -LiteralPath $target | Select-Object FullName,Length
-Get-FileHash -LiteralPath $target -Algorithm SHA256 | Select-Object Algorithm,Hash
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$stream = [IO.File]::OpenRead($target)
+try { [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+finally { $stream.Dispose(); $sha.Dispose() }

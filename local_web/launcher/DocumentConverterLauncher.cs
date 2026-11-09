@@ -25,6 +25,8 @@ internal static class DocumentConverterLauncher
             string root = AppDomain.CurrentDomain.BaseDirectory;
             string python = FindPython(root);
             string logs = Path.Combine(root, "local_web", "data");
+            if (File.Exists(Path.Combine(root, ".region-ocr-install.json")))
+                logs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RegionDocumentConverter", "data");
             Directory.CreateDirectory(logs);
             startupLog = Path.Combine(logs, "desktop-launcher.log");
             if (checkOnly) { Log("CHECK OK " + python); return 0; }

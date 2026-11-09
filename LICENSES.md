@@ -280,3 +280,17 @@ python benchmarks/ocr_tables_20261102/license_audit/collect_inventory.py
 | llama.cpp, установленная официальная CUDA-сборка | b11811, llama-b11811-bin-win-cuda-12.4-x64.zip | https://github.com/ggml-org/llama.cpp/releases/tag/b11811 ; https://github.com/ggml-org/llama.cpp/blob/b11811/LICENSE | MIT для llama.cpp; отдельные условия CUDA покрыты разрешением пользователя на эту сборку | 2026-11-09 |
 
 SHA256 исходного архива llama.cpp: c7857c6b20284d40e648486bcc7f342bbbc6dfcd603cc5d27bbcd9ecc3bb66d6. Совпадает с digest официального GitHub release asset. Используются прежние зафиксированные snapshots Surya 2, Heron и TableFormer; модель ориентации проверяется по SHA256 в коде. Нерелевантные Whisper/RAG-модели, документы пользователя, история, отчёты и действующие секреты в поставку не копируются.
+
+
+## Онлайн-установщик Windows 1.8.0 — 2026-11-09
+
+Поставляется исходный код установщика на C#/.NET Framework. Python, колёса PyPI/PyTorch и модели скачиваются из первичных источников при установке; URL, версии, размеры и SHA256 закреплены в `installer/install-plan.json`. Применяется выданное пользователем 2026-11-09 исключение для этой готовой сборки. Лицензии загружаемых пакетов сохраняются в их dist-info; полные дополнительные уведомления — в THIRD-PARTY-NOTICES.
+
+| Компонент | Версия | Источник | Лицензия | Решение | Дата |
+|---|---|---|---|---|---|
+| pip, только загрузчик в приватном Python | 25.3 | https://pypi.org/project/pip/25.3/ | MIT | разрешено | 2026-11-09 |
+| CPython embeddable x64 и Tcl/Tk из той же установки | 3.12.10; Tcl/Tk 8.6.15 и zlib1.dll из той же установки | https://www.python.org/downloads/release/python-31210/ | PSF-2.0 и уведомления Tcl/Tk в поставке | разрешено пользователем для этой сборки | 2026-11-09 |
+| llama.cpp, Windows CPU x64 | b11811 | https://github.com/ggml-org/llama.cpp/releases/tag/b11811 | MIT | разрешено, LICENSE сохранён | 2026-11-09 |
+| PyTorch / torchvision, CPU wheels | 2.8.0+cpu / 0.23.0+cpu | https://download.pytorch.org/whl/cpu/ | BSD-3-Clause и лицензии вложенных компонентов | то же семейство версий; исключение пользователя для этой сборки | 2026-11-09 |
+| Surya OCR GGUF, полный файл лицензии | 6a3a4c30e5e74446d4f8b6afd05b2f2da970f470 | https://huggingface.co/datalab-to/surya-ocr-2-gguf/blob/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/LICENSE | OpenRAIL | ранее разрешённое исключение; текст включён | 2026-11-09 |
+| TableFormer, полный текст лицензии данных | v2.3.0 | https://github.com/Community-Data-License-Agreements/Releases/blob/main/CDLA-Permissive-2.0.md | CDLA-Permissive-2.0 | исключение пользователя для этой сборки; текст включён | 2026-11-09 |

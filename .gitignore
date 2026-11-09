@@ -175,3 +175,7 @@ Desktop.ini
 .ipynb_checkpoints/
 npm-debug.log*
 yarn-error.log*
+
+# Public pinned installer metadata and mandatory third-party license notices
+!/installer/install-plan.json
+!/installer/notices/*.txt

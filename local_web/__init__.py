@@ -1,0 +1,1 @@
+"""Local document converter application."""

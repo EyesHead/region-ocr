@@ -53,7 +53,7 @@ LOCAL_SCHEMA = 6
 TEXT_CLEANUP_SCHEMA = 6
 TABLE_RECOVERY_SCHEMA = 21
 TABLE_JOIN_SCHEMA = 14
-TABLE_CELL_SCHEMA = 39
+TABLE_CELL_SCHEMA = 40
 # Whole source-image fallbacks retain one actual rendered pixel beyond owned
 # glyph extents; this is geometry only and never supplies editable PDF text.
 SOURCE_IMAGE_BOUNDS_HALO_PIXELS = 1
@@ -7411,69 +7411,12 @@ def prepare_source_cell_ownership(native,page,ref,manifest,api):
     return candidate,geometry
 
 def mask_source_owned_cells(fragment,geometry,source_image,region,page,manifest,api):
-    """Keep complete source-cell pixels when primary payload has no owner."""
-    from bs4 import BeautifulSoup
-    soup=BeautifulSoup(fragment,'html.parser')
-    profile=api.table_profile(fragment)
-    cells=(geometry or {}).get('cells') or []
-    if not _source_cell_shape_matches(profile,geometry):
+    """Keep editable payload even when source-grid ownership is uncertain."""
+    if not _source_cell_shape_matches(api.table_profile(fragment),geometry):
         _source_cell_warning(manifest,api,'physical_and_display_cell_identity_not_proven',page=page)
-        return None,[]
-    physical={(c['row'],c['column'],c['row_span'],c['column_span']):c for c in cells}
-    nodes=[n for n in soup.table.find_all(['td','th']) if n.find_parent('table') is soup.table]
-    proofs=[];retained=list(geometry.get('retained_cell_images',[]))
-    sx,sy=source_image.width/(region[2]-region[0]),source_image.height/(region[3]-region[1])
-    for node,position in zip(nodes,profile['cells']):
-        key=tuple(position[k] for k in ('row','column','row_span','column_span'));source=physical[key]
-        if source.get('primary_ocr'):
-            continue  # Preserve primary words, numbers, MathML and images literally.
-        from docling_pdf_text_cells import owns_positioned_text
-        if owns_positioned_text(node,source,geometry):
-            proof=dict(page=page,row=key[0],column=key[1],**source['positioned_source_text'])
-            manifest.setdefault('positioned_source_text_cells_preserved',[]).append(proof)
-            api.diagnostic_event('TABLE_POSITIONED_SOURCE_TEXT_PRESERVED',**proof)
-            continue
-        if not node.get_text(strip=True) and not node.find('math'):
-            continue  # Already complete original native image, or a genuinely empty source cell.
-        box=source.get('bbox')
-        if not box or source_image is None:
-            _source_cell_warning(manifest,api,'source_cell_pixels_unavailable',page=page,row=key[0],column=key[1])
-            return None,[]
-        from docling_pdf_cell_crop import cell_content_crop
-        interior=cell_content_crop(source_image,region,box)
-        if interior is None:
-            _source_cell_warning(manifest,api,'source_cell_pixels_outside_region',page=page,row=key[0],column=key[1])
-            return None,[]
-        pixels,content_box,crop_proof=interior
-        complete=bool(region[0]<=box[0] and region[1]<=box[1] and box[2]<=region[2] and box[3]<=region[3])
-        if not complete:
-            _source_cell_warning(manifest,api,'source_cell_bbox_exceeds_rendered_region',page=page,
-                row=key[0],column=key[1],bbox=list(box),rendered_region_bbox=list(region))
-        crop=source_image.crop(pixels)
-        try:
-            rendered=BeautifulSoup(api.image_html(crop,content_box[2]-content_box[0],'cell'),'html.parser').img
-            rgb_sha256=hashlib.sha256(crop.convert('RGB').tobytes()).hexdigest()
-        finally:crop.close()
-        rendered['data-source-cell']='true'
-        replaced_images=[hashlib.sha256(image.get('src','').encode()).hexdigest() for image in node.find_all('img')]
-        before_sha256=hashlib.sha256(node.decode_contents().encode()).hexdigest()
-        node.clear();node.append(rendered)
-        source.update(html=node.decode_contents(),text='',primary_content_unmapped=True)
-        retained=[entry for entry in retained if (entry.get('row'),entry.get('column'))!=key[:2]]
-        retained.append(dict(row=key[0],column=key[1],bbox=list(content_box),content_crop=crop_proof,
-            basis='complete_source_cell_without_mapped_primary_ocr' if complete else 'layout_limited_source_cell_pixels'))
-        proof=dict(page=page,row=key[0],column=key[1],row_span=key[2],column_span=key[3],bbox=list(box),
-            reason='primary_ocr_not_mapped_keep_complete_source_cell_pixels' if complete else 'source_cell_pixels_limited_by_layout_region',
-            source_pixel_bbox=list(pixels),source_bbox_coverage_complete=complete,rendered_region_bbox=list(region),
-            source_content_bbox=list(content_box),content_crop=crop_proof,
-            source_rgb_sha256=rgb_sha256,before_html_sha256=before_sha256,
-            replaced_native_image_sources_sha256=replaced_images,primary_payload_replaced=False)
-        proofs.append(proof);api.diagnostic_event('SOURCE_CELL_COMPLETE_PIXELS_KEPT' if complete else 'SOURCE_CELL_LAYOUT_LIMITED_PIXELS_KEPT',**proof)
-    geometry['retained_cell_images']=sorted(retained,key=lambda e:(e['row'],e['column']))
-    manifest.setdefault('primary_ocr_unmapped_cells',[]).extend(proofs)
-    manifest.setdefault('source_cell_complete_fallbacks',[]).extend(p for p in proofs if p['source_bbox_coverage_complete'])
-    manifest.setdefault('source_cell_partial_fallbacks',[]).extend(p for p in proofs if not p['source_bbox_coverage_complete'])
-    return str(soup.table),proofs
+    from docling_pdf_primary import mask_nonprimary_content
+    return mask_nonprimary_content(fragment,geometry,source_image,region,page,manifest,api)
+
 
 def source_owned_graphic_objects(fragment,geometry,objects,page,ref,manifest,api):
     """A source graphic needs its own cell anchors; equal dimensions prove nothing."""
@@ -9005,6 +8948,23 @@ def export_local_html(args, result, normalized, orientation, source):
                                      selected_method=chosen[1] if chosen else None, issues=profile.get('issues',[]),
                                      numeric_conflict=conflict, retry_stop_reason=retry_stop_reason,
                                      attempted_reads=len(candidates), crop_width=image.width, crop_height=image.height)
+            # Grid uncertainty never grants permission to rasterize text or
+            # equations. Resolve every cell/table raster before publication.
+            from docling_pdf_table_content import normalize_table_content
+            typed_region = actual_source_image_bbox if method == 'source_image' else bbox
+            content = normalize_table_content(content, native[1] if native else None,
+                image, typed_region, page_no, args, manifest, sys.modules[__name__], ref=item.self_ref)
+            if method == 'source_image':
+                method = 'typed_source_region'
+            if '<table' in content.lower():
+                profile = table_profile(content, expected)
+                item.data = TableData(num_rows=profile['rows'], num_cols=profile['columns'], table_cells=[
+                    TableCell(text=c['text'], row_span=c['row_span'], col_span=c['column_span'],
+                        start_row_offset_idx=c['row'], end_row_offset_idx=c['row']+c['row_span'],
+                        start_col_offset_idx=c['column'], end_col_offset_idx=c['column']+c['column_span'],
+                        column_header=c['header']) for c in profile['cells']])
+            else:
+                profile = dict(issues=[], columns=0, rows=0, text=semantic_ocr_text(content))
             diagnostic_event('TABLE_CHOSEN', phase='final', page_no=page_no, ref=item.self_ref, method=method,
                              rows=profile.get('rows'), columns=profile.get('columns'), score=profile.get('score'),
                              issues=profile.get('issues',[]), warnings=profile.get('warnings',[]), numeric_conflict=conflict,
@@ -9047,6 +9007,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 print(f"Rejected numeric cells: page {page_no}; "
                       f"{json.dumps(profile['numeric_outliers'], ensure_ascii=False)}", flush=True)
 
+        from docling_pdf_table_content import exclude_typed_primary_copies
+        exclude_typed_primary_copies(doc, routes, excluded, manifest, sys.modules[__name__])
         # Remove only spatially coincident flattened table copies, preserving notes/captions.
         manifest["preserved_table_notes"] = []
         protected_source_notes = set(manifest.get('protected_image_table_text_refs', []))
@@ -9272,10 +9234,10 @@ def export_local_html(args, result, normalized, orientation, source):
                     if any(latex_math(tag.get_text(), "inline") is None for tag in parsed.find_all("math")):
                         region = item_region(item, doc)
                         if region:
-                            if pdf_repair_enabled(args, 'math'):
-                                raise RuntimeError(f'Unrenderable inline equation on page {region[0]}, {item.self_ref}; no HTML published')
-                            diagnostic_event('TEXT_IMAGE_FALLBACK',ref=item.self_ref,page=region[0],bbox=region[1],reason='inline_math_cannot_render')
-                            rendered = image_html(regions.crop(*region), region[1][2] - region[1][0], "text")
+                            from docling_pdf_table_content import _safe_markup
+                            rendered = _safe_markup(item.text, sys.modules[__name__])
+                            diagnostic_event('TEXT_EDITABLE_LATEX_FALLBACK',ref=item.self_ref,page=region[0],
+                                bbox=region[1],reason='inline_math_source_notation_preserved')
                             return create_ser_result(text=rendered, span_source=item)
                 result = super().serialize(item=item, doc_serializer=doc_serializer, doc=doc, **kwargs)
                 if item.self_ref not in inline_math and item.self_ref not in paragraph_refs:
@@ -9292,10 +9254,14 @@ def export_local_html(args, result, normalized, orientation, source):
 
             def _process_formula(self, *, item, text, orig, doc, image_mode, formula_to_mathml, is_inline_scope):
                 formula = text or orig
+                rendered = None
                 if "<math" in formula:
+                    from docling_pdf_table_content import _safe_markup
                     parsed = BeautifulSoup(formula, "html.parser")
-                    formula = " ".join(tag.get_text() for tag in parsed.find_all("math"))
-                rendered = latex_math(formula, "inline" if is_inline_scope else "block")
+                    rendered = _safe_markup(str(parsed), sys.modules[__name__])
+                    formula = " ".join(tag.get('data-latex') or tag.get_text() for tag in parsed.find_all("math"))
+                else:
+                    rendered = latex_math(formula, "inline" if is_inline_scope else "block")
                 region = item_region(item, doc)
                 if rendered and region and region[0] in inline_math_pages and not args.primary_ocr_only:
                     page = native_reader.load_page(region[0])
@@ -9324,41 +9290,20 @@ def export_local_html(args, result, normalized, orientation, source):
                             diagnostic_event('PDF_RASTER_FORMULA_CHECK_ERROR',page=region[0],error=str(error))
                         finally:asset.close()
                 if rendered is None:
-                    if region is None:
-                        diagnostic_event('FORMULA_ERROR',ref=item.self_ref,reason='no_renderable_math_or_provenance')
-                        raise RuntimeError(f"Formula has neither renderable mathematics nor source provenance: {item.self_ref}")
-                    # Extend the SOURCE region before cropping as well as adding
-                    # white OCR padding; whitespace cannot restore cut indices.
-                    box = region[1]
-                    image = regions.crop(region[0], [box[0]-2, box[1]-2, box[2]+2, box[3]+2])
-                    try:
-                        buffer = BytesIO()
-                        image.save(buffer, format='PNG')
-                        if not args.primary_ocr_only:
-                            rendered = formula_recognizer(buffer.getvalue(), dict(
-                                media_name=item.self_ref, width=image.width, height=image.height,
-                                formula_item=True, paragraph_text='', inline=is_inline_scope))
-                        else:
-                            diagnostic_event('PDF_PRIMARY_FORMULA_SOURCE_KEEP', ref=item.self_ref,
-                                page=region[0], bbox=box, reason='no_renderable_primary_surya_formula')
-                        if rendered:
-                            recovered_math = BeautifulSoup(rendered, 'html.parser').math
-                            recovered_math['display'] = 'inline' if is_inline_scope else 'block'
-                            rendered = str(recovered_math)
-                    except Exception as exc:
-                        diagnostic_event('PDF_FORMULA_RECOVERY_ERROR',ref=item.self_ref,error=str(exc))
-                    if rendered is None:
-                        if pdf_repair_enabled(args, 'math'):
-                            raise RuntimeError(f'Equation has no MathML on page {region[0]}, {item.self_ref}; no HTML published')
-                        rendered = image_html(image, box[2]-box[0]+4, "formula")
-                    image.close()
+                    if not formula or not formula.strip():
+                        raise RuntimeError(f'Formula has no recognized source notation: {item.self_ref}')
+                    from docling_pdf_table_content import _safe_markup
+                    literal = BeautifulSoup('', 'html.parser').new_tag('math')
+                    literal['display'] = 'inline' if is_inline_scope else 'block'
+                    literal.string = formula
+                    rendered = _safe_markup(str(literal), sys.modules[__name__])
                 diagnostic_event('FORMULA_RESULT',ref=item.self_ref,page=region[0] if region else None,
-                                 bbox=region[1] if region else None,method='mathml' if '<math' in rendered else 'source_image',
-                                 reason='renderable_latex' if '<math' in rendered else 'latex_cannot_render',latex=diagnostic_summary(formula))
+                                 bbox=region[1] if region else None,method='mathml' if '<math' in rendered else 'latex',
+                                 reason='renderable_latex' if '<math' in rendered else 'source_notation_preserved',latex=diagnostic_summary(formula))
                 manifest["formulas"].append({"ref": item.self_ref, "page": region[0] if region else None,
                     "bbox": region[1] if region else None, "latex": formula,
                     "source_bbox": source_bbox(region[1], orientation[region[0]]) if region else None,
-                    "method": "mathml" if "<math" in rendered else "source_image"})
+                    "method": "mathml" if "<math" in rendered else "latex"})
                 return rendered
 
         class SourcePictures(HTMLPictureSerializer):
@@ -9439,6 +9384,8 @@ def export_local_html(args, result, normalized, orientation, source):
             figure.wrap(soup.new_tag("div", attrs={"class": "table-scroll wide"}))
         for bad in soup.select(".formula-not-decoded"):
             raise RuntimeError("Formula placeholder blocked before HTML publication")
+        from docling_pdf_table_content import validate_published_table_images
+        validate_published_table_images(soup, manifest)
         from docling_pdf_table_audit import register_final_graphic_assets
         register_final_graphic_assets(soup,manifest,sys.modules[__name__])
         from docling_scan_text import audit as audit_editable_tables
@@ -9481,7 +9428,7 @@ Keep all visible text in reading order (Russian Cyrillic, numbers, decimal comma
 Use headings and paragraphs where appropriate. Recognize tables even without ruling lines: <table>, <thead> for repeated headers, <tbody>, <tr>, <th>, <td> with exact rowspan/colspan; keep captions and table numbers. On every <table> set data-columns="N" (total logical column count) and data-continued="true" if it continues from the preceding page (usually a grid at the top of the page with body rows and no new caption/header), otherwise data-continued="false". Keep rowspans within the fragment; do not guess unseen cells.
 Multi-page tables: retain the full logical column grid on every fragment, even without repeated headers. Count all columns, including empty ones; never omit a column, collapse equal adjacent values into one cell, or invent extra colspan columns. Each row must fill the grid, accounting for active rowspans. Mark continuations even when no "continued" label is printed; use <thead> only for actual repeated headers, <tfoot> only for final notes. When a table number is visible, set data-table-id to that number. Mark running page headers and footers, including standalone document identifiers in the page margins, with data-page-furniture="true". Never mark body citations, section headings, the main cover title, table cells or footnotes as page furniture.
 Printed page/sheet numbers in the bottom margin (left, center or right), such as "45", "Лист 3" or "Стр. 12", must appear only as <!-- Номер листа: N --> at the end of the page HTML. Use the printed number, never the physical PDF page index; do not invent missing page numbers. Never apply this rule to numbers in body text, tables or formulas.
-Formulas: LaTeX without dollar delimiters inside <span data-formula="inline" data-bbox="left,top,right,bottom">LATEX</span> or <div data-formula="display" data-bbox="left,top,right,bottom">LATEX</div>. Bbox coordinates use the same entire-page 0..1000 system as diagrams. If a formula cannot be transcribed, preserve it as an <img data-bbox="..." alt="source formula">; never replace a visible formula with a missing/unrecognized-formula message. Preserve the source alphabet for EACH symbol: Latin, Greek and Cyrillic may coexist in one formula, including its indices and \text{}/\mathrm{} contents. Do not select one alphabet for a whole expression, transliterate Cyrillic, or normalize visually similar letters across alphabets. Use adjacent source definitions only as evidence for that particular symbol; never infer or correct numerical values or indices from a familiar equation. Russian explanatory words such as "при", "где", "если" stay OUTSIDE data-formula elements.
+Formulas: LaTeX without dollar delimiters inside <span data-formula="inline" data-bbox="left,top,right,bottom">LATEX</span> or <div data-formula="display" data-bbox="left,top,right,bottom">LATEX</div>. Bbox coordinates use the same entire-page 0..1000 system as diagrams. Never substitute a crop for text or a formula. Keep recognized source LaTeX verbatim in data-formula; if no notation can be recognized, leave that data-formula element empty so conversion reports the recognition failure instead of publishing a formula image. Preserve the source alphabet for EACH symbol: Latin, Greek and Cyrillic may coexist in one formula, including its indices and \text{}/\mathrm{} contents. Do not select one alphabet for a whole expression, transliterate Cyrillic, or normalize visually similar letters across alphabets. Use adjacent source definitions only as evidence for that particular symbol; never infer or correct numerical values or indices from a familiar equation. Russian explanatory words such as "при", "где", "если" stay OUTSIDE data-formula elements.
 Diagrams (also inside table cells): <img data-bbox="left,top,right,bottom" alt="source diagram"> at the original position; integer coordinates normalized to 0..1000 over the ENTIRE page image, origin top-left, including all labels and axes. Never replace a diagram with a text description, ASCII art, SVG or an invented URL."""
 
 
@@ -10100,6 +10047,10 @@ def export_api_html(result, base):
                 if attr.lower().startswith("on"):
                     del tag[attr]
         for img in soup.find_all("img"):
+            if str(img.get('alt', '')).strip().casefold() in {
+                    'source formula', 'source equation', 'formula', 'equation',
+                    'исходная формула', 'формула', 'уравнение'}:
+                raise RuntimeError(f'Page {page.page_no}: formula crop has no recognized editable notation')
             try:
                 l, t, r, b = map(float, img.get("data-bbox", "").split(","))
                 if not (0 <= l < r <= 1000 and 0 <= t < b <= 1000):
@@ -10122,33 +10073,22 @@ def export_api_html(result, base):
                 raise RuntimeError(f"Page {page.page_no}: diagram crop failed: {exc}") from exc
         for formula in soup.select("[data-formula]"):
             latex = formula.get_text().strip()
+            if not latex:
+                raise RuntimeError(f'Page {page.page_no}: formula has no recognized source notation')
             if re.search(r"[\u0400-\u052f]", latex):
                 diagnostic_event('FORMULA_SOURCE_CYRILLIC', page=page.page_no,
                                  policy='preserve_each_source_symbol_in_mixed_alphabets')
             try:
                 converted = latex_math(latex, "block" if formula["data-formula"] == "display" else "inline")
                 if converted is None:
-                    raise ValueError("Formula requires its source image")
+                    raise ValueError("Formula retained as editable source LaTeX")
                 mathml = BeautifulSoup(converted, "html.parser")
                 formula.replace_with(mathml.math)
             except Exception as exc:
-                print(f"API formula source preservation: page {page.page_no}; {exc}", file=sys.stderr)
-                source = page.image
-                if source is None:
-                    stored = result.document.pages.get(page.page_no)
-                    source = stored.image.pil_image if stored and stored.image else None
-                if source is None:
-                    raise RuntimeError(f"Source image unavailable for formula on page {page.page_no}") from exc
-                try:
-                    left, top, right, bottom = map(float, formula.get("data-bbox", "").split(","))
-                    if not (0 <= left < right <= 1000 and 0 <= top < bottom <= 1000):
-                        raise ValueError("Invalid formula bbox")
-                    cropped = source.crop((math.floor(left * source.width / 1000), math.floor(top * source.height / 1000),
-                                           math.ceil(right * source.width / 1000), math.ceil(bottom * source.height / 1000)))
-                    width = (right - left) * page.size.width / 1000
-                except ValueError:
-                    cropped, width = source, page.size.width
-                formula.replace_with(BeautifulSoup(image_html(cropped, width, "formula"), "html.parser"))
+                print(f"API formula source notation preserved: page {page.page_no}; {exc}", file=sys.stderr)
+                literal = soup.new_tag('span', attrs={'class': 'source-latex', 'data-latex': latex})
+                literal.string = '\\(' + latex + '\\)'
+                formula.replace_with(literal)
         root = soup.body or soup
         comment_page_number(root)
         for node in list(root.select('[data-page-furniture="true"], header, footer')):

@@ -587,6 +587,7 @@ def audit(soup,manifest,api):
     entries={e['ref']:e for e in manifest.get('tables',[])}
     issues=[];tables=[]
     diagrams={p['source_image_sha256'] for p in manifest.get('source_cell_diagrams',[])}
+    diagrams.update(p['source_image_sha256'] for p in manifest.get('typed_table_picture_assets',[]))
     for ordinal,table in enumerate(soup.find_all('table')):
         ref=table.get('data-pdf-table-ref');entry=entries.get(ref,{})
         profile=api.table_profile(str(table))

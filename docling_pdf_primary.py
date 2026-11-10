@@ -173,7 +173,12 @@ def _numeric(value):
 
 
 def mask_nonprimary_content(fragment, geometry, source_image, region, page, manifest, api):
-    """Keep source pixels when no primary OCR payload owns a physical cell."""
+    """Keep editable payload and request recovery when ownership is unproved.
+
+    A missing grid-to-OCR mapping is not evidence that text or mathematics
+    is an illustration. Do not replace the cell, or discard prose beside an
+    existing image, while the exporter's typed recovery resolves its source.
+    """
     if not geometry:
         return fragment, []
     soup = BeautifulSoup(fragment, 'html.parser')
@@ -182,60 +187,28 @@ def mask_nonprimary_content(fragment, geometry, source_image, region, page, mani
     before = api.table_profile(str(soup.table))
     physical = {_key(c): c for c in geometry.get('cells', [])}
     nodes = [n for n in soup.table.find_all(['td', 'th']) if n.find_parent('table') is soup.table]
-    retained = list(geometry.get('retained_cell_images', []))
     proofs = []
     for node, position in zip(nodes, before['cells']):
         key = _key(position)
         source = physical.get(key)
         if source is None or source.get('primary_ocr'):
             continue
-        images = node.find_all('img')
         if not node.get_text(strip=True) and not node.find('math'):
             continue
-        # Existing source drawings/crops are preserved; hidden-layer prose
-        # beside them cannot silently become the published Surya result.
-        if images:
-            images = [image.extract() for image in images]
-            node.clear()
-            for image in images:
-                node.append(image)
-        else:
-            box = source.get('bbox')
-            if source_image is None or not box:
-                raise RuntimeError('Unmapped primary OCR cell has no source pixels')
-            import math
-            sx = source_image.width/(region[2]-region[0])
-            sy = source_image.height/(region[3]-region[1])
-            pixels = (max(0, math.floor((box[0]-region[0])*sx)),
-                      max(0, math.floor((box[1]-region[1])*sy)),
-                      min(source_image.width, math.ceil((box[2]-region[0])*sx)),
-                      min(source_image.height, math.ceil((box[3]-region[1])*sy)))
-            if pixels[2] <= pixels[0] or pixels[3] <= pixels[1]:
-                raise RuntimeError('Unmapped primary OCR cell has invalid source bounds')
-            image = source_image.crop(pixels)
-            try:
-                crop = BeautifulSoup(api.image_html(image, box[2]-box[0], 'cell'), 'html.parser').img
-            finally:
-                image.close()
-            crop['data-source-cell'] = 'true'
-            node.clear()
-            node.append(crop)
-            retained = [e for e in retained if (e.get('row'), e.get('column')) != key[:2]]
-            retained.append(dict(row=key[0], column=key[1], bbox=list(box),
-                                 basis='source_pixels_without_mapped_primary_ocr'))
-        source.update(html=node.decode_contents(), text='', primary_content_unmapped=True)
-        proof = dict(page=page, row=key[0], column=key[1],
-                     reason='primary_ocr_not_mapped_keep_source_pixels', bbox=source.get('bbox'))
+        source.update(html=node.decode_contents(), text=node.get_text(' ', strip=True),
+                      primary_content_unmapped=True, typed_content_recovery_required=True)
+        proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
+                     reason='primary_ocr_not_mapped_preserve_editable_content', bbox=source.get('bbox'))
         proofs.append(proof)
         api.diagnostic_event('TABLE_PRIMARY_OCR_UNMAPPED', **proof)
     if not proofs:
         return fragment, []
-    geometry['retained_cell_images'] = sorted(retained, key=lambda c: (c['row'], c['column']))
     result = str(soup.table)
     after = api.table_profile(result)
     if {_key(c) for c in before['cells']} != {_key(c) for c in after['cells']} or after['issues']:
-        raise RuntimeError('Source-pixel fallback changed physical cell positions')
+        raise RuntimeError('Editable payload preservation changed physical cell positions')
     manifest.setdefault('primary_ocr_unmapped_cells', []).extend(proofs)
+    manifest.setdefault('typed_table_recovery_cells', []).extend(proofs)
     return result, proofs
 
 
@@ -276,8 +249,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             continue
         identity = hashlib.sha256(record['html'].encode('utf-8')).hexdigest()
         graphic_marker = '\ue000'+identity+'\ue001'
-        # Only the cell carrying an unknown graphic is ineligible. Preserve
-        # other primary cells without letting the cleaner hide that graphic.
+        # Mark graphic positions before cleaning. The OCR's image URL is not
+        # a source asset; a mixed cell can use only its own retained source
+        # images, substituted at these positions after cell ownership aligns.
         for image in list(raw.table.find_all(['img', 'svg'])):
             image.replace_with(graphic_marker)
         try:
@@ -305,10 +279,10 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
                     basis='terminal_primary_note_after_unique_complete_source_grid_partition'))
         primary_ends.append(primary['rows'])
         for cell in primary['cells']:
-            if _usable(cell) and graphic_marker not in cell['html']:
+            if _usable(cell):
                 proposals.setdefault(_key(cell), {}).setdefault(cell['html'], []).append(
                     dict(source_record_sha256=identity, source_bbox=list(bounds), basis=basis,
-                         header=cell.get('header', False)))
+                         header=cell.get('header', False), graphic_marker=graphic_marker))
         compound = _compound_footer(raw, primary, target, geometry, bounds, identity, api)
         if compound:
             key, html, proof = compound
@@ -333,6 +307,7 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
     protected = manifest.get('protected_source_graphic_assets', []) + manifest.get('source_cell_diagrams', [])
     preserved = []
     positions = set()
+    image_positions = set()
     for node, cell in zip(nodes, target['cells']):
         key = _key(cell)
         choices = proposals.get(key, {})
@@ -357,8 +332,6 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
                    (not cell.get('header') and bool(columns & graphic_columns)) or
                    any(e.get('source_column_context', {}).get('graphic_column') or
                        e.get('source_column_context', {}).get('dimension_column') for e in entries))
-        if graphic:
-            continue
         if len(choices) != 1:
             conflict = dict(page=page, row=key[0], column=key[1], reason='primary_readings_disagree',
                             readings=list(choices))
@@ -366,6 +339,43 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             api.diagnostic_event('TABLE_PRIMARY_OCR_CONFLICT', **conflict)
             continue
         html, readings = next(iter(choices.items()))
+        marker = readings[0].get('graphic_marker', '')
+        marker_count = html.count(marker) if marker else 0
+        images = [image for image in node.find_all('img')
+                  if image.get('data-source-cell') == 'true'
+                  or image.get('data-cell-content') == 'source-diagram']
+        mixed_unresolved = None
+        if marker_count:
+            if marker_count == len(images):
+                parts = html.split(marker)
+                html = ''.join(part + (str(images[index]) if index < len(images) else '')
+                               for index, part in enumerate(parts))
+            else:
+                mixed_unresolved = 'primary_graphic_placeholders_do_not_match_source_assets'
+        elif graphic and images:
+            # With no OCR placeholder, only exact editable content agreement
+            # proves that retaining the existing interleaving is lossless.
+            def editable_payload(value):
+                parsed = BeautifulSoup(value, 'html.parser')
+                for image in parsed.find_all('img'):
+                    image.decompose()
+                for math_node in parsed.find_all('math'):
+                    math_node.replace_with('\x00math:' + str(math_node) + '\x00')
+                return re.sub(r'\s+', '', parsed.get_text())
+            if editable_payload(html) == editable_payload(node.decode_contents()):
+                html = node.decode_contents()
+            else:
+                mixed_unresolved = 'primary_graphic_order_not_proven'
+        if mixed_unresolved:
+            pending = html.replace(marker, '') if marker else html
+            source.update(typed_content_recovery_required=True, pending_primary_html=pending)
+            proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
+                         bbox=source.get('bbox'), reason=mixed_unresolved,
+                         pending_primary_html=pending, source_images=len(images),
+                         primary_graphic_placeholders=marker_count)
+            manifest.setdefault('typed_table_recovery_cells', []).append(proof)
+            api.diagnostic_event('TABLE_PRIMARY_MIXED_CONTENT_RECOVERY_REQUIRED', **proof)
+            continue
         current = node.get_text(' ', strip=True)
         primary_text = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True)
         if (_numeric(current) and _numeric(primary_text) and
@@ -385,12 +395,15 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
         node.append(BeautifulSoup(html, 'html.parser'))
         if any(r['header'] for r in readings):
             node.name = 'th'
+        reading = {name: value for name, value in readings[0].items() if name != 'graphic_marker'}
         proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
-                     method='primary_ocr_payload_on_source_grid', **readings[0])
+                     method='primary_ocr_payload_on_source_grid', **reading)
         source.update(html=node.decode_contents(), text=node.get_text(' ', strip=True), primary_ocr=proof)
         source.pop('raster_cell_ocr', None)
         source.pop('raster_cell_ocr_source', None)
         positions.add(key[:2])
+        if images and BeautifulSoup(html, 'html.parser').find('img'):
+            image_positions.add(key[:2])
         preserved.append(proof)
         api.diagnostic_event('TABLE_PRIMARY_OCR_PRESERVED', **proof)
     if not preserved:
@@ -402,7 +415,8 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
     # participate in the one-to-one image/bbox mapping used by secondary OCR.
     for name in ('retained_cell_images', 'pending_cell_ocr'):
         if name in geometry:
-            geometry[name] = [e for e in geometry[name] if (e.get('row'), e.get('column')) not in positions]
+            geometry[name] = [e for e in geometry[name] if (e.get('row'), e.get('column')) not in positions
+                              or name == 'retained_cell_images' and (e.get('row'), e.get('column')) in image_positions]
     result = str(soup.table)
     after = api.table_profile(result)
     if {_key(c) for c in after['cells']} != {_key(c) for c in target['cells']} or after['issues']:

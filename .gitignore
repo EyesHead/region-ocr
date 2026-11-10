@@ -193,3 +193,7 @@ regression/*
 # Synthetic regressions for broken scan separators (no source documents)
 !regression/broken_scan_rules/
 !regression/broken_scan_rules/*.py
+
+# Typed table content regressions; synthetic inputs only
+!regression/typed_table_cells/
+!regression/typed_table_cells/*.py

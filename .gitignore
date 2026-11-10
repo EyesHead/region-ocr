@@ -179,3 +179,6 @@ yarn-error.log*
 # Public pinned installer metadata and mandatory third-party license notices
 !/installer/install-plan.json
 !/installer/notices/*.txt
+!/installer/tests/
+!/installer/tests/test_*.py
+!/installer/tests/*.cs

@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -18,13 +19,13 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("REGION OCR — установка")]
 [assembly: AssemblyProduct("REGION OCR")]
-[assembly: AssemblyVersion("1.8.3.0")]
-[assembly: AssemblyFileVersion("1.8.3.0")]
+[assembly: AssemblyVersion("1.8.4.0")]
+[assembly: AssemblyFileVersion("1.8.4.0")]
 
 internal static class Setup
 {
     internal const string Product = "REGION OCR";
-    internal const string Version = "1.8.3";
+    internal const string Version = "1.8.4";
     internal const string Marker = ".region-ocr-install.json";
     internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\RegionOCR";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
@@ -327,32 +328,95 @@ internal sealed class Wizard : Form
         catch (InvalidOperationException) { }
     }
 
+    void DownloadStatus(string target, string text)
+    {
+        Status(3, text);
+        try { File.AppendAllText(Path.Combine(Path.GetDirectoryName(target), "installation.log"), DateTime.UtcNow.ToString("o") + " " + text + Environment.NewLine, new UTF8Encoding(false)); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     void Download(Dictionary<string, object> item, string target, CancellationToken token)
     {
-        for (int attempt = 0; attempt < 4; attempt++)
+        long expected = Convert.ToInt64(item["bytes"]);
+        string name = (string)item["filename"], host = new Uri((string)item["url"]).Host;
+        for (int attempt = 0; attempt < 8; attempt++)
         {
             token.ThrowIfCancellationRequested();
             try
             {
-                var request = (HttpWebRequest)WebRequest.Create((string)item["url"]);
-                request.UserAgent = "REGION-OCR-Setup/1.8.3"; request.Timeout = request.ReadWriteTimeout = 90000;
-                using (token.Register(request.Abort))
-                using (var response = request.GetResponse())
-                using (var input = response.GetResponseStream())
-                using (var output = File.Create(target))
+                long offset = File.Exists(target) ? new FileInfo(target).Length : 0;
+                if (offset >= expected)
                 {
-                    byte[] buffer = new byte[1024 * 1024]; int count;
-                    while ((count = input.Read(buffer, 0, buffer.Length)) > 0) { token.ThrowIfCancellationRequested(); output.Write(buffer, 0, count); }
+                    if (offset == expected && Setup.Digest(target) == (string)item["sha256"]) return;
+                    File.Delete(target); offset = 0;
                 }
-                if (new FileInfo(target).Length != Convert.ToInt64(item["bytes"]) || Setup.Digest(target) != (string)item["sha256"])
+                DownloadStatus(target, "Загрузка " + name + " с " + host + ": попытка " + (attempt + 1) + "/8, сохранено " + offset + " байт.");
+                var request = (HttpWebRequest)WebRequest.Create((string)item["url"]);
+                request.UserAgent = "REGION-OCR-Setup/1.8.4"; request.Timeout = request.ReadWriteTimeout = 180000;
+                if (offset > 0) request.AddRange(offset);
+                using (token.Register(request.Abort))
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    long responseBytes = expected;
+                    if (response.StatusCode == HttpStatusCode.PartialContent)
+                    {
+                        var range = Regex.Match(response.Headers["Content-Range"] ?? "", @"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$");
+                        long start, end, total;
+                        if (!range.Success || !Int64.TryParse(range.Groups[1].Value, out start)
+                            || !Int64.TryParse(range.Groups[2].Value, out end) || !Int64.TryParse(range.Groups[3].Value, out total)
+                            || start != offset || total != expected || end < start || end >= total)
+                            throw new InvalidDataException("Недопустимый Content-Range для " + name);
+                        responseBytes = end - start + 1;
+                        if (response.ContentLength >= 0 && response.ContentLength != responseBytes)
+                            throw new InvalidDataException("Неверная длина диапазона для " + name);
+                    }
+                    else if (response.StatusCode == HttpStatusCode.OK)
+                    {
+                        // A server may ignore Range. Replace the partial file instead of appending a full response.
+                        offset = 0;
+                        if (response.ContentLength >= 0 && response.ContentLength != expected)
+                            throw new InvalidDataException("Неверный размер ответа для " + name);
+                    }
+                    else throw new InvalidDataException("Неожиданный HTTP-ответ для " + name);
+                    using (var input = response.GetResponseStream())
+                    using (var output = new FileStream(target, offset > 0 ? FileMode.Append : FileMode.Create, FileAccess.Write))
+                    {
+                        byte[] buffer = new byte[64 * 1024]; int count; long received = 0;
+                        while ((count = input.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            received += count;
+                            if (received > responseBytes) throw new InvalidDataException("Ответ превышает ожидаемый размер для " + name);
+                            output.Write(buffer, 0, count);
+                        }
+                        if (received != responseBytes) throw new IOException("Загрузка прервана: " + name);
+                    }
+                }
+                if (new FileInfo(target).Length != expected) throw new IOException("Загружена только часть " + name);
+                if (Setup.Digest(target) != (string)item["sha256"])
                     throw new InvalidDataException("Не совпадает SHA256: " + item["filename"]);
+                token.ThrowIfCancellationRequested();
+                DownloadStatus(target, "Размер и SHA256 проверены: " + name);
                 return;
             }
-            catch (Exception)
+            catch (Exception error)
             {
-                if (File.Exists(target)) File.Delete(target);
                 token.ThrowIfCancellationRequested();
-                if (attempt == 3) throw;
+                // Interrupted reads retain verified-by-position bytes; invalid responses and hashes start over.
+                bool restart = error is InvalidDataException;
+                string reason = error.GetType().Name;
+                var network = error as WebException;
+                if (network != null)
+                {
+                    reason += "/" + network.Status;
+                    var failedResponse = network.Response as HttpWebResponse;
+                    if (failedResponse != null && failedResponse.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) restart = true;
+                    if (network.Response != null) network.Response.Close();
+                }
+                if (restart && File.Exists(target)) File.Delete(target);
+                DownloadStatus(target, "Не удалось загрузить " + name + ", попытка " + (attempt + 1) + "/8: " + reason + ". Повторная попытка продолжит загрузку.");
+                if (attempt == 7) throw new IOException("Не удалось загрузить " + name + " с " + host + " после 8 попыток. Проверьте интернет, VPN или прокси и повторите установку. Подробности в installation.log.", error);
                 if (token.WaitHandle.WaitOne(1000 * (attempt + 1))) token.ThrowIfCancellationRequested();
             }
         }

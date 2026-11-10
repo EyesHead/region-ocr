@@ -5,13 +5,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
+import urllib.error
 import zipfile
+
+
+DOWNLOAD_TIMEOUT = 180
+DOWNLOAD_ATTEMPTS = 8
 
 
 def safe_path(root, name):
@@ -54,30 +60,71 @@ class Installer:
     def download(self, item):
         name = item.get('filename') or Path(item['path']).name
         target = safe_path(self.cache, name)
-        for attempt in range(4):
-            try:
-                digest = hashlib.sha256()
+        expected = item['bytes']
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            count = target.stat().st_size if target.exists() else 0
+            if count > expected:
+                target.unlink()
                 count = 0
+            try:
+                with self.log.open('a', encoding='utf-8') as log:
+                    log.write(f'Download {name}: attempt {attempt + 1}/{DOWNLOAD_ATTEMPTS}, '
+                              f'{count}/{expected} bytes; source: {item["url"]}\n')
                 tick = 0.0
-                req = urllib.request.Request(item['url'], headers={'User-Agent': 'REGION-OCR-Setup/1.8.3'})
-                with urllib.request.urlopen(req, timeout=90) as response, target.open('wb') as output:
-                    while block := response.read(1024 * 1024):
-                        output.write(block)
-                        digest.update(block)
-                        count += len(block)
-                        if time.monotonic() - tick > .4:
-                            self.report(f'Загрузка {name}: {count // 1048576} / {item["bytes"] // 1048576} МБ', count)
-                            tick = time.monotonic()
-                if digest.hexdigest() != item['sha256'] or count != item['bytes']:
+                if count < expected:
+                    headers = {'User-Agent': 'REGION-OCR-Setup/1.8.4', 'Accept-Encoding': 'identity'}
+                    if count:
+                        headers['Range'] = f'bytes={count}-'
+                    req = urllib.request.Request(item['url'], headers=headers)
+                    self.report(f'Загрузка {name}: {count // 1048576} / {expected // 1048576} МБ', count)
+                    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as response:
+                        if response.status == 206:
+                            span = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',
+                                                response.headers.get('Content-Range', ''))
+                            if (not span or int(span[1]) != count or int(span[3]) != expected
+                                    or not count <= int(span[2]) < expected):
+                                raise ValueError('Invalid Content-Range: ' + name)
+                        elif response.status == 200:
+                            # Some servers ignore Range; replace the prefix rather than append it.
+                            count = 0
+                        else:
+                            raise ValueError(f'Unexpected HTTP status {response.status}: {name}')
+                        with target.open('ab' if count else 'wb') as output:
+                            # read1 persists available bytes even if the next socket read times out.
+                            while block := response.read1(256 * 1024):
+                                if count + len(block) > expected:
+                                    raise ValueError('Downloaded size exceeds pinned size: ' + name)
+                                output.write(block)
+                                count += len(block)
+                                if time.monotonic() - tick > .4:
+                                    self.report(f'Загрузка {name}: {count // 1048576} / {expected // 1048576} МБ', count)
+                                    tick = time.monotonic()
+                    if count != expected:
+                        raise ConnectionError(f'Incomplete download: {count}/{expected} bytes')
+                with target.open('rb') as source:
+                    digest = hashlib.file_digest(source, 'sha256').hexdigest()
+                if digest != item['sha256']:
                     raise ValueError('SHA256/size mismatch: ' + name)
+                with self.log.open('a', encoding='utf-8') as log:
+                    log.write(f'Verified {name}: {count} bytes, SHA256 {digest}\n')
                 self.completed += count
                 return target
-            except Exception:
-                target.unlink(missing_ok=True)
-                if attempt == 3:
-                    raise
-                self.report(f'Повторная попытка загрузить {name} ({attempt + 2}/4)')
-                time.sleep(2 ** attempt)
+            except Exception as error:
+                # Keep transport progress, but never reuse an invalid range or corrupt file.
+                if isinstance(error, ValueError) or (isinstance(error, urllib.error.HTTPError) and error.code == 416):
+                    target.unlink(missing_ok=True)
+                saved = target.stat().st_size if target.exists() else 0
+                reason = f'{type(error).__name__}: {error}'
+                with self.log.open('a', encoding='utf-8') as log:
+                    log.write(f'Download failed {name}: {saved}/{expected} bytes; {reason}\n')
+                if attempt == DOWNLOAD_ATTEMPTS - 1:
+                    raise RuntimeError(f'Не удалось загрузить {name} после {DOWNLOAD_ATTEMPTS} попыток '
+                                       f'({saved}/{expected} байт). Источник: {item["url"]}. '
+                                       f'Причина: {reason}. Проверьте интернет и повторите установку. '
+                                       'Подробности в installation.log.') from error
+                self.report(f'Повторная загрузка {name} ({attempt + 2}/{DOWNLOAD_ATTEMPTS}); '
+                            f'сохранено {saved // 1048576} МБ', saved)
+                time.sleep(min(2 ** attempt, 16))
 
     def pip(self, archive, *, target=None):
         args = [str(self.python), '-s', '-m', 'pip', '--isolated', 'install',

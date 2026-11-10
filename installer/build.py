@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VERSION = '1.8.3'
+VERSION = '1.8.4'
 
 
 def build(output):
@@ -27,10 +27,12 @@ def build(output):
     files = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '-z']).decode('utf-8').split('\0')
     files = {ROOT / name for name in files if name and (ROOT / name).is_file()}
     files.update(f for f in HERE.rglob('*') if f.is_file() and '__pycache__' not in f.parts
+                 and 'tests' not in f.relative_to(HERE).parts
                  and f.name != 'environment-snapshot.json')
     files.add(ROOT / 'DocumentConverter.exe')
     files = {f for f in files if f.suffix != '.pyc' and f.name != 'environment-snapshot.json'
-             and f.relative_to(ROOT).parts[0] not in {'regression', 'tests', 'docs'}}
+             and f.relative_to(ROOT).parts[0] not in {'regression', 'tests', 'docs'}
+             and 'tests' not in f.relative_to(ROOT).parts}
     compiler = Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
     if not compiler.is_file():
         raise FileNotFoundError('The system .NET Framework C# compiler was not found')
@@ -54,7 +56,7 @@ def build(output):
         (work / 'app.config').write_text(config, encoding='utf-8')
         (work / 'installer.manifest').write_text('''<?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.8.3.0" name="EyesHead.RegionOCR.Setup"/>
+  <assemblyIdentity version="1.8.4.0" name="EyesHead.RegionOCR.Setup"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
   </requestedPrivileges></security></trustInfo>

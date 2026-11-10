@@ -53,7 +53,7 @@ LOCAL_SCHEMA = 6
 TEXT_CLEANUP_SCHEMA = 6
 TABLE_RECOVERY_SCHEMA = 21
 TABLE_JOIN_SCHEMA = 14
-TABLE_CELL_SCHEMA = 37
+TABLE_CELL_SCHEMA = 38
 # Whole source-image fallbacks retain one actual rendered pixel beyond owned
 # glyph extents; this is geometry only and never supplies editable PDF text.
 SOURCE_IMAGE_BOUNDS_HALO_PIXELS = 1
@@ -1716,7 +1716,7 @@ class RasterTableRules:
                 groups[-1].append((x,y0,y1))
             else:
                 groups.append([(x,y0,y1)])
-        rails = []
+        rails, attached_rails = [], []
         for group in groups:
             x = sum(v[0] for v in group)/len(group)
             segments = sorted((max(top,v[1]),min(bottom,v[2])) for v in group)
@@ -1727,6 +1727,16 @@ class RasterTableRules:
                         and any(v[1]-4 <= y <= v[2]+4 for v in group)}
             if coverage >= height*.6 and len(contacts)>=2:
                 rails.append((x,min(v[1] for v in group),max(v[2] for v in group)))
+            elif len(contacts)>=2:
+                # A table may have columns only in its header and merged rows
+                # below. Both source junctions prove such short dividers; they
+                # never substitute for the continuous outer side rails.
+                # Test each connected stroke separately: a formula elsewhere
+                # in the merged band can share its X without extending it.
+                for rail_x,start,end in group:
+                    if all(any(abs(y-position)<=4 and a-4<=rail_x<=b+4
+                               for y,a,b in long_horizontal) for position in (start,end)):
+                        attached_rails.append((rail_x,start,end))
         left_rails = [bar for bar in rails if abs(bar[0] - left) <= tolerance]
         right_rails = [bar for bar in rails if abs(bar[0] - right) <= tolerance]
         if not left_rails or not right_rails:
@@ -1751,7 +1761,9 @@ class RasterTableRules:
         bounds = [min(x for x, _ in corners) / self.scale, min(y for _, y in corners) / self.scale,
                   max(x for x, _ in corners) / self.scale, max(y for _, y in corners) / self.scale]
         xs = sorted({x for x, y0, y1 in rails if a[0] - 3 <= x <= b[0] + 3
-                     and min(y1, rule_bottom) - max(y0, rule_top) >= (rule_bottom - rule_top) * .6})
+                     and min(y1, rule_bottom) - max(y0, rule_top) >= (rule_bottom - rule_top) * .6}
+                    | {x for x,y0,y1 in attached_rails if a[0]+3<x<b[0]-3
+                       and y0>=rule_top-4 and y1<=rule_bottom+4})
         # Group the two sides of a thick printed rule into one column boundary.
         groups = []
         for x in xs:
@@ -9150,6 +9162,9 @@ def export_local_html(args, result, normalized, orientation, source):
         if args.primary_ocr_only and pdf_repair_enabled(args, 'subrows'):
             from docling_pdf_primary_layout import expand_primary_fraction_rows
             expand_primary_fraction_rows(doc,routes,manifest,sys.modules[__name__])
+        if args.primary_ocr_only and pdf_repair_enabled(args, 'boundaries'):
+            from docling_pdf_formula_bands import recover_formula_band_routes
+            recover_formula_band_routes(doc,routes,excluded,manifest,native_reader,regions,records,sys.modules[__name__])
         if (args.primary_ocr_only and getattr(args, 'pdf_borderless_rows', True)
                 and pdf_repair_enabled(args, 'subrows')):
             repair_borderless_table_routes(doc,routes,manifest,native_reader,regions,sys.modules[__name__])

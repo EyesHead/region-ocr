@@ -182,3 +182,10 @@ yarn-error.log*
 !/installer/tests/
 !/installer/tests/test_*.py
 !/installer/tests/*.cs
+
+# Portable regressions for full-width formula bands (no source documents)
+!regression/
+regression/*
+!regression/formula_bands/
+!regression/formula_bands/*.py
+!regression/formula_bands/README.md

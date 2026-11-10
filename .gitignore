@@ -189,3 +189,7 @@ regression/*
 !regression/formula_bands/
 !regression/formula_bands/*.py
 !regression/formula_bands/README.md
+
+# Synthetic regressions for broken scan separators (no source documents)
+!regression/broken_scan_rules/
+!regression/broken_scan_rules/*.py

@@ -53,7 +53,7 @@ LOCAL_SCHEMA = 6
 TEXT_CLEANUP_SCHEMA = 6
 TABLE_RECOVERY_SCHEMA = 21
 TABLE_JOIN_SCHEMA = 14
-TABLE_CELL_SCHEMA = 38
+TABLE_CELL_SCHEMA = 39
 # Whole source-image fallbacks retain one actual rendered pixel beyond owned
 # glyph extents; this is geometry only and never supplies editable PDF text.
 SOURCE_IMAGE_BOUNDS_HALO_PIXELS = 1
@@ -4243,6 +4243,10 @@ class NativeTableReader:
                     edges.append(dict(x0=left,x1=right,top=position,bottom=position,
                                       width=right-left,height=0,orientation='h'))
         edges=merge_edges(edges,2,2,3,3)
+        from docling_pdf_scan_recovery import join_broken_scan_rules
+        edges, broken_rule_proofs = join_broken_scan_rules(edges)
+        for proof in broken_rule_proofs:
+            diagnostic_event('SCAN_BROKEN_RULE_JOINED', page_no=page_no, **proof)
         tables=cells_to_tables(intersections_to_cells(edges_to_intersections(edges,3,3)))
         boxes=max(tables,key=lambda t:sum((b[2]-b[0])*(b[3]-b[1]) for b in t),default=[])
         if not boxes:

@@ -10,6 +10,10 @@
   let activePageMenu;
   let duplicateDecision;
   let uploadQueue = Promise.resolve();
+  let updateSnapshot = null;
+  let updateTimer;
+  let updateRequestBusy = false;
+  const updateLockedControls = new Map();
   function toast(message) {
     $('#toast').textContent = message;
     $('#toast').hidden = false;
@@ -17,6 +21,7 @@
     toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 6500);
   }
   async function api(path, options = {}) {
+    if (updateSnapshot?.installing && options.method && options.method !== 'GET' && !path.startsWith('/api/updates')) throw new Error('Подготавливается обновление. Дождитесь перезапуска приложения.');
     const headers = { 'X-Local-App': '1', ...(options.headers || {}) };
     const response = await fetch(path, { ...options, headers, cache: 'no-store' });
     let payload;
@@ -50,18 +55,108 @@
     return node;
   }
   function fileIcon(name) {
-    const label = extension(name).slice(0, 4).toUpperCase();
+    const type = extension(name);
+    const families = { pdf: 'pdf', docx: 'word', pptx: 'slides', xlsx: 'sheet', html: 'web', htm: 'web', png: 'image', jpg: 'image', jpeg: 'image', tif: 'image', tiff: 'image', bmp: 'image', webp: 'image', gif: 'image' };
+    const family = families[type] || 'other';
+    const label = type.slice(0, 4).toUpperCase() || 'FILE';
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     icon.setAttribute('viewBox', '0 0 44 54');
-    icon.setAttribute('class', 'file-icon');
+    icon.setAttribute('class', `file-icon file-icon-${family} file-type-${type || 'unknown'}`);
     icon.setAttribute('aria-hidden', 'true');
-    icon.innerHTML = '<path d="M4 1h22l14 14v37H4zM26 1v15h14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>';
+    const marks = {
+      pdf: '<path d="m12 27 4-7 4 7 4-4 5 4"/>',
+      word: '<path d="m11 21 2 8 3-5 3 5 2-8M25 22h6M25 27h6"/>',
+      slides: '<path d="M11 21h20v10H11zM21 31v3M17 34h8M15 28l4-4 4 2 5-3"/>',
+      sheet: '<path d="M11 21h20v11H11zM11 26h20M18 21v11M25 21v11"/>',
+      web: '<path d="m16 21-5 5 5 5m11-10 5 5-5 5m-4-12-3 14"/>',
+      image: '<path d="M11 21h20v12H11zM12 31l6-6 5 5 4-3 4 4"/><circle cx="26" cy="24" r="1"/>',
+      other: '<path d="M12 22h18M12 27h13"/>'
+    };
+    icon.innerHTML = `<path class="file-paper" d="M4 1h22l14 14v37H4z"/><path class="file-fold" d="M26 1v15h14"/><g class="file-mark">${marks[family]}</g><rect class="file-label" x="1" y="35" width="42" height="16" rx="2"/>`;
     const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttribute('x', '22'); text.setAttribute('y', '36'); text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('font-size', '11'); text.setAttribute('font-family', 'Arial, sans-serif'); text.setAttribute('font-weight', '600'); text.setAttribute('fill', 'currentColor');
+    text.setAttribute('x', '22'); text.setAttribute('y', '46.5'); text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('font-size', label.length > 3 ? '9.5' : '11'); text.setAttribute('font-family', 'Arial, sans-serif'); text.setAttribute('font-weight', '700'); text.setAttribute('fill', 'white');
     text.textContent = label;
     icon.append(text);
     return icon;
+  }
+  function statusIcon(status) {
+    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    icon.setAttribute('aria-hidden', 'true');
+    const shapes = {
+      done: '<path d="m5 12 4.5 4.5L19 7"/>',
+      queued: '<circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/>',
+      running: '<circle cx="12" cy="12" r="9" stroke-dasharray="3 4"/>',
+      uploading: '<path d="M12 17V4m-5 5 5-5 5 5M4 16v4h16v-4"/>',
+      error: '<circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 3v1"/>',
+      cancelled: '<circle cx="12" cy="12" r="9"/><path d="M9 8v8m6-8v8"/>'
+    };
+    icon.innerHTML = shapes[status] || shapes.queued;
+    return icon;
+  }
+  function addedTime(value) {
+    const date = new Date(value);
+    if (!value || !Number.isFinite(date.getTime())) return '';
+    const now = new Date();
+    const today = date.toDateString() === now.toDateString();
+    const day = today ? 'Сегодня' : date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', ...(date.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) });
+    return `${day}, ${date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`;
+  }
+  function newestFirst(jobs) {
+    return jobs.map((job, index) => ({ job, index, added: Date.parse(job.created_at) || 0 }))
+      .sort((a, b) => b.added - a.added || a.index - b.index).map(item => item.job);
+  }
+  function renderUpdates(snapshot) {
+    updateSnapshot = snapshot;
+    const panel = $('.app-updates');
+    panel.classList.toggle('has-update', !!snapshot.available);
+    panel.classList.toggle('has-error', !!snapshot.error);
+    panel.classList.toggle('is-installing', !!snapshot.installing);
+    $('#update-button-label').textContent = snapshot.installing ? 'Подготовка обновления…' : snapshot.checking ? 'Проверка обновлений…' : snapshot.available ? `Обновить до ${snapshot.latest_version}` : 'Проверить обновления';
+    $('#update-button').disabled = !!(snapshot.installing || snapshot.checking || updateRequestBusy);
+    const version = snapshot.current_version ? `Версия ${snapshot.current_version}` : '';
+    $('#update-status').textContent = [version, snapshot.error || snapshot.message || (snapshot.available ? 'Доступна новая версия' : 'Установлена последняя версия')].filter(Boolean).join(' · ');
+    if (snapshot.installing) {
+      document.querySelectorAll('.controls button, .controls input, .job-actions button, .job-main .text-button, #add-files-button, #clear-button, #output-change, #download-all').forEach(control => {
+        if (!updateLockedControls.has(control)) updateLockedControls.set(control, control.disabled);
+        control.disabled = true;
+      });
+    } else if (updateLockedControls.size) {
+      updateLockedControls.forEach((disabled, control) => { if (control.isConnected) control.disabled = disabled; });
+      updateLockedControls.clear();
+    }
+  }
+  async function refreshUpdates() {
+    clearTimeout(updateTimer);
+    try { renderUpdates(await api('/api/updates')); }
+    catch (error) {
+      if (!updateSnapshot?.installing) $('#update-status').textContent = 'Не удалось проверить обновления. Нажмите кнопку, чтобы повторить.';
+    } finally { updateTimer = setTimeout(refreshUpdates, updateSnapshot?.checking || updateSnapshot?.installing ? 2000 : 60000); }
+  }
+  async function checkOrOfferUpdate() {
+    if (updateRequestBusy || updateSnapshot?.installing || updateSnapshot?.checking) return;
+    if (updateSnapshot?.available) {
+      $('#update-description').textContent = `Будет установлена версия ${updateSnapshot.latest_version}. Приложение закроется и откроется снова после обновления. Документы и настройки сохранятся.`;
+      $('#update-dialog').showModal();
+      return;
+    }
+    updateRequestBusy = true;
+    $('#update-button').disabled = true;
+    $('#update-button-label').textContent = 'Проверка обновлений…';
+    try { renderUpdates(await post('/api/updates/check', {})); }
+    catch (error) { toast(error.message); }
+    finally { updateRequestBusy = false; await refreshUpdates(); }
+  }
+  async function installUpdate() {
+    if (updateRequestBusy || updateSnapshot?.installing) return;
+    updateRequestBusy = true;
+    $('#update-confirm').disabled = true;
+    try {
+      renderUpdates(await post('/api/updates/install', {}));
+      $('#update-dialog').close();
+    } catch (error) { toast(error.message); }
+    finally { updateRequestBusy = false; $('#update-confirm').disabled = false; await refreshUpdates(); }
   }
   function button(text, className, action) {
     const node = element('button', className, text);
@@ -277,6 +372,7 @@
     const row = element('article', 'job-row');
     row.dataset.id = job.id;
     row.dataset.status = status;
+    if (job.legacy_export) row.dataset.needsExport = 'true';
     row.setAttribute('role', 'listitem');
     row.append(fileIcon(job.name));
     const main = element('div', 'job-main');
@@ -284,12 +380,15 @@
     name.title = job.name;
     main.append(name);
     const meta = [];
-    if (extension(job.name) === 'pdf' && job.source_page_count) meta.push(countText(job.source_page_count, ['страница', 'страницы', 'страниц']));
-    else if (job.stats && job.stats.pages) meta.push(countText(job.stats.pages, extension(job.name) === 'xlsx' ? ['лист', 'листа', 'листов'] : ['страница', 'страницы', 'страниц']));
+    const added = addedTime(job.created_at);
+    if (added) meta.push(`Добавлен: ${added}`);
     if (job.pages) meta.push(`Выбраны страницы ${job.pages.replace('-', '–')}`);
     if (job.size !== undefined) meta.push(sizeText(job.size));
     if (status === 'done') meta.push(`→ ${formats[convertedFormat]}`);
     main.append(element('p', 'job-meta', meta.join(' · ')));
+    const pages = extension(job.name) === 'pdf' ? job.source_page_count || job.stats?.pages : job.stats?.pages;
+    const pageCount = element('p', 'job-pages', pages ? countText(pages, extension(job.name) === 'xlsx' ? ['лист', 'листа', 'листов'] : ['страница', 'страницы', 'страниц']) : '');
+    const statusRegion = element('div', 'job-state');
     if (status === 'running') {
       const progress = Math.min(100, Math.max(0, Number(job.progress) || 0));
       const line = element('div', 'progress-line');
@@ -301,7 +400,7 @@
       fill.style.width = `${progress}%`;
       track.append(fill);
       line.append(track, element('span', 'progress-percent', `${Math.round(progress)}%`));
-      main.append(line);
+      statusRegion.append(line);
     }
     const stage = status === 'error' ? job.user_error || 'Не удалось преобразовать документ. Повторите попытку.' : job.stage;
     if (stage && status !== 'done') main.append(element('p', `job-stage${status === 'error' ? ' error' : ''}`, stage));
@@ -312,18 +411,13 @@
       reexport.disabled = state.busy;
       main.append(reexport);
     }
-    row.append(main);
+    row.append(main, pageCount, statusRegion);
     const actions = element('div', 'job-actions');
-    const statusNames = { queued: 'В очереди', running: 'Обработка', done: 'Готово', error: 'Ошибка', cancelled: 'Остановлено', uploading: 'Загрузка' };
+    const statusNames = { queued: 'В очереди', running: 'Обработка', done: 'OCR выполнен', error: 'Ошибка', cancelled: 'Остановлено', uploading: 'Загрузка' };
     const needsExport = status === 'done' && job.legacy_export;
     const statusLabel = element('span', `job-status ${needsExport ? 'queued' : status}`, needsExport ? 'Нужен экспорт' : statusNames[status] || status);
-    if (status === 'done' && !needsExport) {
-      const tick = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      tick.setAttribute('viewBox', '0 0 24 24'); tick.setAttribute('aria-hidden', 'true');
-      tick.innerHTML = '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m7 12 3.2 3.3L17 8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>';
-      statusLabel.prepend(tick);
-    }
-    main.append(statusLabel);
+    statusLabel.prepend(statusIcon(needsExport ? 'queued' : status));
+    statusRegion.prepend(statusLabel);
     if (status !== 'uploading') {
       const sources = element('div', 'job-source-controls');
       sources.append(originalButton(job));
@@ -362,7 +456,7 @@
     if (control) { const details = control.closest('details'); if (details && control.tagName !== 'SUMMARY') details.open = true; control.focus({ preventScroll: true }); }
   }
   function render() {
-    const jobs = [...state.jobs, ...state.uploading];
+    const jobs = newestFirst([...state.jobs, ...state.uploading]);
     const normalizedQuery = state.query.trim().toLocaleLowerCase('ru-RU');
     const visibleJobs = jobs.filter(job => (!normalizedQuery || job.name.toLocaleLowerCase('ru-RU').includes(normalizedQuery))
       && (state.filter === 'all' || state.filter === 'done' && job.status === 'done' && !job.legacy_export || state.filter === 'active' && ['queued', 'running', 'uploading'].includes(job.status)));
@@ -436,6 +530,7 @@
       plaintext: 'Текст без оформления. Для таблиц и формул выберите HTML или JSON.'
     };
     $('#format-note').textContent = notes[state.format];
+    if (updateSnapshot?.installing) renderUpdates(updateSnapshot);
   }
   function updateOutputDirectory(value, error = null) {
     if (!value) return;
@@ -518,11 +613,12 @@
     }
   }
   async function uploadFiles(files) {
+    if (updateSnapshot?.installing) { toast('Подготавливается обновление. Дождитесь перезапуска приложения.'); return; }
     const valid = [];
     const invalid = [];
     for (const file of files) (supported.has(extension(file.name)) ? valid : invalid).push(file);
     if (invalid.length) toast(`Формат не поддерживается: ${invalid.map(file => file.name).join(', ')}`);
-    const localJobs = valid.map((file, index) => ({ id: `upload-${Date.now()}-${index}-${Math.random()}`, name: file.name, size: file.size, status: 'uploading', stage: 'Проверка файла…', file }));
+    const localJobs = valid.map((file, index) => ({ id: `upload-${Date.now()}-${index}-${Math.random()}`, name: file.name, size: file.size, created_at: new Date().toISOString(), status: 'uploading', stage: 'Проверка файла…', file }));
     state.uploading.push(...localJobs);
     render();
     const uploadBatch = async () => {
@@ -855,6 +951,10 @@
     await refresh();
   });
   $('#reconnect-button').addEventListener('click', refresh);
+  $('#update-button').addEventListener('click', checkOrOfferUpdate);
+  $('#update-cancel').addEventListener('click', () => $('#update-dialog').close());
+  $('#update-confirm').addEventListener('click', installUpdate);
+  $('#update-dialog').addEventListener('close', () => $('#update-button').focus({ preventScroll: true }));
   $('#download-all').addEventListener('click', saveAllResults);
   $('#installed-button').addEventListener('click', openInstalled);
   $('#output-change').addEventListener('click', openOutputSettings);
@@ -906,4 +1006,5 @@
   document.addEventListener('scroll', event => { closeDismissHint(); if (activePageMenu && !activePageMenu.menu.contains(event.target)) closePageMenu(); document.querySelectorAll('.job-more[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; }); }, true);
   render();
   refresh();
+  refreshUpdates();
 })();

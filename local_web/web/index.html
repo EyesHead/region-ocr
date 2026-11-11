@@ -48,6 +48,10 @@
         <button type="button" class="button button-primary convert-button" id="convert-button" disabled>Конвертировать</button>
         <button type="button" class="button button-outline cancel-all-button" id="cancel-all-button" hidden>Остановить обработку</button>
       </div>
+      <section class="app-updates" aria-label="Обновления приложения">
+        <button type="button" class="button button-outline update-button" id="update-button"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><path d="M20 10a8 8 0 1 0-2 8M20 4v6h-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span id="update-button-label">Проверить обновления</span></button>
+        <p id="update-status" role="status">Проверка версии…</p>
+      </section>
     </aside>
     <section class="results" aria-labelledby="screen-title">
       <div class="results-toolbar">
@@ -58,9 +62,15 @@
         <div class="output-location-text"><span class="output-caption">Папка сохранения</span><p id="output-directory">Подключение…</p><p id="output-storage-error" class="output-storage-error" role="status" hidden></p></div>
         <button type="button" class="button button-outline" id="output-change" aria-haspopup="dialog" aria-controls="output-dialog">Изменить</button>
       </div>
+      <div class="document-legend" aria-label="Обозначения состояний документов">
+        <span class="legend-caption">Условные обозначения:</span>
+        <span><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg><span><strong>В очереди</strong> — ожидает обработки</span></span>
+        <span><svg class="legend-done" viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m7 12 3 3 7-7"/></svg><span><strong>OCR выполнен</strong> — результат готов к открытию</span></span>
+      </div>
       <div class="document-list-toolbar">
+        <label class="document-search"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Найти документ</span><input id="job-search" type="search" placeholder="Найти документ" autocomplete="off" aria-controls="job-list"></label>
         <div class="document-filters" role="group" aria-label="Состояние документов"><button type="button" class="document-filter selected" data-job-filter="all" aria-pressed="true">Все <span id="filter-all-count">0</span></button><button type="button" class="document-filter" data-job-filter="active" aria-pressed="false">В работе <span id="filter-active-count">0</span></button><button type="button" class="document-filter" data-job-filter="done" aria-pressed="false">Готовые <span id="filter-done-count">0</span></button></div>
-        <label class="document-search"><span class="sr-only">Найти документ</span><input id="job-search" type="search" placeholder="Найти документ" autocomplete="off" aria-controls="job-list"></label>
+        <span class="document-sort">Сначала новые <svg viewBox="0 0 24 24" width="17" height="17" fill="none" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></span>
       </div>
       <div class="queue-toolbar">
         <p id="queue-summary" role="status">Файлы появятся здесь после загрузки</p>
@@ -111,6 +121,11 @@
     <div class="delete-actions"><button type="button" class="button button-outline" id="delete-cancel" autofocus>Отмена</button><button type="button" class="button button-danger" id="delete-confirm">Удалить</button></div>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="update-dialog" class="update-dialog" aria-labelledby="update-title" aria-describedby="update-description">
+    <h2 id="update-title">Обновление приложения</h2>
+    <p id="update-description"></p>
+    <div class="update-dialog-actions"><button type="button" class="button button-outline" id="update-cancel" autofocus>Позже</button><button type="button" class="button button-primary" id="update-confirm">Обновить</button></div>
+  </dialog>
   <dialog id="duplicate-dialog" class="duplicate-dialog" aria-labelledby="duplicate-title" aria-describedby="duplicate-name duplicate-message duplicate-details">
     <h2 id="duplicate-title">Файл уже загружен</h2>
     <p id="duplicate-name" class="duplicate-name"></p>

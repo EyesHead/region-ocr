@@ -1,0 +1,142 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified installer as a GitHub release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-installer-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Python and JavaScript sources
+        shell: pwsh
+        run: |
+          @'
+          import ast
+          from pathlib import Path
+          for path in [*Path('local_web').glob('*.py'), *Path('installer').glob('*.py')]:
+              ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+          print('Python syntax OK')
+          '@ | python -B -
+          if ($LASTEXITCODE -ne 0) { throw 'Python validation failed' }
+          node --check local_web/web/app.js
+          if ($LASTEXITCODE -ne 0) { throw 'JavaScript validation failed' }
+      - name: Check document list in a browser
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:RUNNER_TEMP/ocr-ui" --no-audit --no-fund playwright@1.58.2
+          if ($LASTEXITCODE -ne 0) { throw 'Browser test dependency failed' }
+          @'
+          const { chromium } = require(process.env.RUNNER_TEMP + '/ocr-ui/node_modules/playwright');
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          (async () => {
+            const browser = await chromium.launch({ channel: 'msedge', headless: true });
+            try {
+              const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+              const errors = [];
+              page.on('pageerror', error => errors.push(error.message));
+              let jobs = [
+                ['Смета_корпус_Б.pdf', 'queued', 18],
+                ['План_этажа.pdf', 'queued', 4],
+                ['Пояснительная_записка.pdf', 'running', 42],
+                ['Договор_подряда.pdf', 'done', 12],
+                ['Спецификация.pdf', 'done', 8],
+                ['Акт_обследования.pdf', 'done', 6]
+              ].map(([name, status, pages], index) => ({
+                id: String(index + 1).padStart(32, '0'), name, status,
+                created_at: new Date(Date.now() - index * 60000).toISOString(),
+                source_page_count: pages, size: 1024 * (index + 1), progress: 64,
+                stage: status === 'running' ? 'Распознавание текста' : '',
+                format: 'html', saved_result_id: status === 'done' ? String(index + 10).padStart(32, '0') : null
+              })).reverse();
+              const update = {current_version:'1.8.6',latest_version:'1.8.7',available:true,checking:false,installing:false,error:'',message:'Доступна версия 1.8.7'};
+              await page.route('http://ocr.test/**', async route => {
+                const path = new URL(route.request().url()).pathname;
+                if (path.startsWith('/api/')) {
+                  const data = path === '/api/status' ? {version:'1.8.6',jobs,engine_ready:true,output_dir:'D:\\OCR\\ocr_output'} : path.startsWith('/api/updates') ? update : {items:[]};
+                  return route.fulfill({json:data});
+                }
+                const name = path === '/' ? 'index.html' : path.slice(1);
+                if (!/^[a-zA-Z0-9.-]+$/.test(name)) return route.fulfill({status:404});
+                const file = 'local_web/web/' + name;
+                if (!fs.existsSync(file)) return route.fulfill({status:404});
+                const type = name.endsWith('.html') ? 'text/html' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'image/png';
+                return route.fulfill({body:fs.readFileSync(file),contentType:type});
+              });
+              await page.goto('http://ocr.test/');
+              await page.locator('.job-row').nth(5).waitFor();
+              assert.deepEqual(await page.locator('.job-name').allTextContents(), jobs.toReversed().map(job => job.name));
+              assert.equal(await page.locator('[data-status="queued"]').count(),2);
+              assert.equal(await page.locator('[data-status="done"] .job-status').first().textContent(),'OCR выполнен');
+              await page.locator('#update-button').click();
+              assert.equal(await page.locator('#update-dialog').evaluate(el => el.open),true);
+              await page.locator('#update-dialog').evaluate(el => el.close());
+              await page.screenshot({path:process.env.RUNNER_TEMP+'/ocr-desktop.png',fullPage:true});
+              await page.locator('.document-filter[data-job-filter="done"]').click();
+              assert.equal(await page.locator('.job-row').count(),3);
+              await page.locator('.document-filter[data-job-filter="all"]').click();
+              await page.locator('#job-search').fill('Смета');
+              assert.equal(await page.locator('.job-row').count(),1);
+              await page.locator('#job-search').fill('');
+              for (const width of [1320,900,375]) {
+                await page.setViewportSize({width,height:1000});
+                assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true,'Horizontal overflow at '+width);
+              }
+              await page.setViewportSize({width:1320,height:1000});
+              await page.screenshot({path:process.env.RUNNER_TEMP+'/ocr-1320.png',fullPage:true});
+              jobs = ['pdf','docx','pptx','xlsx','html','htm','png','jpg','jpeg','tif','tiff','bmp','webp','gif'].map((extension,index) => ({id:String(index+1).padStart(32,'0'),name:'Документ.'+extension,status:'queued',format:'html',created_at:new Date(Date.now()-index*1000).toISOString(),size:1000}));
+              await page.reload();
+              await page.locator('.job-row').nth(13).waitFor();
+              for (const job of jobs) assert.equal(await page.locator('.file-type-'+job.name.split('.').pop()).count(),1);
+              assert.deepEqual(errors,[]);
+              console.log('Browser checks passed: sorting, statuses, filters, search, 14 formats, update dialog and 4 viewport widths');
+            } finally { await browser.close(); }
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          '@ | node
+          if ($LASTEXITCODE -ne 0) { throw 'Browser checks failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interface-review
+          path: |
+            ${{ runner.temp }}/ocr-desktop.png
+            ${{ runner.temp }}/ocr-1320.png
+          retention-days: 1
+      - name: Build and verify installer
+        shell: pwsh
+        run: |
+          python -B installer/build.py --output release
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: release/*
+          retention-days: 7
+      - name: Publish release
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content installer/install-plan.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to overwrite it" }
+          $notes = "Новые документы появляются сверху. Очередь, обработка и готовые результаты выделены фоном, полосой и значками. Добавлены цветные иконки форматов и проверка обновлений из приложения. Обновление сохраняет установленное окружение, модели, историю и результаты."
+          gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

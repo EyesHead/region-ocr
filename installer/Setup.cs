@@ -19,13 +19,13 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("REGION OCR — установка")]
 [assembly: AssemblyProduct("REGION OCR")]
-[assembly: AssemblyVersion("1.8.5.0")]
-[assembly: AssemblyFileVersion("1.8.5.0")]
+[assembly: AssemblyVersion("1.8.6.0")]
+[assembly: AssemblyFileVersion("1.8.6.0")]
 
 internal static class Setup
 {
     internal const string Product = "REGION OCR";
-    internal const string Version = "1.8.5";
+    internal const string Version = "1.8.6";
     internal const string Marker = ".region-ocr-install.json";
     internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\RegionOCR";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
@@ -44,10 +44,31 @@ internal static class Setup
         {
             if (args.Length > 0 && args[0] == "--uninstall") return Uninstall();
             if (args.Length == 3 && args[0] == "--remove") return Remove(args[1], Int32.Parse(args[2]));
+            if ((args.Length == 4 || args.Length == 8) && args[0] == "--update" && args[2] == "--wait-pid")
+            {
+                int parent;
+                if (!Int32.TryParse(args[3], out parent) || parent <= 0) throw new ArgumentException("Некорректный процесс приложения");
+                string restart = "";
+                if (args.Length == 8)
+                {
+                    if (args[4] != "--data-dir" || args[6] != "--output-dir" || !Path.IsPathRooted(args[5]) || !Path.IsPathRooted(args[7]))
+                        throw new ArgumentException("Некорректные папки данных приложения");
+                    restart = "--data-dir " + Quote(Path.GetFullPath(args[5])) + " --output-dir " + Quote(Path.GetFullPath(args[7]));
+                }
+                using (var updater = new UpdateWindow(args[1], parent, restart)) Application.Run(updater);
+                return 0;
+            }
             if (args.Length == 2 && args[0] == "--verify")
             {
                 string report = ValidatePayload();
                 File.WriteAllText(args[1], report, new UTF8Encoding(false));
+                return 0;
+            }
+            string existing = ExistingInstallation();
+            if (existing != null)
+            {
+                if (MessageBox.Show("Найдена установленная копия REGION OCR:\n" + existing + "\n\nЗакройте конвертер перед продолжением. Обновить эту копию с сохранением документов, настроек и компонентов?\n\n«Нет» — отменить обновление.", Product, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return 0;
+                using (var updater = new UpdateWindow(existing, 0)) Application.Run(updater);
                 return 0;
             }
             using (var wizard = new Wizard()) Application.Run(wizard);
@@ -186,7 +207,7 @@ internal static class Setup
         return 0;
     }
 
-    static void ValidateInstalledFolder(string folder)
+    internal static void ValidateInstalledFolder(string folder)
     {
         string full = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
         if (full == Path.GetPathRoot(full).TrimEnd(Path.DirectorySeparatorChar) || !File.Exists(Path.Combine(full, Marker)))
@@ -195,6 +216,146 @@ internal static class Setup
         if ((string)marker["product"] != Product || !String.Equals((string)marker["folder"], full, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("Не совпадает маркер установки");
         if ((File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0) throw new IOException("Папка установки является ссылкой");
+    }
+
+    static string ExistingInstallation()
+    {
+        string folder = null;
+        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath))
+            if (key != null) folder = Convert.ToString(key.GetValue("InstallLocation"));
+        if (String.IsNullOrEmpty(folder) && File.Exists(Path.Combine(DefaultFolder, Marker))) folder = DefaultFolder;
+        if (String.IsNullOrEmpty(folder) || !File.Exists(Path.Combine(folder, Marker))) return null;
+        ValidateInstalledFolder(folder);
+        return Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
+    }
+
+    static void EnsureApplicationClosed(string folder)
+    {
+        // The desktop host may use an explicitly configured Python outside the install folder.
+        // Its existing single-instance file stays open for the entire window lifetime.
+        string instanceLock = Path.Combine(UserData, "data", "desktop.lock");
+        if (File.Exists(instanceLock))
+        {
+            try { using (var probe = new FileStream(instanceLock, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { } }
+            catch (IOException) { throw new IOException("Конвертер ещё работает. Закройте его окно и повторите обновление. Установленные файлы сохранены."); }
+        }
+        foreach (var process in Process.GetProcesses())
+            using (process)
+            {
+                string name;
+                try { name = process.ProcessName; }
+                catch (InvalidOperationException) { continue; }
+                if (name != "python" && name != "pythonw" && name != "DocumentConverter" && name != "llama-server") continue;
+                string executable;
+                try { executable = process.MainModule.FileName; }
+                catch (System.ComponentModel.Win32Exception) { continue; }
+                catch (InvalidOperationException) { continue; }
+                string prefix = folder + Path.DirectorySeparatorChar;
+                if (executable.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Конвертер или его обработчик ещё работает. Закройте приложение и повторите обновление. Документы и установленные файлы сохранены.");
+            }
+    }
+
+    internal static void UpdateInstallation(string folder, int parent, Action<string> status, string restartArguments = "")
+    {
+        folder = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
+        ValidateInstalledFolder(folder);
+        ValidatePayload();
+        var marker = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, Marker)));
+        System.Version oldVersion, newVersion = new System.Version(Version);
+        if (!System.Version.TryParse(Convert.ToString(marker["version"]), out oldVersion) || oldVersion >= newVersion)
+            throw new InvalidDataException("Версия обновления должна быть новее установленной");
+        string profile = Convert.ToString(marker["profile"]);
+        if (profile != "cpu" && profile != "cu128") throw new InvalidDataException("Неизвестный профиль установки");
+        // Source-only updates reuse the exact installed dependency/model plan.
+        // A future dependency change requires the full installer rather than silently mixing ABIs.
+        var oldPlan = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "installer", "install-plan.json")));
+        var newPlan = Plan(); oldPlan.Remove("version"); newPlan.Remove("version");
+        if (Json.Serialize(oldPlan) != Json.Serialize(newPlan))
+            throw new InvalidDataException("В этой версии изменились компоненты. Установите новую версию через полный установщик GitHub; текущая установка сохранена.");
+        status("Ожидание закрытия конвертера…");
+        try
+        {
+            if (parent > 0)
+                using (var process = Process.GetProcessById(parent))
+                    if (!process.WaitForExit(120000)) throw new IOException("Конвертер ещё работает. Закройте его и повторите обновление.");
+        }
+        catch (ArgumentException) { }
+        ValidateInstalledFolder(folder);
+        EnsureApplicationClosed(folder);
+        var changes = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        using (var memory = new MemoryStream(Resource("app.zip")))
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Read))
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.Name.Length == 0) continue;
+                string name = entry.FullName.Replace('\\', '/');
+                string first = name.Split('/')[0].ToLowerInvariant();
+                if (first == "runtime" || first == "models" || first == ".runtime" || first == ".git"
+                    || first == "ocr_output" || first == "output" || String.Equals(name, Marker, StringComparison.OrdinalIgnoreCase)
+                    || name.StartsWith("local_web/data/", StringComparison.OrdinalIgnoreCase)
+                    || name.StartsWith("local_web/desktop_runtime/", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Пакет обновления содержит пользовательские данные или компоненты: " + name);
+                string target = SafePath(folder, name);
+                ValidateUpdatePath(folder, target);
+                using (var input = entry.Open()) using (var data = new MemoryStream())
+                { input.CopyTo(data); changes.Add(target, data.ToArray()); }
+            }
+        changes[Path.Combine(folder, "Uninstall.exe")] = File.ReadAllBytes(Assembly.GetExecutingAssembly().Location);
+        marker["version"] = Version;
+        changes[Path.Combine(folder, Marker)] = new UTF8Encoding(false).GetBytes(Json.Serialize(marker));
+        // Keep rollback bytes in memory: never copy user documents or create backup folders.
+        var before = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        var written = new List<string>();
+        foreach (string file in changes.Keys)
+        {
+            ValidateUpdatePath(folder, file);
+            before.Add(file, File.Exists(file) ? File.ReadAllBytes(file) : null);
+        }
+        status("Обновление файлов приложения…");
+        try
+        {
+            foreach (var change in changes)
+            {
+                ValidateUpdatePath(folder, change.Key);
+                Directory.CreateDirectory(Path.GetDirectoryName(change.Key));
+                written.Add(change.Key);
+                File.WriteAllBytes(change.Key, change.Value);
+            }
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath, true))
+                if (key != null && String.Equals(Convert.ToString(key.GetValue("InstallLocation")), folder, StringComparison.OrdinalIgnoreCase))
+                    key.SetValue("DisplayVersion", Version);
+        }
+        catch
+        {
+            written.Reverse();
+            foreach (string file in written)
+                if (before[file] == null) File.Delete(file); else File.WriteAllBytes(file, before[file]);
+            throw;
+        }
+        status("Обновление установлено. Запуск конвертера…");
+        Process.Start(new ProcessStartInfo(Path.Combine(folder, "DocumentConverter.exe"), restartArguments) { WorkingDirectory = folder, UseShellExecute = false, CreateNoWindow = true });
+    }
+
+    static void ValidateUpdatePath(string folder, string target)
+    {
+        string path = target;
+        while (!String.Equals(path, folder, StringComparison.OrdinalIgnoreCase))
+        {
+            if ((File.Exists(path) || Directory.Exists(path)) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Обновление не может записывать через ссылку: " + path);
+            path = Path.GetDirectoryName(path);
+            if (String.IsNullOrEmpty(path)) throw new IOException("Путь обновления вышел за папку приложения");
+        }
+    }
+
+    internal static void CleanupUpdateDownload()
+    {
+        string self = Assembly.GetExecutingAssembly().Location;
+        string expected = Path.Combine(UserData, "updates").TrimEnd(Path.DirectorySeparatorChar);
+        if (!String.Equals(Path.GetDirectoryName(self), expected, StringComparison.OrdinalIgnoreCase)) return;
+        string script = "Wait-Process -Id " + Process.GetCurrentProcess().Id + " -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '" + self.Replace("'", "''") + "' -Force -ErrorAction SilentlyContinue; if ((Get-ChildItem -LiteralPath '" + expected.Replace("'", "''") + "' -Force | Measure-Object).Count -eq 0) { Remove-Item -LiteralPath '" + expected.Replace("'", "''") + "' -ErrorAction SilentlyContinue }";
+        Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script))) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
     }
 
     static int Remove(string folder, int parent)
@@ -245,6 +406,32 @@ internal static class Setup
         }
         foreach (string file in Directory.GetFiles(folder)) { File.SetAttributes(file, FileAttributes.Normal); File.Delete(file); }
         Directory.Delete(folder);
+    }
+}
+
+internal sealed class UpdateWindow : Form
+{
+    readonly string folder;
+    readonly int parent;
+    readonly string restartArguments;
+    readonly Label status = new Label();
+    bool working = true;
+
+    internal UpdateWindow(string folder, int parent, string restartArguments = "")
+    {
+        this.folder = folder; this.parent = parent; this.restartArguments = restartArguments;
+        Text = "Обновление REGION OCR " + Setup.Version;
+        ClientSize = new Size(560, 140); FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterScreen; MaximizeBox = false; MinimizeBox = false;
+        Font = new Font("Segoe UI", 10);
+        status.SetBounds(24, 25, 510, 90); status.Text = "Подготовка обновления…"; Controls.Add(status);
+        FormClosing += delegate(object sender, FormClosingEventArgs e) { if (working) e.Cancel = true; };
+        Shown += async delegate
+        {
+            try { await Task.Run(() => Setup.UpdateInstallation(folder, parent, text => BeginInvoke(new Action(() => status.Text = text)), restartArguments)); }
+            catch (Exception error) { MessageBox.Show(this, error.Message, "Обновление не завершено", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            finally { working = false; Setup.CleanupUpdateDownload(); Close(); }
+        };
     }
 }
 

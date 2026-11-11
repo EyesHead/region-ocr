@@ -37,7 +37,7 @@ else:
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -803,7 +803,31 @@ class LocalServer(ThreadingHTTPServer):
 
     def __init__(self, address, store):
         self.store = store
+        self.operation_lock = threading.RLock()
+        self.active_mutations = 0
         super().__init__(address, Handler)
+        if __package__:
+            from .updates import UpdateManager
+        else:
+            from updates import UpdateManager
+        update_cache = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'RegionDocumentConverter' / 'updates'
+        self.updates = UpdateManager(HERE.parent, VERSION, update_cache,
+                                     ready=self._update_ready, shutdown=self._update_shutdown,
+                                     restart_args=('--data-dir', str(store.root.resolve()), '--output-dir', str(store.saved.root.resolve())))
+
+    def _update_ready(self):
+        # Called under operation_lock, also held by each incoming mutation.
+        if self.active_mutations:
+            raise ValueError('Дождитесь завершения загрузки или сохранения документов.')
+        with self.store.lock:
+            if self.store.scheduled or any(job.get('status') == 'running' for job in self.store.jobs.values()):
+                raise ValueError('Дождитесь завершения обработки документов или остановите очередь.')
+
+    def _update_shutdown(self):
+        # Let the request response reach the UI before stopping the desktop window/server.
+        timer = threading.Timer(1.0, self.shutdown)
+        timer.daemon = True
+        timer.start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -885,6 +909,8 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         fmt = query.get("format", [None])[0]
         if self.command == "GET":
+            if path == '/api/updates':
+                return self._json(self.server.updates.refresh())
             if path == "/api/health":
                 return self._json({"app": APP_ID, "version": VERSION})
             if path == "/api/status":
@@ -948,6 +974,17 @@ class Handler(BaseHTTPRequestHandler):
             if path in static and (WEB / static[path][0]).is_file():
                 return self._file(WEB / static[path][0], static[path][1])
         elif self.command == "POST":
+            if path == '/api/updates/check':
+                self._body()
+                return self._json(self.server.updates.check())
+            if path == '/api/updates/install':
+                self._body()
+                with self.server.operation_lock:
+                    try:
+                        result = self.server.updates.install()
+                    except (ValueError, OSError, json.JSONDecodeError) as error:
+                        raise APIError(str(error), 409) from None
+                return self._json(result)
             if path == '/api/settings':
                 return self._json(store.change_output_dir(self._body().get('output_dir')))
             if path == '/api/upload-check':
@@ -1060,7 +1097,15 @@ class Handler(BaseHTTPRequestHandler):
             shutil.copyfileobj(temporary, self.wfile, 1024 * 1024)
 
     def _handle(self):
+        counted = False
         try:
+            path = urlsplit(self.path).path
+            if path.startswith('/api/') and path not in {'/api/health', '/api/status', '/api/updates', '/api/updates/check', '/api/updates/install'}:
+                with self.server.operation_lock:
+                    if self.server.updates.snapshot()['installing']:
+                        raise APIError('Приложение готовится к обновлению. Дождитесь перезапуска.', 409)
+                    self.server.active_mutations += 1
+                    counted = True
             self._dispatch()
         except APIError as exc:
             self.close_connection = True
@@ -1071,6 +1116,10 @@ class Handler(BaseHTTPRequestHandler):
             LOG.exception("Request failed")
             self.close_connection = True
             self._json({"error": "Ошибка локального сервера. Подробности в журнале приложения."}, 500)
+        finally:
+            if counted:
+                with self.server.operation_lock:
+                    self.server.active_mutations -= 1
 
     do_GET = do_POST = do_DELETE = _handle
 
@@ -1122,6 +1171,7 @@ def main(argv=None):
         raise
     url = f"http://127.0.0.1:{server.server_port}"
     LOG.info("Application ready at %s", url)
+    server.updates.check()
     print(url, flush=True)
     if args.open_browser:
         webbrowser.open(url)

@@ -84,6 +84,8 @@ jobs:
               assert.deepEqual(await page.locator('.job-name').allTextContents(), jobs.toReversed().map(job => job.name));
               assert.equal(await page.locator('[data-status="queued"]').count(),2);
               assert.equal(await page.locator('[data-status="done"] .job-status').first().textContent(),'OCR выполнен');
+              const aligned = await page.locator('.job-state').evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().left));
+              assert.ok(Math.max(...aligned)-Math.min(...aligned)<1,'Status columns must align');
               await page.locator('#update-button').click();
               assert.equal(await page.locator('#update-dialog').evaluate(el => el.open),true);
               await page.locator('#update-dialog').evaluate(el => el.close());
@@ -99,6 +101,8 @@ jobs:
                 assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true,'Horizontal overflow at '+width);
               }
               await page.setViewportSize({width:1320,height:1000});
+              const compactAligned = await page.locator('.job-state').evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().left));
+              assert.ok(Math.max(...compactAligned)-Math.min(...compactAligned)<1,'Status columns must align at 1320px');
               await page.screenshot({path:process.env.RUNNER_TEMP+'/ocr-1320.png',fullPage:true});
               jobs = ['pdf','docx','pptx','xlsx','html','htm','png','jpg','jpeg','tif','tiff','bmp','webp','gif'].map((extension,index) => ({id:String(index+1).padStart(32,'0'),name:'Документ.'+extension,status:'queued',format:'html',created_at:new Date(Date.now()-index*1000).toISOString(),size:1000}));
               await page.reload();

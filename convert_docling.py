@@ -583,7 +583,7 @@ def diagnostic_document_log(router, lock, path, source, args):
     router.target = report
     try:
         with diagnostic_session(router, lock,
-                                trace_functions=os.environ.get('DOCLING_TRACE_FUNCTIONS', '1') != '0') as recorder:
+                                trace_functions=os.environ.get('DOCLING_TRACE_FUNCTIONS', '0') != '0') as recorder:
             if recorder is not None and getattr(args, 'api_key', None):
                 recorder.secrets.add(args.api_key)
             report_event(router, lock, 'document log started', f'log={path}; pid={os.getpid()}')
@@ -3370,7 +3370,7 @@ def source_anchored_cell_math(glyphs, objects, references, row, column, row_span
     return content
 
 
-def scan_cell_graphic(mask, image_region, cell_bbox, glyphs, sx, sy, *, pure_math=False,graphic_hint=False,full_ink=False,source_image=None):
+def scan_cell_graphic(mask, image_region, cell_bbox, glyphs, sx, sy, *, pure_math=False,graphic_hint=False,full_ink=False,source_image=None,cell_crop_ink=None):
     """Locate non-text ink inside a scanned cell using positioned OCR glyphs.
 
     Only the detection mask is erased; returned crops use the untouched scan,
@@ -3387,8 +3387,10 @@ def scan_cell_graphic(mask, image_region, cell_bbox, glyphs, sx, sy, *, pure_mat
     x0,y0 = max(0,x0+trim_x),max(0,y0+trim_y)
     x1,y1 = min(mask.shape[1],x1-trim_x),min(mask.shape[0],y1-trim_y)
     if source_image is not None:
-        from docling_pdf_cell_crop import cell_content_crop
-        interior=cell_content_crop(source_image,image_region,cell_bbox)
+        from docling_pdf_cell_crop import cell_content_crop, prepare_cell_content_ink
+        if cell_crop_ink is None:
+            cell_crop_ink=prepare_cell_content_ink(source_image)
+        interior=cell_content_crop(source_image,image_region,cell_bbox,ink=cell_crop_ink)
         if interior is None:return None
         x0,y0,x1,y1=interior[0]
     residual = mask[y0:y1,x0:x1].copy()
@@ -3497,7 +3499,7 @@ def scan_cell_graphic(mask, image_region, cell_bbox, glyphs, sx, sy, *, pure_mat
         if tuple(box)==previous:break
     content_crop={}
     if source_image is not None:
-        interior=cell_content_crop(source_image,image_region,cell_bbox,box)
+        interior=cell_content_crop(source_image,image_region,cell_bbox,box,ink=cell_crop_ink)
         if interior is None:return None
         pixels,box,proof=interior
         content_crop=dict(source_pixel_bbox=list(pixels),content_crop=proof)
@@ -4472,6 +4474,8 @@ class NativeTableReader:
                     reference_blank_columns[column] = anchors
         soup=BeautifulSoup('<table><thead></thead><tbody></tbody></table>','html.parser');retained=[];pending=[]
         source_grid_ink=None;source_grid_ink_checked=False;empty_cell_rule_proofs=[]
+        from docling_pdf_cell_crop import prepare_cell_content_ink
+        cell_crop_ink=None
         for y in range(len(ys)-1):
             row=soup.new_tag('tr');(soup.thead if y<header_rows else soup.tbody).append(row)
             for c in sorted((c for c in cells if c['row']==y),key=lambda c:c['column']):
@@ -4574,10 +4578,14 @@ class NativeTableReader:
                     has_math=bool(peer.find('math'))
                     for tag in peer.find_all('math'):tag.decompose()
                     pure_math=has_math and not peer.get_text(strip=True)
-                graphic=(scan_cell_graphic(mask,region,c['bbox'],c['glyphs'],1/sx,1/sy,pure_math=pure_math,
-                         graphic_hint=c['column'] in graphic_columns,full_ink=c['column'] in dimension_columns,
-                         source_image=source_image)
-                         if y>=header_rows and not needs_numeric else None)
+                if y>=header_rows and not needs_numeric:
+                    if cell_crop_ink is None:
+                        cell_crop_ink=prepare_cell_content_ink(source_image)
+                    graphic=scan_cell_graphic(mask,region,c['bbox'],c['glyphs'],1/sx,1/sy,pure_math=pure_math,
+                        graphic_hint=c['column'] in graphic_columns,full_ink=c['column'] in dimension_columns,
+                        source_image=source_image,cell_crop_ink=cell_crop_ink)
+                else:
+                    graphic=None
                 if override and graphic:
                     if graphic.get('basis') == 'connected_source_strokes_over_ocr_text':
                         override = None
@@ -4750,6 +4758,7 @@ class NativeTableReader:
                 pass
         cells, owners, image_owners, retained_images, restored_math = [], [0] * len(chars), [0] * len(images), [], []
         context = {}
+        cell_crop_ink = None
         for bounds in sorted(source_cells, key=lambda c: (c[1], c[0])):
             x0, x1 = [min(range(len(xs)), key=lambda i: abs(xs[i] - x)) for x in (bounds[0], bounds[2])]
             y0, y1 = [min(range(len(ys)), key=lambda i: abs(ys[i] - y)) for y in (bounds[1], bounds[3])]
@@ -4763,8 +4772,10 @@ class NativeTableReader:
                            min(obj["x1"], bounds[2]), min(obj["bottom"], bounds[3]))
                 if clipped[2] - clipped[0] < .1 or clipped[3] - clipped[1] < .1:
                     continue
-                from docling_pdf_cell_crop import cell_content_crop
-                interior=cell_content_crop(source_image,region,bounds,clipped)
+                from docling_pdf_cell_crop import cell_content_crop, prepare_cell_content_ink
+                if cell_crop_ink is None:
+                    cell_crop_ink=prepare_cell_content_ink(source_image)
+                interior=cell_content_crop(source_image,region,bounds,clipped,ink=cell_crop_ink)
                 if interior is None:
                     return None
                 pixels,clipped,crop_proof=interior

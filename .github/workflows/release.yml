@@ -141,6 +141,6 @@ jobs:
           $tag = "v$version"
           gh release view $tag --json tagName 2>$null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to overwrite it" }
-          $notes = "Новые документы появляются сверху. Очередь, обработка и готовые результаты выделены фоном, полосой и значками. Добавлены цветные иконки форматов и проверка обновлений из приложения. Обновление сохраняет установленное окружение, модели, историю и результаты."
+          $notes = "Маска изображения таблицы рассчитывается один раз для всех её ячеек. Подробная трассировка Python-функций по умолчанию выключена; для диагностики её можно включить переменной DOCLING_TRACE_FUNCTIONS=1. Обычные сообщения и проверки документа сохранены. Обновление устанавливается через интерфейс приложения."
           gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

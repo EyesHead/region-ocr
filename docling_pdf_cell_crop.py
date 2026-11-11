@@ -55,7 +55,19 @@ def _rule_inset(ink, coordinate, start, stop, axis, direction, scale):
     return inset, [a, b+1]
 
 
-def cell_content_crop(image, region, cell_bbox, content_bbox=None):
+def prepare_cell_content_ink(image):
+    """Measure one unchanged table image for reuse by its physical cells."""
+    with image.convert('L') as gray:
+        values = np.asarray(gray)
+        # A pale rule is still a rule. Compare with the actual paper level,
+        # so an off-white scan background is not itself treated as one.
+        threshold = max(1, min(250, float(np.percentile(values, 90))-4))
+        ink = values < threshold
+    ink.setflags(write=False)
+    return ink
+
+
+def cell_content_crop(image, region, cell_bbox, content_bbox=None, *, ink=None):
     """Return ``(pixels, actual_bbox, proof)`` for original content pixels.
 
     ``region`` and both bboxes use source-page points. A minimum of three
@@ -63,6 +75,7 @@ def cell_content_crop(image, region, cell_bbox, content_bbox=None):
     past a measured rule's inward edge and antialiasing allowance. ``bbox``
     and spans supplied by the grid reader are never modified. An optional
     picture bbox is clipped to this interior. A degenerate crop returns None.
+    Optional ``ink`` must be prepared from this same unchanged table image.
     """
     if image is None or len(region) != 4 or len(cell_bbox) != 4:
         return None
@@ -75,12 +88,10 @@ def cell_content_crop(image, region, cell_bbox, content_bbox=None):
            (cell_bbox[2]-region[0])*sx, (cell_bbox[3]-region[1])*sy]
     if box[2] <= box[0] or box[3] <= box[1]:
         return None
-    with image.convert('L') as gray:
-        values = np.asarray(gray)
-        # A pale rule is still a rule. Compare with the actual paper level,
-        # so an off-white scan background is not itself treated as one.
-        threshold = max(1, min(250, float(np.percentile(values, 90))-4))
-        ink = values < threshold
+    if ink is None:
+        ink = prepare_cell_content_ink(image)
+    elif not isinstance(ink, np.ndarray) or ink.shape != (height, width) or ink.dtype != np.bool_:
+        raise ValueError('Prepared cell ink must match the source image size and boolean pixels')
     measurements = [
         _rule_inset(ink, box[0], box[1], box[3], 'x', 1, sx),
         _rule_inset(ink, box[1], box[0], box[2], 'y', 1, sy),

@@ -71,6 +71,15 @@ def _check_cancel(cancel_event):
         raise ConversionCancelled('Конвертация отменена')
 
 
+def _process_exit_message(code):
+    if code is None:
+        return 'Поток вывода локального OCR закрылся; код завершения процесса недоступен.'
+    detail = f'код {code}'
+    if os.name == 'nt':
+        detail += f' (0x{code & 0xFFFFFFFF:08X})'
+    return f'Процесс локального OCR завершился без результата: {detail}.'
+
+
 def _validate_pages(pages: str) -> str:
     pages = (pages or '').strip()
     if not pages:
@@ -209,6 +218,7 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
         command += ['--pages', pages]
     environment = os.environ.copy()
     environment['PYTHONIOENCODING'] = 'utf-8'
+    environment['PYTHONFAULTHANDLER'] = '1'
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                encoding='utf-8', errors='replace', env=environment,
                                cwd=ENGINE_DIR, bufsize=1,
@@ -260,7 +270,10 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
             _check_cancel(cancel_event)
             if code or not result:
                 detail = error_detail or last_error
-                raise RuntimeError('Локальный конвертер завершился с ошибкой. ' + detail + ' Журнал: engine.log')
+                message = _process_exit_message(code) + (' ' + detail if detail else '')
+                log.write('\n' + message + '\n')
+                log.flush()
+                raise RuntimeError(message + ' Журнал: engine.log')
             return result
     finally:
         _stop_process(process)

@@ -197,3 +197,7 @@ regression/*
 # Typed table content regressions; synthetic inputs only
 !regression/typed_table_cells/
 !regression/typed_table_cells/*.py
+
+# Worker lifecycle regressions; synthetic IPC only
+!regression/engine_lifecycle/
+!regression/engine_lifecycle/*.py

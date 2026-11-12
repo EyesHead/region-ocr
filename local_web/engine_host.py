@@ -73,6 +73,7 @@ class PersistentEngine:
             source_revision = _source_revision()
             env = os.environ.copy()
             env['PYTHONIOENCODING'] = 'utf-8'
+            env['PYTHONFAULTHANDLER'] = '1'
             command = self.command or [self.python, '-u', str(Path(__file__).with_name('engine_process.py'))]
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -152,10 +153,22 @@ class PersistentEngine:
                 else:
                     self.logger.info(line.rstrip())
         finally:
+            if __package__:
+                from .converter import _process_exit_message
+            else:
+                from converter import _process_exit_message
+            try:
+                code = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                code = process.poll()
             with self.lock:
                 if self.process is process:
-                    if not self.closed and self.state.get('phase') != 'error':
-                        self.state.update(phase='error', message='Процесс OCR завершился; следующий запуск восстановит его')
+                    if not self.closed:
+                        message = _process_exit_message(code)
+                        if self.state.get('phase') == 'error':
+                            message = self.state.get('message', '') + ' ' + message
+                        self.state.update(phase='error', message=message, exit_code=code)
+                        self.logger.error(message)
                     self.ready.set()
                     if self.active is not None:
                         self.active.put((None, None))
@@ -214,8 +227,11 @@ class PersistentEngine:
                         except queue.Empty:
                             continue
                         if line is None:
+                            message = self.snapshot()['message']
+                            log.write('\n' + message + '\n')
+                            log.flush()
                             self._terminate()
-                            raise RuntimeError('Процесс локального OCR завершился. Журнал: engine.log')
+                            raise RuntimeError(message + ' Журнал: engine.log')
                         log.write(line)
                         log.flush()
                         if event and event.get('event') == 'complete' and event.get('id') == ident:
@@ -251,7 +267,8 @@ class PersistentEngine:
             self.process_source_revision = None
             owned = self.owned_children
             self.owned_children = {}
-            self.state.update(phase='stopped', message='Движок остановлен')
+            if self.closed or self.state.get('phase') != 'error':
+                self.state.update(phase='stopped', message='Движок остановлен')
             self.ready.set()
         if process is None:
             return

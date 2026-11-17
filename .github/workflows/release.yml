@@ -7,6 +7,10 @@ on:
         description: Publish the verified installer as a GitHub release
         type: boolean
         default: false
+      run_tests:
+        description: Run regression and browser tests before building
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -29,7 +33,7 @@ jobs:
           @'
           import ast
           from pathlib import Path
-          for path in [*Path('local_web').glob('*.py'), *Path('installer').glob('*.py')]:
+          for path in [*Path('.').glob('*.py'), *Path('local_web').glob('*.py'), *Path('installer').glob('*.py')]:
               ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
           print('Python syntax OK')
           '@ | python -B -
@@ -37,6 +41,7 @@ jobs:
           node --check local_web/web/app.js
           if ($LASTEXITCODE -ne 0) { throw 'JavaScript validation failed' }
       - name: Check OCR process crash diagnostics
+        if: inputs.run_tests
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check psutil==7.2.2
@@ -44,6 +49,7 @@ jobs:
           python -B -m unittest discover -s regression/engine_lifecycle -p "test_*.py" -v
           if ($LASTEXITCODE -ne 0) { throw 'OCR process diagnostics tests failed' }
       - name: Check document list in a browser
+        if: inputs.run_tests
         shell: pwsh
         run: |
           npm install --prefix "$env:RUNNER_TEMP/ocr-ui" --no-audit --no-fund playwright@1.58.2
@@ -122,6 +128,7 @@ jobs:
           '@ | node
           if ($LASTEXITCODE -ne 0) { throw 'Browser checks failed' }
       - uses: actions/upload-artifact@v4
+        if: inputs.run_tests
         with:
           name: interface-review
           path: |
@@ -148,6 +155,6 @@ jobs:
           $tag = "v$version"
           gh release view $tag --json tagName 2>$null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to overwrite it" }
-          $notes = "При неожиданном завершении OCR журнал сохраняет код выхода процесса, включая шестнадцатеричный код Windows. Состояние ошибки сохраняется после очистки процесса; следующий запуск восстанавливает движок. Включён вывод стека Python при нативном сбое. Добавлены пять регрессионных проверок. Обновление устанавливается через интерфейс приложения."
-          gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes
+          $notes = "Исправлены сборка таблиц из нескольких страниц, ложные вложенные таблицы и объединение строк и ячеек. Сохранены многоуровневые заголовки, примечания и формулы; устранены повторения текста и ошибочные индексы. Обновлены обработка документов Office и интерфейс результатов. Удалён кэш промежуточного OCR: каждая конвертация выполняет распознавание заново. Обновление доступно через кнопку «Проверить обновления»."
+          gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

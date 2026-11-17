@@ -5,6 +5,146 @@ import unicodedata
 from bs4 import BeautifulSoup, NavigableString
 
 
+def join_primary_note_table_continuations(soup, manifest, records, api):
+    """Unwrap a source-proved continuation of an unfinished table footnote.
+
+    Page OCR can classify the remainder of a full-width footer as a new
+    one-column table. The preceding published note and both positioned
+    primary packets must prove its owner before any markup is moved.
+    """
+    from hashlib import sha256
+    from bs4 import Comment
+
+    def flat(text):
+        return re.sub(r'[\s\u00ad\u200b]+', '', unicodedata.normalize('NFKC', text))
+
+    def outer(table):
+        parent = table.parent
+        if parent is not None and 'table-scroll' in parent.get('class', []):
+            return parent
+        return table
+
+    def previous_visible(node):
+        for sibling in node.previous_siblings:
+            if isinstance(sibling, Comment) or (isinstance(sibling, NavigableString) and not sibling.strip()):
+                continue
+            return sibling
+        return None
+
+    entries = {entry['ref']: entry for entry in manifest.get('tables', [])}
+    pages = manifest.get('pages', {})
+    repaired = []
+    tables = [table for table in soup.find_all('table') if table.find_parent('table') is None]
+    for index, table in enumerate(tables):
+        if index == 0 or table.parent is None or table.find('caption'):
+            continue
+        entry = entries.get(table.get('data-pdf-table-ref'))
+        previous = tables[index - 1]
+        if previous.parent is None:
+            continue
+        old = entries.get(previous.get('data-pdf-table-ref'))
+        if not entry or not old or entry.get('joined_into'):
+            continue
+        page = entry['page']
+        previous_page = old.get('source_pages', [old['page']])[-1]
+        if page != previous_page + 1:
+            continue
+        info = pages.get(page, pages.get(str(page), {}))
+        old_info = pages.get(previous_page, pages.get(str(previous_page), {}))
+        if any(meta.get('clockwise') != 0 or len(meta.get('original_size', [])) != 2
+               for meta in (info, old_info)):
+            continue
+        width, height = info['original_size']
+        old_width, old_height = old_info['original_size']
+        profile = api.table_profile(str(table))
+        if (profile['issues'] or profile['columns'] != 1 or profile['rows'] < 2
+                or api.table_profile(str(previous))['columns'] < 2
+                or table.find(['img', 'svg', 'table', 'ul', 'ol', 'pre', 'code'])
+                or any(c['row_span'] != 1 or c['column_span'] != 1 for c in profile['cells'])):
+            continue
+        cells = [cell for cell in table.find_all(['td', 'th']) if cell.find_parent('table') is table]
+        if len(cells) != profile['rows']:
+            continue
+        texts = [cell.get_text(' ', strip=True) for cell in cells]
+        numbers = [re.match(r'^(\d+)\s+\D', text) for text in texts[1:]]
+        if (not re.match(r'^[а-яёa-z]', texts[0]) or not all(numbers)
+                or [int(match[1]) for match in numbers] != list(range(2, len(cells) + 1))):
+            continue
+        holder = outer(table)
+        note = previous_visible(holder)
+        if (note is None or getattr(note, 'name', None) not in {'div', 'p'}
+                or previous_visible(note) is not outer(previous) or note.find(['table', 'img', 'svg'])):
+            continue
+        prefix = note.get_text(' ', strip=True)
+        if not re.match(r'^1\s+\D', prefix) or re.search(r'[.!?;:]\s*$', prefix):
+            continue
+        current_packets, preceding_packets = [], []
+        for record in records or ():
+            if record.get('page_no') not in {previous_page, page}:
+                continue
+            box = record.get('bbox')
+            if not box or len(box) != 4 or '<table' not in record.get('html', '').lower():
+                continue
+            parsed = BeautifulSoup(record['html'], 'html.parser')
+            if len(parsed.find_all('table')) != 1:
+                continue
+            text = parsed.get_text(' ', strip=True)
+            if (record.get('page_no') == page and box[1] < .15 * height
+                    and flat(text) == flat(table.get_text(' ', strip=True))):
+                current_packets.append(record)
+            if record.get('page_no') == previous_page and box[3] > .85 * old_height:
+                marker = list(re.finditer(r'\bпримечани[ея]\b', text, re.I))
+                if marker and flat(text[marker[-1].end():]) == flat(prefix):
+                    preceding_packets.append(record)
+        pairs = [(a, b) for a in preceding_packets for b in current_packets
+                 if all(abs(a['bbox'][i] / old_width - b['bbox'][i] / width) < .015 for i in (0, 2))]
+        if len(pairs) != 1:
+            continue
+        preceding_packet, current_packet = pairs[0]
+        # Work on copies until a complete prose/MathML check proves that
+        # replacing the wrapper changes presentation only.
+        copied = BeautifulSoup(str(note), 'html.parser').find(note.name)
+        if copied.name == 'p':
+            wrapper = soup.new_tag('div', attrs={'class': 'pdf-source-table-notes'})
+            wrapper.append(copied)
+            copied = wrapper
+        copied_table = BeautifulSoup(str(table), 'html.parser').table
+        copied_cells = copied_table.find_all(['td', 'th'])
+        for cell in copied_cells:
+            for block in reversed(cell.find_all(['p', 'div'])):
+                block.insert_before(' ')
+                block.unwrap()
+        target = copied.find_all('p')[-1] if copied.find('p') else copied
+        target.append(' ')
+        for child in list(copied_cells[0].contents):
+            target.append(child.extract())
+        for cell in copied_cells[1:]:
+            paragraph = soup.new_tag('p', attrs={'class': 'source-table-note'})
+            for child in list(cell.contents):
+                paragraph.append(child.extract())
+            copied.append(paragraph)
+        if _semantic_key(str(note) + str(table), api) != _semantic_key(str(copied), api):
+            continue
+        copied['data-table-note'] = 'true'
+        copied['data-note-owner'] = old['ref']
+        copied['role'] = 'note'
+        note.replace_with(copied)
+        table.decompose()
+        if holder is not table and not holder.get_text(strip=True) and not holder.find(['table', 'math', 'img']):
+            holder.decompose()
+        proof = dict(table=old['ref'], continuation=entry['ref'], source_pages=[previous_page, page],
+                     paragraphs=len(cells), method='adjacent_primary_packets_of_unfinished_numbered_table_note',
+                     preceding_record_sha256=sha256(preceding_packet['html'].encode()).hexdigest(),
+                     continuation_record_sha256=sha256(current_packet['html'].encode()).hexdigest(),
+                     source_bbox=list(current_packet['bbox']))
+        entry['publication_role'] = 'table_note_continuation'
+        entry['note_continuation_into'] = old['ref']
+        repaired.append(proof)
+        api.diagnostic_event('PRIMARY_TABLE_NOTE_CONTINUATION_JOINED', **proof)
+    manifest.setdefault('primary_table_note_continuations', []).extend(repaired)
+    return repaired
+
+
 def _semantic_key(fragment, api):
     """Keep math structure and its place among prose when checking duplicates."""
     from docling_pdf_repairs import math_signature

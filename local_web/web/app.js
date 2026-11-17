@@ -3,7 +3,9 @@
   const $ = (selector) => document.querySelector(selector);
   const formats = { markdown: 'Markdown', html: 'HTML', json: 'JSON', plaintext: 'Текст' };
   const supported = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'webp', 'gif']);
-  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', outputDir: '', storageBusy: false };
+  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false };
+  const lifecycleNames = { uploading: 'Загрузка файла…', ready: 'Готов к обработке', queued: 'В очереди', running: 'Обработка…', error: 'Не удалось обработать', cancelled: 'Обработка остановлена', done: 'Результат готов', export: 'Нужен новый экспорт' };
+  const nameCollator = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
   let toastTimer;
   let activeDismissHint;
   let deleteConfirmation;
@@ -103,9 +105,26 @@
     const day = today ? 'Сегодня' : date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', ...(date.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) });
     return `${day}, ${date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`;
   }
-  function newestFirst(jobs) {
-    return jobs.map((job, index) => ({ job, index, added: Date.parse(job.created_at) || 0 }))
-      .sort((a, b) => b.added - a.added || a.index - b.index).map(item => item.job);
+  function jobLifecycle(job) {
+    if (job.status === 'done' && job.legacy_export) return 'export';
+    if (job.status === 'queued') return job.scheduled === true || (job.scheduled === undefined && job.stage === 'В очереди') ? 'queued' : 'ready';
+    return job.status || 'ready';
+  }
+  function sortJobs(jobs) {
+    return jobs.map((job, index) => ({ job, index, added: Date.parse(job.created_at) }))
+      .sort((a, b) => {
+        if (state.sort === 'name-asc' || state.sort === 'name-desc') {
+          return nameCollator.compare(a.job.name, b.job.name) * (state.sort === 'name-desc' ? -1 : 1) || a.index - b.index;
+        }
+        if (Number.isFinite(a.added) !== Number.isFinite(b.added)) return Number.isFinite(a.added) ? -1 : 1;
+        return (Number.isFinite(a.added) ? (a.added - b.added) * (state.sort === 'oldest' ? 1 : -1) : 0) || a.index - b.index;
+      }).map(item => item.job);
+  }
+  function matchesJobFilter(job, filter) {
+    const lifecycle = jobLifecycle(job);
+    return filter === 'all' || filter === 'queued' && lifecycle === 'ready'
+      || filter === 'active' && ['uploading', 'queued', 'running'].includes(lifecycle)
+      || filter === 'done' && lifecycle === 'done' || filter === 'error' && lifecycle === 'error';
   }
   function renderUpdates(snapshot) {
     updateSnapshot = snapshot;
@@ -118,7 +137,7 @@
     const version = snapshot.current_version ? `Версия ${snapshot.current_version}` : '';
     $('#update-status').textContent = [version, snapshot.error || snapshot.message || (snapshot.available ? 'Доступна новая версия' : 'Установлена последняя версия')].filter(Boolean).join(' · ');
     if (snapshot.installing) {
-      document.querySelectorAll('.controls button, .controls input, .job-actions button, .job-main .text-button, #add-files-button, #clear-button, #output-change, #download-all').forEach(control => {
+      document.querySelectorAll('.controls button, .controls input, .job-actions button, .job-pages button, .job-name-button, .job-main .text-button, #add-files-button, #clear-button, #output-change, #download-all').forEach(control => {
         if (!updateLockedControls.has(control)) updateLockedControls.set(control, control.disabled);
         control.disabled = true;
       });
@@ -167,7 +186,7 @@
   function jobFormat(job) { return Object.hasOwn(formats, job.format) ? job.format : 'markdown'; }
   function isJobRecord(record) { return record.kind === 'job'; }
   function recordPath(record) { return isJobRecord(record) ? `/api/jobs/${encodeURIComponent(record.job_id)}` : `/api/installed/${encodeURIComponent(record.id)}`; }
-  function deletionKey(record) { return record.job_id ? `job:${record.job_id}` : record.id; }
+  function deletionKey(record) { return isJobRecord(record) ? `job:${record.job_id}` : `saved:${record.id}`; }
   function savedActions(record, disabled = false, original = false) {
     const first = original
       ? button('Открыть оригинал', 'button button-outline', () => openSavedResult(record.id, 'source'))
@@ -184,30 +203,62 @@
   function deleteButton(record) {
     const remove = button(state.deleting.has(deletionKey(record)) ? 'Удаление…' : 'Удалить', 'button button-danger', () => deleteDocument(record));
     remove.disabled = state.deleting.has(deletionKey(record)) || record.status === 'running';
-    remove.setAttribute('aria-label', `Удалить файл и все результаты конвертации: ${record.name}`);
+    remove.setAttribute('aria-label', isJobRecord(record) ? `Удалить файл и все результаты конвертации: ${record.name}` : `Удалить результат в формате ${formats[record.format] || record.format}: ${record.name}`);
     return remove;
   }
   function additionalActions(job, record) {
+    const lifecycle = jobLifecycle(job);
     const details = element('details', 'job-more');
     const summary = element('summary', '', '⋯');
     summary.setAttribute('aria-label', `Другие действия с документом ${job.name}`);
+    summary.setAttribute('aria-expanded', 'false');
     const menu = element('div', 'job-more-menu');
     menu.setAttribute('popover', 'manual'); menu.hidden = true;
-    if (record) {
-      const disabled = state.opening.has(record.id) || state.deleting.has(deletionKey(record));
-      if (record.format !== 'html') {
-        const label = record.format === 'plaintext' ? 'TXT' : formats[record.format] || record.format;
-        const converted = button(`Открыть в ${label}`, 'button button-outline', () => openSavedResult(record.id, 'converted'));
-        converted.disabled = disabled; menu.append(converted);
-      }
-      const folder = button('Открыть папку результата', 'button button-outline', () => openSavedResult(record.id, 'folder'));
-      folder.disabled = disabled; menu.append(folder, deleteButton(record));
-    } else {
-      menu.append(deleteButton({...job, kind: 'job', job_id: job.id}));
+    menu.id = `job-menu-${job.id}`;
+    summary.setAttribute('aria-controls', menu.id);
+    function group(label, actions) {
+      const section = element('div', 'job-menu-group');
+      section.setAttribute('role', 'group'); section.setAttribute('aria-label', label);
+      const heading = element('p', 'job-menu-heading', label);
+      heading.setAttribute('aria-hidden', 'true');
+      section.append(heading, ...actions); menu.append(section);
     }
-    menu.append(dismissControl(job, true));
+    if (lifecycle === 'done') {
+      const results = [];
+      if (record) {
+        const disabled = state.opening.has(record.id) || state.deleting.has(deletionKey(record)) || !state.connected;
+        if (record.format !== 'html') {
+          const label = record.format === 'plaintext' ? 'TXT' : formats[record.format] || record.format;
+          const converted = button(`Открыть в ${label}`, 'button button-outline', () => openSavedResult(record.id, 'converted'));
+          converted.disabled = disabled; results.push(converted);
+        }
+        const folder = button('Открыть папку результата', 'button button-outline', () => openSavedResult(record.id, 'folder'));
+        folder.disabled = disabled; results.push(folder);
+      } else {
+        const save = button(state.saving.has(job.id) ? 'Сохранение…' : 'Сохранить в папку', 'button button-outline', () => saveResult(job.id));
+        save.disabled = state.busy || state.saving.has(job.id) || state.savingAll || !state.connected;
+        save.title = `Сохранить ${formats[jobFormat(job)]} и ресурсы документа в ${state.outputDir || 'выбранную папку'}`;
+        results.push(save);
+      }
+      if (jobFormat(job) !== state.format) {
+        const reexport = button(`Экспортировать в ${formats[state.format]}`, 'button button-outline', () => exportJobs([job.id], state.format));
+        reexport.title = 'Подготовить выбранный формат без повторного распознавания';
+        reexport.disabled = state.busy || state.savingAll || state.saving.has(job.id) || !state.connected;
+        results.push(reexport);
+      }
+      group('Результат', results);
+    }
+    const documentActions = [originalButton(job)];
+    if (['running', 'error', 'cancelled', 'done', 'export'].includes(lifecycle)) {
+      documentActions.push(button('Открыть журнал', 'button button-outline', () => openLog({...job, kind: 'job', job_id: job.id})));
+    }
+    group('Документ', documentActions);
+    if (!['queued', 'running', 'uploading'].includes(lifecycle)) {
+      group('Управление', [dismissControl(job, true), deleteButton(record || {...job, kind: 'job', job_id: job.id})]);
+    }
     details.append(summary, menu);
     details.addEventListener('toggle', () => {
+      summary.setAttribute('aria-expanded', String(details.open));
       if (!details.open) { if (typeof menu.hidePopover === 'function' && menu.matches(':popover-open')) menu.hidePopover(); menu.hidden = true; return; }
       document.querySelectorAll('.job-more[open]').forEach(other => { if (other !== details) other.open = false; });
       menu.hidden = false;
@@ -216,7 +267,27 @@
       menu.style.left = `${Math.max(8, Math.min(bounds.right - menu.offsetWidth, innerWidth - menu.offsetWidth - 8))}px`;
       menu.style.top = `${bounds.bottom + menu.offsetHeight + 8 > innerHeight && bounds.top > menu.offsetHeight + 8 ? bounds.top - menu.offsetHeight - 7 : Math.min(bounds.bottom + 7, innerHeight - menu.offsetHeight - 8)}px`;
     });
-    menu.addEventListener('click', event => { if (event.target.closest('button,a')) details.open = false; });
+    menu.addEventListener('click', event => {
+      if (event.target.closest('button,a')) { details.open = false; if (details.isConnected) summary.focus({ preventScroll: true }); }
+    }, true);
+    summary.addEventListener('keydown', event => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        const focusFirst = () => { if (details.open) menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true }); };
+        if (menu.hidden) details.addEventListener('toggle', focusFirst, { once: true });
+        else focusFirst();
+        details.open = true;
+      }
+    });
+    menu.addEventListener('keydown', event => {
+      const controls = [...menu.querySelectorAll('button:not(:disabled)')];
+      if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const index = controls.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? controls.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + controls.length) % controls.length;
+        controls[next]?.focus({ preventScroll: true });
+      }
+    });
     return details;
   }
   function closeDismissHint() {
@@ -282,7 +353,7 @@
     trigger.setAttribute('aria-expanded', 'false');
     if (restoreFocus && trigger.isConnected) trigger.focus({ preventScroll: true });
   }
-  function originalButton(job, caption = 'Оригинал') {
+  function originalButton(job, caption = 'Открыть оригинал') {
     const key = `source:${job.id}`;
     const open = button(caption, 'button button-outline original-button', async () => {
       if (state.opening.has(key)) return;
@@ -300,7 +371,7 @@
     open.prepend(icon); open.append(arrow);
     open.title = extension(job.name) === 'pdf' ? 'Открыть исходный PDF' : 'Открыть исходный файл';
     open.setAttribute('aria-label', `Открыть оригинал: ${job.name}`);
-    open.disabled = job.source_available === false || state.opening.has(key) || state.deleting.has(`job:${job.id}`);
+    open.disabled = !state.connected || job.source_available === false || state.opening.has(key) || state.deleting.has(`job:${job.id}`);
     return open;
   }
   function pageControl(job) {
@@ -324,7 +395,7 @@
     const chevron = element('span', 'page-chevron', '⌄'); chevron.setAttribute('aria-hidden', 'true'); trigger.append(chevron);
     trigger.setAttribute('aria-label', `Выбрать страницы: ${job.name}`);
     trigger.setAttribute('aria-haspopup', 'dialog'); trigger.setAttribute('aria-expanded', 'false');
-    trigger.disabled = !known || job.pages_editable === false || !['queued', 'error', 'cancelled'].includes(job.status) || state.busy;
+    trigger.disabled = !state.connected || !known || job.pages_editable === false || !['queued', 'error', 'cancelled'].includes(job.status) || state.busy;
     trigger.title = !known ? job.page_count_error || 'Не удалось определить число страниц PDF' : job.status === 'done' ? 'Диапазон обработанного документа' : 'Выбрать страницы только для этого PDF';
     const menu = element('div', 'page-menu'); menu.hidden = true;
     menu.id = `page-menu-${job.id}`; menu.setAttribute('popover', 'manual'); menu.setAttribute('role', 'dialog');
@@ -366,18 +437,39 @@
     menu.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closePageMenu(true); } });
     update(); wrapper.append(trigger, menu); return wrapper;
   }
+  function createJobWarnings(job) {
+    const warnings = Array.isArray(job.warnings) ? job.warnings.filter(message => typeof message === 'string' && message.trim()).map(message => message.trim()) : [];
+    if (!warnings.length) return null;
+    const details = element('details', 'job-warnings');
+    const caption = extension(job.name) === 'pdf' ? 'Предупреждения по исходному PDF' : 'Предупреждения по документу';
+    const summary = element('summary', '', `${caption} (${warnings.length})`);
+    summary.setAttribute('aria-label', `${caption}: ${job.name}`);
+    const list = element('ul', 'job-warning-list');
+    warnings.forEach(message => list.append(element('li', '', message)));
+    details.append(summary, list);
+    return details;
+  }
   function createJobRow(job) {
     const status = job.status || 'queued';
+    const lifecycle = jobLifecycle(job);
     const convertedFormat = jobFormat(job);
     const row = element('article', 'job-row');
     row.dataset.id = job.id;
     row.dataset.status = status;
+    row.dataset.lifecycle = lifecycle;
     if (job.legacy_export) row.dataset.needsExport = 'true';
     row.setAttribute('role', 'listitem');
     row.append(fileIcon(job.name));
     const main = element('div', 'job-main');
-    const name = element('h3', 'job-name', job.name);
+    const name = element('h3', 'job-name');
     name.title = job.name;
+    if (lifecycle === 'uploading') name.textContent = job.name;
+    else {
+      const openSource = originalButton(job);
+      openSource.className = 'job-name-button';
+      openSource.textContent = job.name;
+      name.append(openSource);
+    }
     main.append(name);
     const meta = [];
     const added = addedTime(job.created_at);
@@ -387,14 +479,18 @@
     if (status === 'done') meta.push(`→ ${formats[convertedFormat]}`);
     main.append(element('p', 'job-meta', meta.join(' · ')));
     const pages = extension(job.name) === 'pdf' ? job.source_page_count || job.stats?.pages : job.stats?.pages;
-    const pageCount = element('p', 'job-pages', pages ? countText(pages, extension(job.name) === 'xlsx' ? ['лист', 'листа', 'листов'] : ['страница', 'страницы', 'страниц']) : '');
+    const pageCount = element('div', 'job-pages', pages ? countText(pages, extension(job.name) === 'xlsx' ? ['лист', 'листа', 'листов'] : ['страница', 'страницы', 'страниц']) : '');
+    if (['ready', 'error', 'cancelled'].includes(lifecycle) && extension(job.name) === 'pdf' && job.pages_editable !== false) {
+      pageCount.textContent = '';
+      pageCount.append(pageControl(job));
+    }
     const statusRegion = element('div', 'job-state');
     if (status === 'running') {
       const progress = Math.min(100, Math.max(0, Number(job.progress) || 0));
       const line = element('div', 'progress-line');
       const track = element('div', 'progress-track');
       track.setAttribute('role', 'progressbar');
-      track.setAttribute('aria-label', `Обработка ${job.name}`);
+      track.setAttribute('aria-label', `Обработка: ${job.name}`);
       track.setAttribute('aria-valuemin', '0'); track.setAttribute('aria-valuemax', '100'); track.setAttribute('aria-valuenow', String(progress));
       const fill = element('div', 'progress-fill');
       fill.style.width = `${progress}%`;
@@ -402,29 +498,19 @@
       line.append(track, element('span', 'progress-percent', `${Math.round(progress)}%`));
       statusRegion.append(line);
     }
-    const stage = status === 'error' ? job.user_error || 'Не удалось преобразовать документ. Повторите попытку.' : job.stage;
-    if (stage && status !== 'done') main.append(element('p', `job-stage${status === 'error' ? ' error' : ''}`, stage));
-    if (status === 'done' && (job.legacy_export || convertedFormat !== state.format)) {
-      if (job.legacy_export) main.append(element('p', 'job-stage', 'Обновите экспорт для новой структуры папки и внешних изображений.'));
-      const reexport = button(`Экспортировать в ${formats[state.format]}`, 'text-button', () => exportJobs([job.id], state.format));
-      reexport.title = 'Подготовить выбранный формат из сохранённого результата без повторного OCR';
-      reexport.disabled = state.busy;
-      main.append(reexport);
-    }
+    const stage = status === 'error' ? job.user_error || 'Откройте журнал, чтобы узнать причину ошибки.' : status === 'running' || status === 'uploading' ? job.stage : '';
+    if (stage) main.append(element('p', `job-stage${status === 'error' ? ' error' : ''}`, stage));
+    if (status === 'error' && job.error_action) main.append(element('p', 'job-stage', job.error_action));
+    const warnings = createJobWarnings(job);
+    if (warnings) main.append(warnings);
+    if (lifecycle === 'export') main.append(element('p', 'job-stage', 'Обновите экспорт без повторного распознавания.'));
     row.append(main, pageCount, statusRegion);
     const actions = element('div', 'job-actions');
-    const statusNames = { queued: 'В очереди', running: 'Обработка', done: 'OCR выполнен', error: 'Ошибка', cancelled: 'Остановлено', uploading: 'Загрузка' };
-    const needsExport = status === 'done' && job.legacy_export;
-    const statusLabel = element('span', `job-status ${needsExport ? 'queued' : status}`, needsExport ? 'Нужен экспорт' : statusNames[status] || status);
-    statusLabel.prepend(statusIcon(needsExport ? 'queued' : status));
+    const statusLabel = element('span', `job-status ${lifecycle}`, lifecycleNames[lifecycle] || lifecycle);
+    statusLabel.prepend(statusIcon(['ready', 'export'].includes(lifecycle) ? 'queued' : status));
     statusRegion.prepend(statusLabel);
-    if (status !== 'uploading') {
-      const sources = element('div', 'job-source-controls');
-      sources.append(originalButton(job));
-      if (extension(job.name) === 'pdf') sources.append(pageControl(job));
-      actions.append(sources);
-    }
-    if (status === 'done' && !job.legacy_export) {
+    if (job.saved_result_id && lifecycle === 'done') statusRegion.append(element('span', 'job-saved-note', 'Сохранён в папку'));
+    if (lifecycle === 'done') {
       if (job.saved_result_id) {
         const record = { id: job.saved_result_id, job_id: job.id, name: job.name, format: convertedFormat };
         const disabled = state.opening.has(record.id) || state.deleting.has(deletionKey(record));
@@ -433,52 +519,73 @@
         actions.append(open, additionalActions(job, record));
       } else {
         actions.append(button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/view/${encodeURIComponent(job.id)}/document.html`)));
-        const download = button(state.saving.has(job.id) ? 'Сохранение…' : 'Скачать', 'button button-outline', () => saveResult(job.id));
-        download.disabled = state.saving.has(job.id) || state.savingAll;
-        download.title = 'Сохранить выбранный формат и ресурсы в папку результата';
-        download.setAttribute('aria-label', `Скачать ${job.name} в формате ${formats[convertedFormat]}`);
-        actions.append(download, additionalActions(job));
+        actions.append(additionalActions(job));
       }
-    } else if (status === 'running') {
+    } else if (lifecycle === 'running') {
       actions.append(button('Остановить', 'button button-outline', () => cancelJobs([job.id])));
-    } else if (status === 'error' || status === 'cancelled') {
-      actions.append(button('Повторить', 'button button-outline', () => startJobs([job.id])));
+    } else if (lifecycle === 'queued') {
+      actions.append(button('Убрать из очереди', 'button button-outline', () => cancelJobs([job.id])));
+    } else if (lifecycle === 'ready') {
+      actions.append(button('Обработать', 'button button-primary', () => startJobs([job.id])));
+    } else if (lifecycle === 'export') {
+      actions.append(button('Обновить экспорт', 'button button-primary', () => exportJobs([job.id], state.format)));
+    } else if (lifecycle === 'error') {
+      const assemblyFailure = ['quality_match', 'quality_integrity', 'internal'].includes(job.error_kind);
+      const retry = button(assemblyFailure && !job.error_retryable ? 'Повторить сборку' : 'Повторить', 'button button-primary', () => startJobs([job.id]));
+      retry.title = !job.error_retryable && assemblyFailure ? 'Использует сохранённый OCR. Повторная сборка без исправления причины может дать ту же ошибку.' : job.error_action || 'Повторить обработку после устранения причины';
+      actions.append(retry);
+    } else if (lifecycle === 'cancelled') {
+      actions.append(button('Запустить заново', 'button button-primary', () => startJobs([job.id])));
     }
-    if (status !== 'running' && status !== 'uploading' && !(status === 'done' && !job.legacy_export)) {
+    if (!['uploading', 'done'].includes(lifecycle)) {
       actions.append(additionalActions(job));
     }
+    if (state.busy || !state.connected || state.deleting.has(`job:${job.id}`)) actions.querySelectorAll('button').forEach(control => { control.disabled = true; });
     row.append(actions);
     return row;
   }
-  function restoreRowFocus(focusId, focusLabel) {
+  function restoreRowFocus(focusId, focusLabel, inMenu = false) {
     const row = [...$('#job-list').children].find(node => node.dataset.id === focusId);
-    const control = row && [...row.querySelectorAll('button,a,summary')].find(node => (node.getAttribute('aria-label') || node.textContent) === focusLabel);
-    if (control) { const details = control.closest('details'); if (details && control.tagName !== 'SUMMARY') details.open = true; control.focus({ preventScroll: true }); }
+    const control = row && [...row.querySelectorAll(inMenu ? '.job-more-menu button,.job-more-menu a' : 'button,a,summary')].find(node => (node.getAttribute('aria-label') || node.textContent) === focusLabel);
+    if (!control) return;
+    const details = control.closest('.job-more');
+    if (details && control.tagName !== 'SUMMARY') {
+      if (details.querySelector('.job-more-menu').hidden) {
+        details.addEventListener('toggle', () => { if (details.open && control.isConnected) control.focus({ preventScroll: true }); }, { once: true });
+        details.open = true;
+        return;
+      }
+      details.open = true;
+    }
+    control.focus({ preventScroll: true });
   }
   function render() {
-    const jobs = newestFirst([...state.jobs, ...state.uploading]);
-    const normalizedQuery = state.query.trim().toLocaleLowerCase('ru-RU');
-    const visibleJobs = jobs.filter(job => (!normalizedQuery || job.name.toLocaleLowerCase('ru-RU').includes(normalizedQuery))
-      && (state.filter === 'all' || state.filter === 'done' && job.status === 'done' && !job.legacy_export || state.filter === 'active' && ['queued', 'running', 'uploading'].includes(job.status)));
+    const jobs = sortJobs([...state.jobs, ...state.uploading]);
+    const normalizedQuery = state.query.trim().normalize('NFKC').toLocaleLowerCase('ru-RU');
+    const visibleJobs = jobs.filter(job => (!normalizedQuery || job.name.normalize('NFKC').toLocaleLowerCase('ru-RU').includes(normalizedQuery)) && matchesJobFilter(job, state.filter));
     const completed = state.jobs.filter(job => job.status === 'done' && !job.legacy_export);
     const needsExport = state.jobs.filter(job => job.status === 'done' && job.legacy_export);
     const running = state.jobs.filter(job => job.status === 'running');
-    const queued = state.jobs.filter(job => job.status === 'queued');
+    const queued = state.jobs.filter(job => jobLifecycle(job) === 'ready');
+    const scheduled = state.jobs.filter(job => jobLifecycle(job) === 'queued');
     const failures = state.jobs.filter(job => job.status === 'error');
-    const active = running.length > 0;
+    const active = running.length > 0 || scheduled.length > 0;
     const previousScroll = $('#job-list').scrollTop;
     const focused = document.activeElement;
     const focusedRow = focused?.closest('.job-row');
     const focusId = focusedRow?.dataset.id;
     const focusLabel = focused?.getAttribute('aria-label') || focused?.textContent;
+    const focusInMenu = !!focused?.closest('.job-more-menu');
     const list = $('#job-list');
     const existingRows = new Map([...list.children].map(row => [row.dataset.id, row]));
     const nextRows = visibleJobs.map(job => {
-      const key = JSON.stringify([state.format, state.busy, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), job]);
+      const key = JSON.stringify([state.format, state.busy, state.connected, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), state.deleting.has(`saved:${job.saved_result_id}`), job]);
       const previous = existingRows.get(job.id);
       if (previous?.dataset.renderKey === key) return previous;
       const row = createJobRow(job);
-      if (previous?.querySelector('.job-more')?.open && row.querySelector('.job-more')) row.querySelector('.job-more').open = true;
+      for (const selector of ['.job-more', '.job-warnings']) {
+        if (previous?.querySelector(selector)?.open && row.querySelector(selector)) row.querySelector(selector).open = true;
+      }
       row.dataset.renderKey = key;
       return row;
     });
@@ -488,7 +595,7 @@
     [...list.children].forEach(row => { if (!retained.has(row)) { if (activeDismissHint && row.contains(activeDismissHint)) closeDismissHint(); row.remove(); } });
     $('#job-list').scrollTop = previousScroll;
     if (focusId && !focused.isConnected) {
-      restoreRowFocus(focusId, focusLabel);
+      restoreRowFocus(focusId, focusLabel, focusInMenu);
     }
     $('#empty-state').hidden = visibleJobs.length > 0;
     $('#empty-state h3').textContent = jobs.length ? 'Документы не найдены' : 'Добавьте документы';
@@ -497,11 +604,15 @@
     $('#nav-all-count').textContent = jobs.length;
     $('#nav-done-count').textContent = completed.length;
     $('#filter-all-count').textContent = jobs.length;
-    $('#filter-active-count').textContent = jobs.filter(job => ['queued', 'running', 'uploading'].includes(job.status)).length;
+    $('#filter-queued-count').textContent = queued.length;
+    $('#filter-active-count').textContent = jobs.filter(job => matchesJobFilter(job, 'active')).length;
     $('#filter-done-count').textContent = completed.length;
-    $('#download-all').hidden = !completed.some(job => !job.saved_result_id);
-    $('#download-all').disabled = state.savingAll || state.saving.size > 0 || !state.connected;
-    $('#download-all').textContent = state.savingAll ? 'Сохранение…' : 'Скачать всё';
+    $('#filter-error-count').textContent = failures.length;
+    const unsaved = completed.filter(job => !job.saved_result_id);
+    $('#download-all').hidden = completed.length === 0;
+    $('#download-all').disabled = unsaved.length === 0 || state.busy || state.savingAll || state.saving.size > 0 || !state.connected;
+    $('#download-all').textContent = state.savingAll ? 'Сохранение…' : unsaved.length ? `Сохранить все · ${unsaved.length}` : 'Все результаты сохранены';
+    $('#download-all').title = unsaved.length ? `Сохранить ${countText(unsaved.length, ['готовый результат', 'готовых результата', 'готовых результатов'])} из всего списка в ${state.outputDir || 'выбранную папку'}. Поиск и фильтры не меняют набор сохраняемых результатов.` : 'Все готовые результаты уже сохранены в папки';
     $('#clear-button').hidden = jobs.length === 0 || active || state.uploading.length > 0;
     $('#cancel-all-button').hidden = !active;
     $('#convert-button').disabled = queued.length === 0 || state.busy || state.uploading.length > 0 || !state.connected;
@@ -521,7 +632,7 @@
       $('#screen-subtitle').textContent = 'Документы и сканы → структурированный результат';
     }
     $('#screen-title').textContent = 'Документы';
-    $('#queue-summary').textContent = jobs.length ? `${countText(jobs.length, ['документ', 'документа', 'документов'])}${completed.length ? ` · Готово: ${completed.length}` : ''}${needsExport.length ? ` · Нужен экспорт: ${needsExport.length}` : ''}${queued.length ? ` · В очереди: ${queued.length}` : ''}` : 'Файлы появятся здесь после загрузки';
+    $('#queue-summary').textContent = jobs.length ? `${visibleJobs.length === jobs.length ? countText(jobs.length, ['документ', 'документа', 'документов']) : `Показано ${visibleJobs.length} из ${jobs.length}`}${completed.length ? ` · Готово: ${completed.length}` : ''}${needsExport.length ? ` · Нужен экспорт: ${needsExport.length}` : ''}${queued.length ? ` · К обработке: ${queued.length}` : ''}` : 'Файлы появятся здесь после загрузки';
     $('#results-footnote').textContent = completed.length ? 'Готовые документы можно открыть или сохранить.' : active ? 'Документы обрабатываются последовательно. Можно продолжать добавлять файлы.' : 'Файлы и результаты доступны в «Истории»';
     const notes = {
       markdown: 'Для заметок и текстовых редакторов. Сохраняет структуру документа.',
@@ -539,7 +650,6 @@
     $('#output-directory').textContent = value;
     $('#output-directory').title = value;
     $('#installed-root').textContent = value;
-    $('#download-all').title = `Сохранить все готовые результаты в ${value}`;
   }
   async function openOutputSettings() {
     $('#output-error').hidden = true;
@@ -604,6 +714,7 @@
       render();
     } catch (error) {
       state.connected = false;
+      render();
       $('#connection-error').hidden = false;
       $('#engine-label').textContent = 'Нет соединения';
       $('#engine-status').className = 'engine-status unavailable';
@@ -729,7 +840,7 @@
     catch (error) { toast(error.message); }
   }
   async function exportJobs(ids, format) {
-    if (state.busy) return;
+    if (state.busy || state.savingAll || state.saving.size) return;
     state.busy = true;
     render();
     try { await post('/api/export', { ids, format }); }
@@ -737,7 +848,7 @@
     finally { state.busy = false; await refresh(); }
   }
   async function saveResult(id) {
-    if (state.saving.has(id) || state.savingAll) return;
+    if (state.busy || state.saving.has(id) || state.savingAll) return;
     state.saving.add(id);
     render();
     if ($('#installed-dialog').open) renderInstalled();
@@ -753,14 +864,14 @@
     finally { state.saving.delete(id); render(); if ($('#installed-dialog').open) renderInstalled(); }
   }
   async function saveAllResults() {
-    if (state.savingAll || state.saving.size) return;
+    if (state.busy || state.savingAll || state.saving.size) return;
     state.savingAll = true;
     render();
     try {
       const result = await post('/api/save-all', {});
       const items = result.items || [];
       const errors = result.errors || [];
-      toast(errors.length ? `Сохранено: ${items.length}. Не удалось сохранить: ${errors.length}. Проверьте результаты в «Истории».` : `Сохранено ${countText(items.length, ['документ', 'документа', 'документов'])} в ocr_output.`);
+      toast(errors.length ? `Сохранено: ${items.length}. Не удалось сохранить: ${errors.length}. Проверьте результаты в «Истории».` : `Сохранено ${countText(items.length, ['документ', 'документа', 'документов'])} в ${state.outputDir || 'выбранную папку'}.`);
       await refresh();
       if ($('#installed-dialog').open) await loadInstalled();
     } catch (error) { toast(error.message); }
@@ -788,8 +899,7 @@
       row.dataset.id = item.id;
       const description = element('div', 'installed-description');
       description.append(element('h3', '', item.folder_name || item.name));
-      const statuses = { queued: 'В очереди', running: 'Обработка', error: 'Ошибка', cancelled: 'Остановлено', done: 'Не скачан' };
-      description.append(element('p', 'installed-meta', [formats[item.format] || item.format, isJobRecord(item) ? statuses[item.status] : 'Скачан', savedDate(item.created_at), sizeText(item.size)].filter(Boolean).join(' · ')));
+      description.append(element('p', 'installed-meta', [formats[item.format] || item.format, isJobRecord(item) ? lifecycleNames[jobLifecycle(item)] : 'Сохранён в папку', savedDate(item.created_at), sizeText(item.size)].filter(Boolean).join(' · ')));
       if (item.path && !isJobRecord(item)) description.append(element('p', 'installed-path', item.path));
       if (item.exists === false) description.append(element('p', 'installed-missing', 'Папка не найдена на диске'));
       const actions = element('div', 'installed-actions');
@@ -845,7 +955,14 @@
     closePageMenu();
     if ($('#delete-dialog').open) return Promise.resolve(false);
     closeDismissHint();
-    $('#delete-message').textContent = `Вы подтверждаете, что хотите полностью удалить файл и результаты конвертации «${record.name}»?`;
+    const wholeDocument = isJobRecord(record);
+    $('#delete-title').textContent = wholeDocument ? 'Удаление файла' : 'Удаление результата';
+    $('#delete-message').textContent = wholeDocument
+      ? `Удалить файл «${record.name}» и все результаты конвертации?`
+      : `Удалить результат в формате ${formats[record.format] || record.format} для файла «${record.name}»?`;
+    $('#delete-details').textContent = wholeDocument
+      ? 'Будут удалены загруженная копия, все сохранённые результаты, логи и кэш этого файла. Исходный файл вне программы останется на компьютере.'
+      : 'Будет удалён выбранный сохранённый результат. Загруженный файл, результаты в других форматах и данные для конвертации сохранятся.';
     const trigger = document.activeElement;
     return new Promise(resolve => {
       deleteConfirmation = { resolve, trigger };
@@ -863,7 +980,7 @@
       await api(recordPath(item), { method: 'DELETE' });
       await refresh();
       if ($('#installed-dialog').open) await loadInstalled();
-      toast('Файл, все результаты конвертации, логи и кэш удалены.');
+      toast(isJobRecord(item) ? 'Файл, все результаты конвертации, логи и кэш удалены.' : `Результат в формате ${formats[item.format] || item.format} удалён.`);
     } catch (error) {
       toast(error.message);
       await refresh();
@@ -911,6 +1028,26 @@
       await copyLogContent(record, result.content);
     } catch (error) { toast(`Не удалось скопировать лог: ${error.message}`); }
   }
+  async function openLog(record) {
+    const token = ++state.logToken;
+    state.logTrigger = document.activeElement?.closest('.job-more')?.querySelector('summary') || document.activeElement;
+    state.logRecord = record;
+    state.logContent = null;
+    $('#log-title').textContent = record.name;
+    $('#log-content').hidden = $('#log-copy-fallback').hidden = true;
+    $('#log-message').hidden = false;
+    $('#log-message').textContent = 'Загрузка журнала…';
+    $('#copy-log-button').disabled = true;
+    $('#log-dialog').showModal();
+    try {
+      const result = await api(`${recordPath(record)}/log`);
+      if (token !== state.logToken || !$('#log-dialog').open) return;
+      if (typeof result.content !== 'string') throw new Error('Приложение не вернуло текст журнала.');
+      setLogContent(record, result.content);
+    } catch (error) {
+      if (token === state.logToken) $('#log-message').textContent = error.message;
+    }
+  }
   async function removeJob(id) {
     closeDismissHint();
     try { await post(`/api/jobs/${encodeURIComponent(id)}/hide`, {}); await refresh(); }
@@ -919,6 +1056,7 @@
   $('#choose-button').addEventListener('click', () => $('#file-input').click());
   $('#add-files-button').addEventListener('click', () => $('#file-input').click());
   $('#job-search').addEventListener('input', event => { state.query = event.target.value; render(); });
+  $('#job-sort').addEventListener('change', event => { state.sort = event.target.value; render(); });
   document.querySelectorAll('[data-job-filter]').forEach(node => node.addEventListener('click', () => {
     state.filter = node.dataset.jobFilter;
     document.querySelectorAll('[data-job-filter]').forEach(item => {
@@ -940,8 +1078,8 @@
     document.querySelectorAll('[data-format]').forEach(item => { const selected = item.dataset.format === state.format; item.classList.toggle('selected', selected); item.setAttribute('aria-pressed', String(selected)); });
     render();
   }));
-  $('#convert-button').addEventListener('click', () => startJobs(state.jobs.filter(job => job.status === 'queued').map(job => job.id)));
-  $('#cancel-all-button').addEventListener('click', () => cancelJobs(state.jobs.filter(job => job.status === 'queued' || job.status === 'running').map(job => job.id)));
+  $('#convert-button').addEventListener('click', () => startJobs(state.jobs.filter(job => jobLifecycle(job) === 'ready').map(job => job.id)));
+  $('#cancel-all-button').addEventListener('click', () => cancelJobs(state.jobs.filter(job => ['queued', 'running'].includes(jobLifecycle(job))).map(job => job.id)));
   $('#clear-button').addEventListener('click', async () => {
     closeDismissHint();
     for (const job of state.jobs.filter(item => item.status !== 'running')) {
@@ -984,6 +1122,7 @@
   $('#installed-dialog').addEventListener('close', () => { state.installedToken++; $('#installed-button').focus({ preventScroll: true }); });
   $('#close-log').addEventListener('click', () => $('#log-dialog').close());
   $('#log-dialog').addEventListener('close', () => {
+    const jobId = state.logRecord?.job_id;
     state.logToken++;
     state.logContent = null;
     state.logRecord = null;
@@ -991,6 +1130,10 @@
     $('#log-copy-fallback').value = '';
     if (state.logTrigger?.isConnected) state.logTrigger.focus({ preventScroll: true });
     else if ($('#installed-dialog').open) $('#installed-refresh').focus({ preventScroll: true });
+    else {
+      const row = [...$('#job-list').children].find(node => node.dataset.id === jobId);
+      (row?.querySelector('.job-more > summary') || $('#job-search')).focus({ preventScroll: true });
+    }
   });
   $('#copy-log-button').addEventListener('click', () => {
     if (state.logRecord && state.logContent !== null) copyLogContent(state.logRecord, state.logContent);

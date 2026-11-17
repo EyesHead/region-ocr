@@ -37,7 +37,7 @@ else:
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.8"
+VERSION = "1.8.11"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -136,7 +136,6 @@ class JobStore:
                     if self.stopping.is_set():
                         return
                     self.engine_host = PersistentEngine(self.root / 'engine_runtime', python=info['python'])
-                    self.engine_host.start()
         except Exception as exc:
             info = {"available": False, "message": f"Не удалось проверить конвертер: {exc}"}
         with self.lock:
@@ -203,6 +202,19 @@ class JobStore:
             except (APIError, OSError, ValueError, TypeError, KeyError) as error:
                 LOG.warning('HTML старого сохранённого результата %s не дополнен: %s', record['id'], error)
 
+    def _diagnose_failure(self, job, error=None):
+        if __package__:
+            from .converter import ConversionFailure, describe_conversion_failure
+        else:
+            from converter import ConversionFailure, describe_conversion_failure
+        if error is None:
+            error = ConversionFailure(job.get('error', ''), dict(
+                kind=job.get('error_kind'), location=job.get('error_location')))
+        failure = describe_conversion_failure(error, self.root / job['id'] / 'result' / 'engine')
+        return dict(user_error=failure['message'], error_kind=failure['kind'],
+                    error_action=failure['action'], error_retryable=failure['retryable'],
+                    error_location=failure['location'])
+
     def public(self, job):
         editable = (job.get('status') in {'queued', 'error', 'cancelled'}
                     and job['id'] not in self.scheduled and Path(job['name']).suffix.lower() == '.pdf'
@@ -212,12 +224,16 @@ class JobStore:
                   and not key.startswith(('_', 'technical_'))}
         result['warnings'] = [text for text in result.get('warnings', [])
                               if 'Движок пометил результат для визуальной проверки таблиц' not in str(text)]
+        if job.get('status') == 'error':
+            result.update(self._diagnose_failure(job))
+            result['error'] = result['user_error']
         if job['id'] in self.scheduled and job.get('status') in {'done', 'error'}:
             # A completed conversion may still be finalizing its durable local
             # artifacts. Do not expose a restartable terminal state before the
             # queue releases it, otherwise an immediate export gets skipped.
             result.update(status='running', progress=99, stage='Завершение обработки')
-        return result | {"artifacts": list(job.get("artifacts", {})), 'pages_editable': editable}
+        return result | {"artifacts": list(job.get("artifacts", {})), 'pages_editable': editable,
+                         'scheduled': job['id'] in self.scheduled}
 
     def snapshot(self):
         with self.lock:
@@ -231,9 +247,10 @@ class JobStore:
                     public['saved_result_id'] = None
                 jobs.append(public)
             runtime = self.engine_host.snapshot() if self.engine_host is not None else None
+            idle_ready = bool(runtime and runtime.get('phase') == 'stopped' and self.engine.get('available'))
             return {"version": VERSION, "session_id": self.session_id,
-                    "engine": "convert_docling · local", "engine_ready": runtime.get('phase') == 'ready' if runtime else bool(self.engine.get("available")),
-                    "engine_message": runtime['message'] if runtime else self.engine.get("message", ""),
+                    "engine": "convert_docling · local", "engine_ready": idle_ready or runtime.get('phase') == 'ready' if runtime else bool(self.engine.get("available")),
+                    "engine_message": 'Готов к обработке' if idle_ready else runtime['message'] if runtime else self.engine.get("message", ""),
                     "engine_runtime": runtime,
                     "jobs": jobs, "output_dir": str(self.saved.root), "storage_error": self.saved.storage_error}
 
@@ -393,7 +410,7 @@ class JobStore:
                         if group['job']:
                             self.delete(group['job_id'])
                         else:
-                            self.delete_saved(group['records'][0]['id'])
+                            self._delete_orphaned_document(group['job_id'])
                     except (APIError, OSError) as error:
                         message = ('Новый файл загружен, но прежнюю копию не удалось полностью удалить. '
                                    'Закройте открытые файлы и удалите прежнюю запись в Истории: ' + str(error))
@@ -488,6 +505,8 @@ class JobStore:
                 job.update(status="queued", progress=0, stage="В очереди", error="", pages=selected_pages,
                            format=output_format, _replay=job.get("replay_html") if export_only else None,
                            saved_result_id=None)
+                for field in ('user_error', 'error_kind', 'error_action', 'error_retryable', 'error_location'):
+                    job.pop(field, None)
                 append_job_log(self.root / ident, f'{"Повторный экспорт из HTML" if export_only else "Конвертация"}: формат={output_format}; страницы={selected_pages or "все"}.')
                 self.events[ident] = threading.Event()
                 self.scheduled.add(ident)
@@ -618,24 +637,28 @@ class JobStore:
             return saved
 
     def delete_saved(self, ident):
+        """Remove one delivered format, retaining the upload and canonical HTML."""
         with self.lock:
             record = self.saved_call('get', ident)
-            job_id = record['job_id']
-            if job_id in self.jobs:
-                self.delete(job_id)
-            else:
-                # A saved delivery may outlive an older queue manifest. Its
-                # upload ID also identifies an owned private cache, if one
-                # survived. Legacy non-UUID IDs cannot name a private folder.
-                target = self._owned_job_folder(job_id) if re.fullmatch(r'[0-9a-f]{32}', job_id) else None
-                self.saved_call('validate_delete_job', job_id)
-                if target is not None and native_path(target).exists():
-                    try:
-                        shutil.rmtree(native_path(target))
-                    except OSError as error:
-                        raise APIError('Не удалось полностью удалить рабочие файлы. Закройте открытые файлы и повторите удаление: '
-                                       + str(error), 409) from None
-                self.saved_call('delete_job', job_id)
+            job = self.jobs.get(record['job_id'])
+            if job and (job['status'] == 'running' or job['id'] in self.scheduled):
+                raise APIError('Сначала остановите обработку файла.', 409)
+            self.saved_call('delete', ident)
+
+    def _delete_orphaned_document(self, job_id):
+        """Fully replace an old upload whose queue entry is no longer present."""
+        with self.lock:
+            # Only explicit document replacement may remove all deliveries and
+            # the shared source. Deleting a history result never enters here.
+            target = self._owned_job_folder(job_id) if re.fullmatch(r'[0-9a-f]{32}', job_id) else None
+            self.saved_call('validate_delete_job', job_id)
+            if target is not None and native_path(target).exists():
+                try:
+                    shutil.rmtree(native_path(target))
+                except OSError as error:
+                    raise APIError('Не удалось полностью удалить рабочие файлы. Закройте открытые файлы и повторите удаление: '
+                                   + str(error), 409) from None
+            self.saved_call('delete_job', job_id)
 
     def saved_document(self, ident, target):
         with self.lock:
@@ -725,7 +748,7 @@ class JobStore:
                         job["stage"] = str(stage)
 
             try:
-                if self.converter is None and not job.get('_replay') and Path(job['source']).suffix.lower() not in {'.html', '.htm', '.xlsx'}:
+                if self.converter is None and not job.get('_replay') and Path(job['source']).suffix.lower() not in {'.html', '.htm', '.xlsx', '.docx'}:
                     while not self.engine_probe_done.wait(.15):
                         if event.is_set() or self.stopping.is_set():
                             raise RuntimeError('Обработка отменена до подготовки движка')
@@ -772,7 +795,8 @@ class JobStore:
                         append_job_log(self.root / ident, 'Обработка отменена.')
                     else:
                         LOG.exception("Conversion failed for %s", ident)
-                        job.update(status="error", stage="Ошибка обработки", error=str(exc)[:2000])
+                        job.update(status="error", stage="Ошибка обработки", error=str(exc)[:2000],
+                                   **self._diagnose_failure(job, exc))
                         append_job_log(self.root / ident, 'ОШИБКА: ' + traceback.format_exc())
             finally:
                 with self.lock:

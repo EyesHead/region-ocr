@@ -94,11 +94,41 @@ def _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)
 
 def _aligned_profile(fragment, geometry, target, source_image, region, api, *, bounds=None, page=None, reader=None):
     primary = api.table_profile(fragment)
+    normalization = None
+    if primary['issues'] and geometry.get('source_grid_verified'):
+        from collections import Counter
+        original = BeautifulSoup(fragment, 'html.parser')
+        repaired, operations = api.repair_table_spans(fragment, target['columns'])
+        candidate = BeautifulSoup(repaired, 'html.parser')
+        def payloads(parsed):
+            return [node.decode_contents() for node in parsed.table.find_all(['td', 'th'])
+                    if node.find_parent('table') is parsed.table]
+        before, after = payloads(original), payloads(candidate)
+        extra = Counter(after)-Counter(before)
+        if (not (Counter(before)-Counter(after)) and not any(value for value in extra)
+                and [value for value in before if value] == [value for value in after if value]
+                and Counter(str(node) for node in original.find_all('math'))
+                    == Counter(str(node) for node in candidate.find_all('math'))):
+            fresh = api.table_profile(repaired)
+            if not fresh['issues']:
+                normalization = dict(method='existing_span_normalizer_with_all_atomic_payloads_preserved',
+                    expected_columns=target['columns'], operations=operations,
+                    original_sha256=hashlib.sha256(fragment.encode()).hexdigest(),
+                    normalized_sha256=hashlib.sha256(repaired.encode()).hexdigest())
+                fragment, primary = repaired, fresh
+    def proven(profile, basis):
+        if normalization:
+            profile['source_primary_span_normalization'] = normalization
+        return profile, basis
     if _prefix_matches(primary, target):
-        return primary, 'exact_source_cell_positions'
+        return proven(primary, 'exact_source_cell_positions')
+    from docling_pdf_primary_rows import align_atomic_primary_rows
+    atomic = align_atomic_primary_rows(fragment, geometry, target, api)
+    if atomic is not None:
+        return proven(atomic, 'unique_monotone_atomic_primary_rows_on_measured_source_grid')
     external = _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)
     if external is not None:
-        return external, 'exact_primary_grid_prefix_and_complete_positioned_external_note'
+        return proven(external, 'exact_primary_grid_prefix_and_complete_positioned_external_note')
     xs, ys = geometry.get('x_grid', []), geometry.get('y_grid', [])
     cells = geometry.get('cells', [])
     if (source_image is None or len(ys) != target['rows'] + 1 or len(xs) != target['columns'] + 1
@@ -114,7 +144,7 @@ def _aligned_profile(fragment, geometry, target, source_image, region, api, *, b
             if proof:
                 candidate = api.table_profile(aligned)
                 if _prefix_matches(candidate, target):
-                    return candidate, 'source_rule_bands_and_exact_reference_cell_order'
+                    return proven(candidate, 'source_rule_bands_and_exact_reference_cell_order')
         tail = [c for c in cells if c['row'] == end-1]
         if (len(tail) != 1 or tail[0]['column'] != 0 or tail[0]['column_span'] != target['columns']
                 or tail[0]['row_span'] != 1):
@@ -123,7 +153,7 @@ def _aligned_profile(fragment, geometry, target, source_image, region, api, *, b
     from docling_pdf_primary_partitions import align_flattened_primary
     partitioned = align_flattened_primary(fragment, geometry, target, source_image, region, api)
     if partitioned is not None:
-        return partitioned, 'unique_complete_primary_partition_on_visible_positioned_source_glyphs'
+        return proven(partitioned, 'unique_complete_primary_partition_on_visible_positioned_source_glyphs')
     return None, None
 
 
@@ -220,12 +250,13 @@ def _numeric_signature(value):
 
 
 def preserve_primary_cells(fragment, geometry, primary_records, region, page, manifest, api,
-                           source_image=None, reader=None):
+                           source_image=None, reader=None, args=None, source_regions=None, table_ref=None):
     """Transfer unambiguous primary cells, retaining physical spans and drawings.
 
     The source grid remains authoritative. A mismatching OCR grid is usable
     only after existing pixel/glyph-backed alignment proves cell ownership.
-    This function performs no OCR calls and changes no blank primary cells.
+    Conflicting math/symbols on proven vector text require regional pixel
+    confirmation before either reading can replace the other.
     """
     if not geometry:
         return fragment, []
@@ -264,6 +295,11 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             api.diagnostic_event('TABLE_PRIMARY_OCR_SKIPPED', page=page,
                                  reason='source_cell_mapping_not_proven', bbox=bounds)
             continue
+        if primary.get('source_primary_span_normalization'):
+            proof = dict(page=page, source_bbox=list(bounds), source_record_sha256=identity,
+                         **primary['source_primary_span_normalization'])
+            manifest.setdefault('primary_source_span_normalizations', []).append(proof)
+            api.diagnostic_event('PRIMARY_SOURCE_GRID_SPANS_NORMALIZED', **proof)
         if primary.get('source_external_note_prefix'):
             proof = dict(source_record_sha256=identity, **primary['source_external_note_prefix'])
             manifest.setdefault('primary_source_external_note_prefixes', []).append(proof)
@@ -339,6 +375,23 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             api.diagnostic_event('TABLE_PRIMARY_OCR_CONFLICT', **conflict)
             continue
         html, readings = next(iter(choices.items()))
+        vector_confirmation = None
+        if source_image is not None:
+            from docling_pdf_vector_content import confirm_vector_cell
+            vector_confirmation = confirm_vector_cell(node.decode_contents(), html, source, geometry,
+                reader, source_regions, page, args, manifest, api, ref=table_ref)
+            if vector_confirmation and vector_confirmation[0] == 'source':
+                html = vector_confirmation[1].get('source_literal_html', node.decode_contents())
+                if vector_confirmation[1].get('source_literal_html') is not None:
+                    from docling_pdf_text_cells import content_fingerprint
+                    source['positioned_source_text'] = dict(source['positioned_source_text'],
+                        html_sha256=content_fingerprint(html), literal_scripts_preserved=True)
+                if vector_confirmation[1].get('review_required'):
+                    node['data-source-review'] = vector_confirmation[1]['reason']
+                    node['data-source-authority'] = 'vector-pdf-literal'
+            elif vector_confirmation:
+                source['source_text_unreliable'] = True
+                source['source_text_conflict_reason'] = 'regional_pixels_confirm_primary_over_pdf_text'
         marker = readings[0].get('graphic_marker', '')
         marker_count = html.count(marker) if marker else 0
         images = [image for image in node.find_all('img')
@@ -398,6 +451,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
         reading = {name: value for name, value in readings[0].items() if name != 'graphic_marker'}
         proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
                      method='primary_ocr_payload_on_source_grid', **reading)
+        if vector_confirmation:
+            proof['method'] = 'vector_source_counterread_' + vector_confirmation[0]
+            proof['vector_confirmation'] = vector_confirmation[1]
         source.update(html=node.decode_contents(), text=node.get_text(' ', strip=True), primary_ocr=proof)
         source.pop('raster_cell_ocr', None)
         source.pop('raster_cell_ocr_source', None)

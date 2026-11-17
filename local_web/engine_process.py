@@ -159,7 +159,7 @@ def main():
     identity = backend_identity(manager)
     emit('ready', message='Локальный OCR готов', **identity,
          startup_seconds=round(time.monotonic()-started, 3))
-    from converter import _worker, _validate_pages
+    from converter import _worker, _validate_pages, describe_conversion_failure
     try:
         for line in sys.stdin:
             request = json.loads(line)
@@ -172,12 +172,14 @@ def main():
             emit('job_started', id=ident, **backend_identity(manager))
             original_argv = sys.argv[:]
             original_environment = {name: os.environ.get(name) for name in ('PATH', 'NO_PROXY', 'no_proxy')}
+            attempt_started = time.time()
             try:
                 _worker(Path(request['source']).resolve(), Path(request['destination']).resolve(),
                         _validate_pages(request.get('pages', '')))
             except (Exception, SystemExit) as error:
                 traceback.print_exc()
-                emit('complete', id=ident, ok=False, message=str(error))
+                emit('complete', id=ident, ok=False, message=str(error),
+                     failure=describe_conversion_failure(error, Path(request['destination']), since=attempt_started))
             else:
                 identity = backend_identity(manager)
                 emit('complete', id=ident, ok=True, seconds=round(time.monotonic()-before, 3),

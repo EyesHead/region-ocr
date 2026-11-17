@@ -12,7 +12,7 @@ if __package__:
 else:
     from file_paths import native_path, normal_path
 
-EXPORT_SCHEMA = 10
+EXPORT_SCHEMA = 13
 CANONICAL_MANIFEST_SCHEMA = 1
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
 FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
@@ -86,6 +86,7 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                   replay_html=None, initial_warnings=(), initial_joins=()):
     """Create a canonical once, then derive packages without mutating that source."""
     from bs4 import BeautifulSoup
+    from docling_pdf_annotations import normalize_semantic_annotations
     source, destination = normal_path(Path(source).resolve()), normal_path(Path(destination).resolve())
     if output_format is not None and output_format not in EXTENSIONS:
         raise ValueError('Неизвестный формат результата: ' + str(output_format))
@@ -127,6 +128,15 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                 raise ValueError('Канонический HTML не содержит body')
             manifest = _legacy_manifest(canonical, canonical_bytes, soup, pages, structured)
         _check_assets(canonical.parent, manifest)
+        if manifest.get('export_schema') != EXPORT_SCHEMA:
+            # Rebuild only the document layer in a new private canonical.
+            # Historical packages/source bytes remain available unchanged.
+            normalize_semantic_annotations(soup, {}, {})
+            return build_exports(str(soup), source, destination,
+                                 pages=manifest['stats'].get('pages', pages),
+                                 output_format=output_format, resource_root=canonical.parent,
+                                 initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
+                                 initial_joins=list(initial_joins) + manifest.get('table_joins', []))
         removed_reviews = structured.strip_review_annotations(soup)
         joins = join_captioned_tables(soup)
         star_notes = normalize_table_star_notes(soup)
@@ -143,6 +153,7 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         if soup.body is None:
             raise ValueError('Документ не содержит body после нормализации HTML')
         structured.strip_review_annotations(soup)
+        normalize_semantic_annotations(soup, {}, {})
         warnings = list(initial_warnings) + list(structured.normalize_table_notes(soup))
         joins = list(initial_joins) + join_captioned_tables(soup)
         normalize_table_star_notes(soup)

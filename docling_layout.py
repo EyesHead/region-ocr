@@ -43,31 +43,6 @@ def opaque_image(image):
     return white.convert('RGB')
 
 
-def prepare_cell_text_image(image):
-    """Fit a source-proven text cell to all its ink, preserving every pixel.
-
-    Only exact white paper is trimmed. If background noise extends to an edge,
-    that edge remains. Padding scales with the retained text rather than the
-    physical cell dimensions, which may include a large blank field.
-    """
-    from PIL import ImageChops
-    source = opaque_image(image)
-    paper = Image.new('RGB',source.size,'white')
-    difference = ImageChops.difference(source,paper)
-    bounds = difference.getbbox()
-    difference.close(); paper.close()
-    if bounds is None:
-        return source, dict(method='source_cell_exact_white_fit',blank=True,
-                            original_size=list(image.size),ink_bbox=None)
-    crop=source.crop(bounds);source.close()
-    padding=max(1,math.ceil(min(crop.size)/6))
-    prepared=Image.new('RGB',(crop.width+2*padding,crop.height+2*padding),'white')
-    prepared.paste(crop,(padding,padding));crop.close()
-    return prepared,dict(method='source_cell_exact_white_fit',blank=False,
-        original_size=list(image.size),ink_bbox=list(bounds),padding=padding,
-        prepared_size=list(prepared.size))
-
-
 def source_colored_field(image, metadata):
     """Prove a large filled triangular/circular graphic from source pixels.
 

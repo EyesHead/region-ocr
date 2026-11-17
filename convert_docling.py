@@ -43,7 +43,6 @@ from functools import lru_cache
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
-from types import SimpleNamespace
 
 from portable_runtime import configure_runtime
 configure_runtime()
@@ -51,9 +50,6 @@ configure_runtime()
 
 LOCAL_SCHEMA = 6
 TEXT_CLEANUP_SCHEMA = 6
-TABLE_RECOVERY_SCHEMA = 21
-TABLE_JOIN_SCHEMA = 14
-TABLE_CELL_SCHEMA = 40
 # Whole source-image fallbacks retain one actual rendered pixel beyond owned
 # glyph extents; this is geometry only and never supplies editable PDF text.
 SOURCE_IMAGE_BOUNDS_HALO_PIXELS = 1
@@ -142,7 +138,6 @@ SURYA_INSTALL = 'python -m pip install -r requirements-docling-surya.txt'
 
 IMAGE_SCALE = 4.2
 RETAINED_IMAGE_SCALE = 1.5
-TABLE_REGION_ATTEMPTS = 4
 LOCAL_REQUEST_SECONDS = 90.0
 API_IMAGE_SCALE = 2.2
 API_MODEL = "gpt-6-luna"
@@ -415,7 +410,7 @@ def diagnostic_startup():
     path=Path(__file__).resolve()
     diagnostic_event('RUNTIME',script=str(path),script_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                      script_mtime_ns=path.stat().st_mtime_ns,python=sys.executable,python_version=sys.version,
-                     cwd=str(Path.cwd()),argv=args,schemas=[LOCAL_SCHEMA,TABLE_RECOVERY_SCHEMA,TABLE_JOIN_SCHEMA,TABLE_CELL_SCHEMA])
+                     cwd=str(Path.cwd()),argv=args,schema=LOCAL_SCHEMA)
     loaded=[]
     for name,obj in sorted(globals().items()):
         code=getattr(obj,'__code__',None)
@@ -1894,7 +1889,16 @@ def clean_pdf_text_flow(doc, records, excluded, manifest, native_reader=None):
                 "right" if box[0] >= size.width * .92 else None)
         reason = None
         if item.label in furniture:
-            reason = "layout_furniture"
+            from docling_pdf_artifacts import primary_body_text
+            retained = primary_body_text(item, region, records, margins.get((edge, key), ()),
+                                         sys.modules[__name__])
+            if retained:
+                item.label = DocItemLabel.TEXT
+                item.content_layer = ContentLayer.BODY
+                manifest.setdefault('retained_primary_body_text', []).append(retained)
+                diagnostic_event('PRIMARY_BODY_TEXT_FURNITURE_PROTECTED', **retained)
+            else:
+                reason = "layout_furniture"
         elif item.label not in {DocItemLabel.FORMULA, DocItemLabel.CAPTION, DocItemLabel.TITLE}:
             if any(record["page_no"] == page_no and record["label"] in {"PageHeader", "PageFooter"}
                    and key == furniture_key(record["text"])
@@ -2139,6 +2143,14 @@ def generate_local_ocr_requests(batch, request, diagnostic):
             # trained layout + block path. Do not retry the identical greedy
             # full-page request or recursively repeat it on smaller pages.
             outputs.extend(result)
+        elif item.metadata.get('purpose') == 'vector_source_counterread':
+            # This checks an already positioned literal source. The caller
+            # retains that source with REVIEW if the check cannot finish;
+            # repeating the same failed decode adds no source evidence.
+            result = request([item])
+            if len(result) != 1:
+                raise RuntimeError('Vector source counterread result count mismatch')
+            outputs.extend(result)
         else:
             if item.prompt_type == 'layout' and item.guided_json is None:
                 item=replace(item,guided_json=LAYOUT_JSON_SCHEMA)
@@ -2161,10 +2173,20 @@ def local_surya_backend(model):
                 if timeout>LOCAL_REQUEST_SECONDS:
                     diagnostic_event('OCR_REQUEST_TOKEN_TIME_ALLOWANCE',seconds=timeout,
                         max_tokens=max(item.max_tokens or 2048 for item in items))
-                return request_with_backend_recovery(backend, lambda: chat_completions_batch(
+                outputs = request_with_backend_recovery(backend, lambda: chat_completions_batch(
                     items, client=backend._client.with_options(max_retries=0),
                     model_name=backend.handle.model_name, timeout=timeout,
                     max_workers=1, max_retries=0, request_logprobs_default=False), diagnostic_event)
+                from surya.recognition import _detect_repeat_loop
+                for item, output in zip(items, outputs):
+                    reason = ('output_token_limit' if item.max_tokens and output.token_count >= item.max_tokens
+                              else 'repeating_output' if _detect_repeat_loop(output.raw) else None)
+                    if reason:
+                        output.error = True
+                        diagnostic_event('OCR_RESPONSE_REQUIRES_RECOVERY', reason=reason,
+                            prompt_type=item.prompt_type, tokens=output.token_count,
+                            max_tokens=item.max_tokens, metadata=item.metadata)
+                return outputs
             return generate_local_ocr_requests(batch, request, diagnostic_event)
         backend.generate = generate
         backend._convert_docling_bounded = True
@@ -2327,9 +2349,10 @@ def restore_ocr_formula_blocks(doc, records, picture_routes, manifest):
     a larger drawing or table stays in that drawing/table.
     """
     from bs4 import BeautifulSoup
-    from docling_core.types.doc import DocItemLabel
+    from docling_core.types.doc import ContentLayer, DocItemLabel
 
     restored = []
+    reachable = {item.self_ref for item, _ in doc.iterate_items()}
     for record in records:
         if "<math" not in record["html"] or "<table" in record["html"]:
             continue
@@ -2349,6 +2372,28 @@ def restore_ocr_formula_blocks(doc, records, picture_routes, manifest):
         matches = [item for item in doc.texts if item.label == DocItemLabel.FORMULA
                    and (reg := item_region(item, doc)) and reg[0] == record["page_no"]
                    and overlap_ratio(reg[1], record["bbox"]) > .6]
+        if not matches:
+            # A pure source equation can already be a TextItem. Keep that
+            # live item instead of inserting a second copy at the same place.
+            # Picture-owned equations retain the promotion route below.
+            from docling_pdf_table_content import _typed_payload_digest
+            digest = _typed_payload_digest(record['html'])
+            coincident_picture = any((where := item_region(picture, doc))
+                and where[0] == record['page_no']
+                and overlap_ratio(where[1], record['bbox']) > .85 for picture in doc.pictures)
+            if not coincident_picture:
+                existing = [item for item in doc.texts
+                    if item.self_ref in reachable
+                    and item.label not in {DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER}
+                    and getattr(item, 'content_layer', None) != ContentLayer.FURNITURE
+                    and (where := item_region(item, doc))
+                    and where[0] == record['page_no']
+                    and all(abs(a-b) <= 1 for a, b in zip(where[1], record['bbox']))
+                    and _typed_payload_digest(item.orig or '') == digest]
+                if len(existing) == 1:
+                    diagnostic_event('PRIMARY_MATH_TEXT_REUSED', ref=existing[0].self_ref,
+                                     page=record['page_no'], bbox=record['bbox'])
+                    continue
         if matches:
             item = max(matches, key=lambda candidate: overlap_ratio(item_region(candidate, doc)[1], record["bbox"]))
         else:
@@ -4701,7 +4746,7 @@ class NativeTableReader:
         if profile['issues'] or profile['columns']!=len(xs)-1 or profile['rows']!=len(ys)-1:
             return None
         from docling_pdf_roman_labels import reference_roman_rows
-        return fragment,dict(basis='raster_cell_rules',bbox=[xs[0],ys[0],xs[-1],ys[-1]],x_grid=xs,y_grid=ys,
+        geometry=dict(basis='raster_cell_rules',bbox=[xs[0],ys[0],xs[-1],ys[-1]],x_grid=xs,y_grid=ys,
                              source_grid_verified=bool(_short_rules and complete_source_grid),
                              source_roman_references=reference_roman_rows(reference_profiles,len(xs)-1),
                              header_rows=header_rows,retained_cell_images=retained,restored_cell_math=[],
@@ -4710,6 +4755,8 @@ class NativeTableReader:
                              hidden_ocr_direction_conflict=source_text_unreliable,
                              glyph_coverage=1.0,text_method='positioned_pdf_ocr_layer',
                              cells=[{k:v for k,v in cell.items() if k!='glyphs'} for cell in cells])
+        from docling_pdf_primary_rows import quarantine_scan_text
+        return quarantine_scan_text(fragment,geometry,source_image,region,page_no,sys.modules[__name__])
 
     def read(self, page_no, region, reference_fragments=(), source_image=None):
         from bs4 import BeautifulSoup
@@ -5131,8 +5178,9 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
             by_page.setdefault(entry["page"], []).append((entry["ref"], obj["bbox"], "verified_cell_object"))
         if entry["method"] in {"pdf_geometry", "raster_geometry"} and geometry.get("glyph_coverage") == 1.0:
             by_page.setdefault(entry["page"], []).append((entry["ref"], geometry["bbox"], "verified_structured_table"))
-        if entry["method"] == "source_image":
-            by_page.setdefault(entry["page"], []).append((entry["ref"], entry["bbox"], "whole_table_crop"))
+        if entry["method"] in {"source_image", "source_image_review"}:
+            source_bbox = entry.get("actual_source_image_bbox") or entry.get("source_render_bbox") or entry["bbox"]
+            by_page.setdefault(entry["page"], []).append((entry["ref"], source_bbox, "whole_table_crop"))
         diagnostic_event("PICTURE_DUPLICATE_TABLE", ref=entry["ref"], page=entry["page"],
                          method=entry["method"], bbox=entry.get("bbox"),
                          geometry_bbox=geometry.get("bbox"), glyph_coverage=geometry.get("glyph_coverage"),
@@ -5260,97 +5308,6 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
 def restore_table_reading_order(doc, excluded, manifest):
     from docling_pdf_flow import restore_table_reading_order as restore_source_order
     restore_source_order(doc, excluded, manifest, sys.modules[__name__])
-
-
-def prepare_pdf_inline_math(doc, reader, regions, picture_routes, recognizer):
-    """Repair inline Flate/Predictor images and attach proven math slots locally."""
-    from bs4 import BeautifulSoup
-    targets, pages = {}, set()
-    if reader is None or not getattr(reader, 'path', None):
-        return targets, pages
-    for picture in doc.pictures:
-        if picture.self_ref in picture_routes:
-            continue
-        reg = item_region(picture, doc)
-        if not reg:
-            continue
-        page_no, box = reg
-        page = reader.load_page(page_no)
-        matches = []
-        for obj in page.images:
-            attrs = obj['stream'].attrs
-            parameters = attrs.get('DP') or attrs.get('DecodeParms') or {}
-            predictor = parameters.get('Predictor') if isinstance(parameters, dict) else None
-            bounds = [obj['x0'], obj['top'], obj['x1'], obj['bottom']]
-            if predictor == 15 and obj['height'] <= 35 and obj['width'] <= 160 and overlap_ratio(bounds, box) > .65:
-                matches.append((obj, bounds))
-        if len(matches) != 1:
-            continue
-        obj, bounds = matches[0]
-        nested_index = False
-        try:
-            from PIL import Image
-            from docling_symbol_evidence import _components
-            w,h = obj['srcsize']
-            raw = obj['stream'].get_data()
-            if obj.get('bits') == 8 and len(raw) == w*h*3:
-                original = Image.frombytes('RGB',(w,h),raw)
-                _, components = _components(original)
-                if len(components) == 3:
-                    a,b,c = components
-                    nested_index = (a[3] >= 1.5*b[3] and a[1]+a[3] < b[1]+b[3]
-                                    and b[1]+b[3]+1 < c[1]+c[3]
-                                    and c[1] > b[1]+1 and b[1] > a[1]+a[3]*.5)
-                original.close()
-        except (ValueError, OSError):
-            pass
-        image = regions.crop(page_no, [bounds[0]-2,bounds[1]-2,bounds[2]+2,bounds[3]+2])
-        # Re-rendering is safe even if no mathematical placement is proven:
-        # never export the broken decoded image buffer again.
-        clean = image_html(image, bounds[2]-bounds[0], 'picture')
-        picture_routes[picture.self_ref] = clean
-        right = [c for c in reader.chars if c['x0'] >= bounds[2]-.5
-                 and bounds[1]-2 <= (c['top']+c['bottom'])/2 <= bounds[3]+2]
-        source_right = ' '.join(l['text'] for l in native_cell_lines(right)).lstrip(' )-—–')
-        key = cell_text_key(source_right)[:25]
-        candidates = []
-        if len(key) >= 10:
-            for item in doc.texts:
-                location = item_region(item, doc)
-                if not location or location[0] != page_no or item.label.value == 'formula':
-                    continue
-                b = location[1]
-                if (b[1] > bounds[3]+8 or b[3] < bounds[1]-4
-                        or bounds[0] > b[2]+10 or bounds[2] < b[0]-30):
-                    continue
-                if key in cell_text_key(item.text):
-                    slots = re.findall(r'\(\s*\)', item.text)
-                    if len(slots) == 1:
-                        kind = 'parentheses'
-                    else:
-                        prefix = re.sub(r'^\s*где\b\s*[-—–]?\s*', '', item.text)
-                        if slots or not cell_text_key(prefix).lstrip('-—–').startswith(key):
-                            continue
-                        kind = 'definition'
-                    candidates.append((item, kind))
-        if len(candidates) == 1:
-            item, kind = candidates[0]
-            rendered = None
-            try:
-                buffer = BytesIO(); image.save(buffer,'PNG')
-                rendered = recognizer(buffer.getvalue(),dict(formula_item=True,width=image.width,height=image.height,
-                    paragraph_text=item.text,inline=True,media_name=picture.self_ref,
-                    source_nested_index=nested_index))
-            except Exception as error:
-                diagnostic_event('PDF_INLINE_MATH_ERROR',page=page_no,ref=picture.self_ref,error=str(error))
-            replacement = rendered or BeautifulSoup(clean,'html.parser').find('img').__str__()
-            targets.setdefault(item.self_ref,[]).append((kind,replacement))
-            picture_routes[picture.self_ref] = ''
-            pages.add(page_no)
-            diagnostic_event('PDF_INLINE_MATH',page=page_no,ref=picture.self_ref,target=item.self_ref,
-                             method='mathml' if rendered else 'source_render',slot=kind)
-        image.close()
-    return targets, pages
 
 
 def apply_inline_math(fragment, replacements):
@@ -5697,6 +5654,17 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
             blockers = (intervening_blocks(old, current, old_page, page_no, old_geo, geo,
                                           allow_page_notes=explicit_continuation and bool(repeated))
                         if page_no == old_page + 1 else [])
+            header_grid_refinement = None
+            if (header_only and page_no == old_page + 1 and not blockers and caption_ok
+                    and (not identity or identity == old_identity)
+                    and geo['bbox'][1] < .15 * size.height):
+                from docling_pdf_table_layout import refine_header_only_grid
+                refined = refine_header_only_grid(str(old_soup.table), old_geo, geo,
+                    sys.modules[__name__], page_width=old_size.width, following_page_width=size.width)
+                if refined is not None:
+                    refined_html, old_geo, header_grid_refinement = refined
+                    old_soup = BeautifulSoup(refined_html, 'html.parser')
+                    head = old_soup.table.find('thead', recursive=False)
             same_grid = (len(old_geo['x_grid'])==len(geo['x_grid'])
                          and all(abs(a/old_size.width-b/size.width)<.008
                                  for a,b in zip(old_geo['x_grid'],geo['x_grid'])))
@@ -5818,6 +5786,57 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                 old_profile, new_profile = table_profile(str(old_soup.table)), table_profile(str(soup.table))
                 old_nodes = old_soup.table.find_all(["td", "th"])
                 new_nodes = soup.table.find_all(["td", "th"])
+                if header_grid_refinement:
+                    # Measured blank header stubs can continue for several
+                    # header levels, rather than becoming empty body cells.
+                    continued_rows = list(new_head.find_all('tr')) if new_head else []
+                    source_header_rows = (current.get('pdf_geometry') or {}).get('header_rows', 0)
+                    stub_pairs = []
+                    if continued_rows and source_header_rows == len(continued_rows):
+                        for lower in (c for c in new_profile['cells'] if c['row'] == 0
+                                      and c['row_span'] == source_header_rows and not c['text']):
+                            lower_node = new_nodes[new_profile['cells'].index(lower)]
+                            uppers = [c for c in old_profile['cells'] if c['column'] == lower['column']
+                                and c['column_span'] == lower['column_span'] and c['text']
+                                and c['row'] + c['row_span'] == old_profile['rows']]
+                            if len(uppers) == 1 and not lower_node.find(['img', 'math', 'table']):
+                                upper = uppers[0]
+                                stub_pairs.append((upper, old_nodes[old_profile['cells'].index(upper)], lower_node))
+                    if stub_pairs:
+                        for upper, upper_node, lower_node in stub_pairs:
+                            upper_node['rowspan'] = str(upper['row_span'] + source_header_rows)
+                            lower_node.decompose()
+                        for continued_row in continued_rows:
+                            for cell in continued_row.find_all(['td', 'th'], recursive=False):
+                                cell.name = 'th'
+                            old_soup.table.find('thead', recursive=False).append(continued_row.extract())
+                        header_grid_refinement['continued_source_header_rows'] = source_header_rows
+                        old_profile = table_profile(str(old_soup.table))
+                        new_profile = table_profile(str(soup.table))
+                        old_nodes = old_soup.table.find_all(['td', 'th'])
+                        new_nodes = soup.table.find_all(['td', 'th'])
+                    # A numeric second header level can start on the next
+                    # page. Keep the inherited stub's rowspan inside THEAD.
+                    stub = next((c for c in old_profile['cells'] if c['column'] == 0
+                        and c['column_span'] == 1 and c['text']
+                        and c['row'] + c['row_span'] == old_profile['rows']), None)
+                    row = soup.table.find('tr')
+                    cells = row.find_all(['td', 'th'], recursive=False) if row else []
+                    if (stub and len(cells) == old_profile['columns']
+                            and all(int(c.get('rowspan', 1)) == int(c.get('colspan', 1)) == 1 for c in cells)
+                            and not cells[0].get_text(strip=True) and not cells[0].find(True)
+                            and all(re.fullmatch(r'[\d\s.,+−–—\-/%<>≤≥=]+', c.get_text(' ', strip=True))
+                                    and not c.find(['img', 'table']) for c in cells[1:])):
+                        old_nodes[old_profile['cells'].index(stub)]['rowspan'] = str(stub['row_span'] + 1)
+                        cells[0].decompose()
+                        for cell in cells[1:]:
+                            cell.name = 'th'
+                        old_soup.table.find('thead', recursive=False).append(row.extract())
+                        header_grid_refinement['continued_numeric_header_rows'] = 1
+                        old_profile = table_profile(str(old_soup.table))
+                        new_profile = table_profile(str(soup.table))
+                        old_nodes = old_soup.table.find_all(['td', 'th'])
+                        new_nodes = soup.table.find_all(['td', 'th'])
                 # The first empty cell of a continued group inherits the existing
                 # vertical merge. A new nonempty cell is always kept unchanged.
                 first = next((c for c in new_profile["cells"] if c["row"] == 0 and c["column"] == 0), None)
@@ -5825,6 +5844,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                              and c["row"] + c["row_span"] == old_profile["rows"]), None)
                 if (first and last and not first["text"] and last["text"]
                         and first["column_span"] == last["column_span"] == 1
+                        and old_nodes[old_profile['cells'].index(last)].find_parent('thead') is None
                         and not new_nodes[new_profile["cells"].index(first)].find(["img", "math"])):
                     prefix, empty_cells = 0, []
                     for cell in new_profile["cells"]:
@@ -5856,6 +5876,12 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                 if profile['issues'] and decisions:
                     decisions[-1]['combined_issues'] = profile['issues']
                 if not profile["issues"]:
+                    if header_grid_refinement:
+                        old['join_geometry'] = old_geo
+                        proof = dict(left=old_item.self_ref, right=item.self_ref, page=page_no,
+                                     **header_grid_refinement)
+                        manifest.setdefault('source_header_grid_refinements', []).append(proof)
+                        diagnostic_event('TABLE_HEADER_SOURCE_GRID_REFINED', **proof)
                     if old_soup.table.find("colgroup") is None:
                         xs = old_geo["x_grid"]
                         group = old_soup.new_tag("colgroup")
@@ -5931,41 +5957,6 @@ def insert_source_item(doc, page_no, bbox, kind):
     return method(**kwargs)
 
 
-def recover_table_crop(args, image, seconds):
-    """Reuse the running local server. One bounded request, without API retries."""
-    if getattr(args, 'primary_ocr_only', False):
-        raise RuntimeError('Auxiliary content OCR disabled: use the primary Surya response')
-    from surya.inference.schema import BatchInputItem, PROMPT_TYPE_BLOCK
-    from surya.inference.backends.openai_client import chat_completions_batch
-    from surya.inference.parsers import clean_block_html
-    from docling_backend_health import request_with_backend_recovery
-
-    buffer = BytesIO()
-    image.save(buffer, format='PNG')
-    key = hashlib.sha256(f'{TABLE_RECOVERY_SCHEMA}:'.encode()+buffer.getvalue()).hexdigest()
-    cache = getattr(args, 'table_region_memory', None)
-    if cache is None:
-        args.table_region_memory = cache = {}
-    if key in cache:
-        return cache[key]
-    backend = local_surya_backend(args.surya_ocr_model)
-    if backend.handle is None:
-        backend.start()
-    outputs = request_with_backend_recovery(backend, lambda: chat_completions_batch(
-        [BatchInputItem(image=image, prompt_type=PROMPT_TYPE_BLOCK, max_tokens=8192)],
-        client=backend._client.with_options(max_retries=0, timeout=seconds),
-        model_name=backend.handle.model_name, timeout=seconds, max_workers=1,
-        max_retries=0, request_logprobs_default=False,
-    ), diagnostic_event)
-    if not outputs or outputs[0].error:
-        raise RuntimeError("Regional table recognition failed")
-    if outputs[0].token_count >= 8192:
-        raise RuntimeError('Regional table reached model output capacity; partial table rejected')
-    content = clean_table_html(clean_block_html(outputs[0].raw))
-    cache[key] = content
-    return content
-
-
 def numeric_cells(profile):
     result = {}
     for cell in profile.get("cells", []):
@@ -5974,177 +5965,6 @@ def numeric_cells(profile):
             value = re.sub(r"\s+", "", value).replace(".", ",").translate(str.maketrans("−–—", "---"))
             result[(cell["row"], cell["column"])] = value.replace("<=", "≤").replace(">=", "≥")
     return result
-
-
-def missing_scan_header_cells(fragment, geometry, image, region):
-    """Find omitted header text by ink in exact source cells, excluding rails."""
-    import cv2
-    import numpy as np
-    if not geometry or geometry.get('basis') != 'raster_numbered_header_rules':
-        return []
-    profile = table_profile(fragment)
-    if profile['issues'] or profile['columns'] != len(geometry['x_grid'])-1:
-        return []
-    index_rows = [y for y in range(profile['rows']) if [c['text'].strip() for c in profile['cells']
-                  if c['row']==y] == [str(i) for i in range(1,profile['columns']+1)]]
-    if not index_rows:
-        return []
-    sx,sy=image.width/(region[2]-region[0]),image.height/(region[3]-region[1])
-    targets=[]
-    for cell in profile['cells']:
-        if cell['row']>=min(index_rows) or cell['text'].strip() or '<img' in cell['html'].lower():
-            continue
-        source=next((c for c in geometry['cells'] if all(c[k]==cell[k]
-                    for k in ('row','column','row_span','column_span'))),None)
-        if not source:
-            continue
-        a,b,d,e=source['bbox']
-        bounds=(max(0,round((a-region[0]+2)*sx)),max(0,round((b-region[1]+2)*sy)),
-                min(image.width,round((d-region[0]-2)*sx)),min(image.height,round((e-region[1]-2)*sy)))
-        if bounds[2]-bounds[0]<8 or bounds[3]-bounds[1]<8:
-            continue
-        crop=image.crop(bounds)
-        gray=np.asarray(crop.convert('L'))
-        mask=cv2.threshold(gray,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
-        _,_,stats,_=cv2.connectedComponentsWithStats(mask,8)
-        letters=[(x,y,w,h,area) for x,y,w,h,area in stats[1:]
-                 if h>=max(3,2*sy) and w>=2 and area>=5 and h<.8*crop.height and w<.8*crop.width]
-        if len(letters)>=3:
-            # A tall empty header cell can dwarf its one short word. Read
-            # the text components with padding, not a mostly white rectangle.
-            padding=max(4,math.ceil(2*max(sx,sy)))
-            tight=(max(0,min(v[0] for v in letters)-padding),
-                   max(0,min(v[1] for v in letters)-padding),
-                   min(crop.width,max(v[0]+v[2] for v in letters)+padding),
-                   min(crop.height,max(v[1]+v[3] for v in letters)+padding))
-            crop=crop.crop(tight)
-            if crop.height<40:
-                crop=crop.resize((round(crop.width*40/crop.height),40))
-            targets.append(dict(row=cell['row'],column=cell['column'],bbox=source['bbox'],image=crop))
-    return targets
-
-
-def scan_numeric_crop(image, region, target):
-    """Tight, padded source ink for a damaged numeric tolerance cell."""
-    import numpy as np
-    sx,sy=image.width/(region[2]-region[0]),image.height/(region[3]-region[1])
-    a,b,d,e=target['bbox']
-    crop=image.crop((max(0,math.ceil((a-region[0]+2)*sx)),max(0,math.ceil((b-region[1]+2)*sy)),
-                     min(image.width,math.floor((d-region[0]-2)*sx)),min(image.height,math.floor((e-region[1]-2)*sy))))
-    gray=np.asarray(crop.convert('L'));yy,xx=np.nonzero(gray<180)
-    if not len(xx):return None
-    pad=max(4,math.ceil(2*max(sx,sy)))
-    bounds=(max(0,int(xx.min())-pad),max(0,int(yy.min())-pad),
-            min(crop.width,int(xx.max())+pad+1),min(crop.height,int(yy.max())+pad+1))
-    rows=sorted(set(yy.tolist()));groups=[]
-    for y in rows:
-        if not groups or y-groups[-1][-1]>max(2,sy):groups.append([y])
-        else:groups[-1].append(y)
-    crop=crop.crop(bounds)
-    if crop.height<48:crop=crop.resize((round(crop.width*48/crop.height),48))
-    return dict(target,image=crop,source_lines=len(groups))
-
-
-def recognize_scan_header_cells(args, targets, seconds):
-    """Read only the missing labels on the already running OCR server."""
-    if getattr(args, 'primary_ocr_only', False):
-        diagnostic_event('TABLE_SECONDARY_CONTENT_OCR_DISABLED', stage='header_cells',
-                         cells=len(targets), reason='primary_surya_content_only')
-        return []
-    from bs4 import BeautifulSoup
-    from surya.inference.schema import BatchInputItem, PROMPT_TYPE_BLOCK
-    from surya.inference.backends.openai_client import chat_completions_batch
-    from surya.inference.parsers import clean_block_html
-    from docling_backend_health import request_with_backend_recovery
-    if not targets:
-        return []
-    # A later cell gets the same complete request allowance as the first one.
-    # Document size and worker waves must not reduce its chance to be read.
-    backend=local_surya_backend(args.surya_ocr_model)
-    if backend.handle is None:
-        backend.start()
-    requests=[];prepared_images=[]
-    try:
-        for target in targets:
-            image=target['image'];prompt=None
-            if target.get('source_cell_interior'):
-                from docling_layout import prepare_cell_text_image
-                image, preparation = prepare_cell_text_image(image)
-                prepared_images.append(image)
-                prompt=('OCR this text block to HTML. This is one physical table header cell. '
-                        'Transcribe every visible word, number and symbol in reading order as a paragraph. '
-                        'Preserve indices and printed line breaks. Return the text in <p>...</p>. '
-                        'Do not create a table or infer missing text.')
-                diagnostic_event('TABLE_HEADER_SOURCE_INK_FIT',row=target['row'],
-                    column=target['column'],bbox=target['bbox'],**preparation)
-            requests.append(BatchInputItem(image=image,prompt_type=PROMPT_TYPE_BLOCK,
-                                          prompt=prompt,max_tokens=2048))
-        outputs=request_with_backend_recovery(backend, lambda: chat_completions_batch(requests,
-            client=backend._client.with_options(max_retries=0,timeout=seconds),
-            model_name=backend.handle.model_name,timeout=seconds,max_workers=min(2,len(targets)),
-            max_retries=0,request_logprobs_default=False), diagnostic_event)
-    finally:
-        for image in prepared_images:image.close()
-    restored=[]
-    for target,output in zip(targets,outputs):
-        if output.error:
-            diagnostic_event('TABLE_HEADER_TEXT_UNREAD',row=target['row'],column=target['column'],
-                             reason='ocr_request_error')
-            continue
-        if output.token_count >= 2048:
-            diagnostic_event('TABLE_HEADER_TEXT_UNREAD',row=target['row'],column=target['column'],
-                             reason='model_output_capacity_partial_cell_rejected')
-            continue
-        parsed=BeautifulSoup(render_surya_math(clean_block_html(output.raw)),'html.parser')
-        undecoded_math=False
-        for math_node in list(parsed.find_all('math')):
-            if math_node.find(True):
-                continue
-            rendered=latex_math(math_node.get('data-latex') or math_node.get_text(),'inline')
-            if rendered is None:
-                undecoded_math=True
-                break
-            math_node.replace_with(BeautifulSoup(rendered,'html.parser').math)
-        if undecoded_math:
-            diagnostic_event('TABLE_HEADER_TEXT_UNREAD',row=target['row'],column=target['column'],
-                reason='undecodable_cell_mathematics',response=diagnostic_summary(output.raw))
-            continue
-        if (target.get('source_cell_interior') and parsed.find('table')
-                and not parsed.find(['img','script'])):
-            # A crop proven to be one physical source cell has no inner grid.
-            # OCR may nevertheless wrap its lines in a synthetic HTML table.
-            # Remove that layout wrapper while preserving every text/math node.
-            wrapped_cells = len(parsed.find_all(['td','th']))
-            for cell in list(parsed.find_all(['td','th'])):
-                cell.insert_after(' ')
-                cell.unwrap()
-            for row in list(parsed.find_all('tr')):
-                row.insert_after(parsed.new_tag('br'))
-                row.unwrap()
-            for layout in list(parsed.find_all(['thead','tbody','tfoot','table'])):
-                layout.unwrap()
-            diagnostic_event('TABLE_HEADER_LAYOUT_WRAPPER_NORMALIZED',row=target['row'],
-                column=target['column'],cells=wrapped_cells,
-                reason='one_physical_source_cell_without_internal_grid')
-        if parsed.find(['img','table','script']) or not parsed.get_text(strip=True):
-            diagnostic_event('TABLE_HEADER_TEXT_UNREAD',row=target['row'],column=target['column'],
-                             reason='empty_transcription' if not parsed.get_text(strip=True) else 'not_cell_text',
-                             response=diagnostic_summary(output.raw))
-            continue
-        if target.get('kind')=='numeric':
-            text=re.sub(r'\s+','',parsed.get_text())
-            if not re.fullmatch(r'[\d.,±+−–—/()%\-]+',text):continue
-            if parsed.find(['mfrac','msup','msub','msqrt','mroot']):continue
-            values=re.findall(r'[±+−–—-]?\d+(?:[.,]\d+)?',text)
-            if len(values)!=target.get('source_lines') or ''.join(values)!=text:continue
-            restored.append(dict(row=target['row'],column=target['column'],html='<br/>'.join(values)))
-            continue
-        # Keep short labels inline; the original enclosing cell is unchanged.
-        for tag in list(parsed.find_all(['p','div','h1','h2','h3'])):
-            if tag.find_previous_sibling(['p','div','h1','h2','h3']):tag.insert_before(parsed.new_tag('br'))
-            tag.unwrap()
-        restored.append(dict(row=target['row'],column=target['column'],html=str(parsed).strip()))
-    return restored
 
 
 def retain_graphics_in_table(fragment, geometry, objects, source_image, region):
@@ -6189,8 +6009,56 @@ def table_request_limit(table_count):
 
 def _captioned_figure_title(text):
     """Recognize a complete formal figure caption, never an in-prose citation."""
-    return re.fullmatch(r'\s*Рисунок\s+(?P<number>(?:[A-ZА-ЯЁ]\s*\.\s*)?\d+'
-                        r'(?:\s*[.\-]\s*\d+)*)\s*[—–−-]\s*(?P<title>\S[\s\S]*)', text, re.I)
+    from docling_pdf_forms import FIGURE_CAPTION
+    return FIGURE_CAPTION.fullmatch(text)
+
+
+def _figure_body_before_embedded_caption(box, capbox, page, font, regions):
+    """Separate an owned caption at a white source gutter, without masking ink."""
+    if (regions is None or not _captioned_figure_contains(box, capbox)
+            or box[3]-capbox[3] > font or capbox[1] <= box[1]+font):
+        return None
+    import numpy as np
+    image = regions.crop(page, box)
+    try:
+        with image.convert('L') as gray:
+            ink = np.asarray(gray) < 235
+        sx, sy = image.width/(box[2]-box[0]), image.height/(box[3]-box[1])
+        left = max(0, math.floor((capbox[0]-box[0]-.25*font)*sx))
+        right = min(image.width, math.ceil((capbox[2]-box[0]+.25*font)*sx))
+        top = max(0, math.floor((capbox[1]-box[1]-.25*font)*sy))
+        bottom = min(image.height, math.ceil((capbox[3]-box[1])*sy))
+        rows = np.flatnonzero(ink[top:bottom, left:right].any(axis=1))
+        if not len(rows):
+            return None
+        first = top+int(rows[0])
+        start = max(1, first-math.ceil(1.5*font*sy))
+        empty = [y for y in range(start, first) if not ink[y].any()]
+        runs = []
+        for y in empty:
+            if not runs or y > runs[-1][-1]+1:
+                runs.append([y])
+            else:
+                runs[-1].append(y)
+        runs = [run for run in runs if len(run) >= 2 and ink[:run[0]].any()]
+        if not runs:
+            return None
+        run = runs[-1]
+        cut = (run[0]+run[-1])/2
+        # Only caption ink may be removed. A white gap above it alone does
+        # not prove that a diagram stroke beside or below it can be discarded.
+        caption_bottom = min(image.height, math.ceil((capbox[3]-box[1]+.25*font)*sy))
+        trailing = ink[math.floor(cut):]
+        if (trailing[:, :left].any() or trailing[:, right:].any()
+                or ink[caption_bottom:].any()):
+            return None
+        body = [box[0], box[1], box[2], box[1]+cut/sy]
+        return body, dict(method='owned_caption_separated_at_source_white_gutter',
+            original_bbox=list(box), caption_bbox=list(capbox),
+            source_empty_pixel_rows=[run[0], run[-1]], body_bbox=body,
+            discarded_ink_within_caption_bbox=True)
+    finally:
+        image.close()
 
 
 def _captioned_figure_contains(outer, inner):
@@ -6204,7 +6072,7 @@ def _captioned_figure_warning(manifest, api, reason, **fields):
     api.diagnostic_event('CAPTIONED_FIGURE_UNCHANGED', **warning)
 
 
-def capture_captioned_figures(doc, reader, records, manifest, api):
+def capture_captioned_figures(doc, reader, records, manifest, api, *, regions=None):
     """Snapshot source figure ownership before any table repair shrinks its bbox."""
     objects = [(item, api.item_region(item, doc)) for item in [*doc.tables, *doc.pictures]]
     objects = [(item, loc) for item, loc in objects if loc]
@@ -6233,7 +6101,15 @@ def capture_captioned_figures(doc, reader, records, manifest, api):
             if loc[0] != page:
                 continue
             box = loc[1]; gap = capbox[1]-box[3]
-            linked = any(ref.cref == caption.self_ref for ref in getattr(item, 'captions', []))
+            linked = (any(ref.cref == caption.self_ref for ref in getattr(item, 'captions', []))
+                      or any(ref.cref == caption.self_ref for ref in getattr(item, 'children', []))
+                      and getattr(getattr(caption, 'parent', None), 'cref', None) == item.self_ref)
+            separated = None
+            if linked and gap < -tolerance:
+                separated = _figure_body_before_embedded_caption(box, capbox, page, font, regions)
+                if separated:
+                    box = separated[0]
+                    gap = capbox[1]-box[3]
             if (not -tolerance <= gap <= font*CAPTION_FIGURE_MAX_GAP_EM
                     or x_overlap(box, capbox) < CAPTION_FIGURE_X_OVERLAP
                     or not box[0]-tolerance <= (capbox[0]+capbox[2])/2 <= box[2]+tolerance):
@@ -6245,7 +6121,8 @@ def capture_captioned_figures(doc, reader, records, manifest, api):
                 and x_overlap(box, pos[1]) >= CAPTION_FIGURE_X_OVERLAP]
             if intervening:
                 continue
-            candidates.append(dict(item=item, box=list(box), gap=gap, linked=linked))
+            candidates.append(dict(item=item, box=list(box), gap=gap, linked=linked,
+                                   caption_separation=separated[1] if separated else None))
         linked = [candidate for candidate in candidates if candidate['linked']]
         if linked:
             candidates = linked
@@ -6260,6 +6137,31 @@ def capture_captioned_figures(doc, reader, records, manifest, api):
                                  page=page, candidates=[c['item'].self_ref for c in candidates])
             continue
         selected = candidates[0]; item, box = selected['item'], selected['box']
+        if not selected['linked']:
+            # The second caption pass supports objects on either side. Do not
+            # claim an upper object here if a closer lower one can own it.
+            opposite = []
+            for other, pos in objects:
+                if pos[0] != page or other.self_ref == item.self_ref:
+                    continue
+                lower = pos[1]; gap = lower[1]-capbox[3]
+                if (not -tolerance <= gap <= max(0., selected['gap'])+font*CAPTION_FIGURE_UNIQUE_GAP_EM
+                        or x_overlap(lower, capbox) < CAPTION_FIGURE_X_OVERLAP
+                        or not lower[0]-tolerance <= (capbox[0]+capbox[2])/2 <= lower[2]+tolerance):
+                    continue
+                blocked = any(p and p[0] == page
+                    and t.self_ref not in {other.self_ref, caption.self_ref}
+                    and not _captioned_figure_contains(lower, p[1])
+                    and p[1][1] >= capbox[3]-tolerance and p[1][3] <= lower[1]+tolerance
+                    and x_overlap(lower, p[1]) >= CAPTION_FIGURE_X_OVERLAP
+                    for t, p in [*objects, *texts])
+                if not blocked:
+                    opposite.append(other.self_ref)
+            if opposite:
+                api.diagnostic_event('CAPTIONED_FIGURE_BINDING_SKIPPED', severity='info',
+                    caption_ref=caption.self_ref, page=page, reason='closer_or_ambiguous_object_after_caption',
+                    candidates=[item.self_ref, *opposite])
+                continue
         # A nearby footer alone cannot stand in for a fragmented whole drawing.
         fragments = []
         for other, pos in objects:
@@ -6310,6 +6212,8 @@ def capture_captioned_figures(doc, reader, records, manifest, api):
             source_table_refs=[item.self_ref] if item.self_ref in table_refs else [], excluded_refs=[],
             primary_records=[dict(record_sha256=hashlib.sha256(r.get('html', '').encode()).hexdigest(), bbox=list(r['bbox'])) for r in owned],
             method='explicit_source_figure_caption')
+        if selected.get('caption_separation'):
+            entry['caption_separation'] = selected['caption_separation']
         registry[item.self_ref] = entry
         manifest.setdefault('captioned_figures', []).append(entry)
         api.diagnostic_event('CAPTIONED_FIGURE_REGISTERED', **entry)
@@ -6324,6 +6228,10 @@ def reconcile_captioned_figures(doc, registry, figure_routes, routes, picture_ro
     table_refs = {item.self_ref for item in doc.tables}
     caption_refs = {ref for entry in registry.values()
                     for ref in entry.get('caption_refs', [entry['caption_ref']])}
+    for container in manifest.get('source_form_container_replacements', []):
+        ref = container['ref']
+        excluded.add(ref)
+        (routes if ref in table_refs else picture_routes)[ref] = ''
     for ref, entry in registry.items():
         owner = next((item for item in all_items if item.self_ref == ref), None)
         if owner is None:
@@ -6604,60 +6512,6 @@ def table_consensus_candidate(candidates):
                pair[1][1] in {"pdf_geometry", "raster_geometry"}, support(pair[0]), pair[1][0]))[1]
 
 
-def recover_complete_table_header(content, candidates):
-    """Recover a lost grouped heading when two reads agree on the data grid.
-
-    Replace only an incomplete header plus empty padding rows. Never move,
-    overwrite or infer body values from header similarity alone.
-    """
-    from bs4 import BeautifulSoup
-    soup=BeautifulSoup(content,'html.parser');profile=table_profile(content)
-    rows=soup.table.find_all('tr')
-    current_head=len(soup.table.thead.find_all('tr')) if soup.table.thead else 0
-    values=numeric_cells(profile)
-    for _,method,fragment,other in candidates:
-        if (other['issues'] or (other['columns'],other['rows'])!=(profile['columns'],profile['rows'])):
-            continue
-        alternative=BeautifulSoup(fragment,'html.parser')
-        header=alternative.table.thead
-        count=len(header.find_all('tr')) if header else 0
-        if header is None:
-            prefix=[]
-            for row in alternative.table.find_all('tr'):
-                if not row.find('th',recursive=False):break
-                prefix.append(row)
-            if prefix:
-                header=alternative.new_tag('thead')
-                for row in prefix:header.append(row.extract())
-                count=len(prefix)
-        if count<=current_head or count>=len(rows):
-            continue
-        if any(row.get_text(strip=True) or row.find(['math','img']) for row in rows[current_head:count]):
-            continue
-        numeric=numeric_cells(other);common={k for k in values.keys()&numeric.keys() if k[0]>=count}
-        if len(common)<5 or any(values[k]!=numeric[k] for k in common):
-            continue
-        # A layout parser may put the stub heading in the second header row
-        # with an empty cell above it. Restore its vertical merge.
-        header_rows=header.find_all('tr')
-        if len(header_rows)>=2:
-            upper=header_rows[0].find(['td','th'],recursive=False)
-            lower=header_rows[1].find(['td','th'],recursive=False)
-            if (upper and lower and not upper.get_text(strip=True) and not upper.find(['math','img'])
-                    and lower.get_text(strip=True) and upper.get('colspan','1')==lower.get('colspan','1')=='1'
-                    and upper.get('rowspan','1')==lower.get('rowspan','1')=='1'):
-                for child in list(lower.contents):upper.append(child.extract())
-                upper['rowspan']='2';upper.name='th';lower.decompose()
-        for row in rows[:count]:row.decompose()
-        if soup.table.thead:soup.table.thead.decompose()
-        soup.table.insert(0,header.extract())
-        result=str(soup.table)
-        if not table_profile(result,profile['columns'])['issues']:
-            return result,{'method':method,'header_rows':count,'matching_numeric_cells':len(common)}
-        return content,None
-    return content,None
-
-
 def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, routes, excluded, manifest):
     """Recover ruled scan tables even when layout emitted pictures/fragments.
 
@@ -6816,8 +6670,9 @@ def _borderless_html_lines(html):
 def _borderless_atomic(text):
     import re
     value = text.strip()
-    return bool(value and (re.fullmatch(r'[\d\s.,+−–—\-<>≤≥%°/:()]+', value)
-        or re.fullmatch(r'[A-Za-zА-Яа-яЁёΑ-Ωα-ω]{1,2}\s*\d*\)?', value)
+    symbol = r'[A-Za-zА-Яа-яЁёΑ-Ωα-ω]{1,2}\s*\d*\)?'
+    return bool(value and (re.fullmatch(r'[\d\s.,;+−–—\-<>≤≥%°/:()]+', value)
+        or re.fullmatch(symbol + r'(?:\s*[,;]\s*' + symbol + r')*', value)
         or re.fullmatch(r'[^\w\s]+', value)))
 
 def _borderless_source_lines(reader, cell, page, api):
@@ -6832,7 +6687,7 @@ def _borderless_source_lines(reader, cell, page, api):
         glyphs = [g for g in reader.chars if box[0] < (g['x0']+g['x1'])/2 < box[2]
                   and box[1] < (g['top']+g['bottom'])/2 < box[3]]
     if glyphs:
-        return api.native_cell_lines(glyphs)
+        return [line for line in api.native_cell_lines(glyphs) if line['text'].strip()]
     # Some OCR/layout providers already attach positioned line records.
     lines = cell.get('lines') or cell.get('ocr_lines') or []
     return sorted((dict(line) for line in lines if line.get('text', '').strip()
@@ -6870,25 +6725,35 @@ def _borderless_warning(manifest, api, page, ref, row, reason, **extra):
     manifest.setdefault('borderless_row_warnings', []).append(warning)
     api.diagnostic_event('BORDERLESS_ROW_UNCHANGED', **warning)
 
-def _borderless_plan(lines, fragments):
+def _borderless_plan(lines, fragments, *, physical_cells=None):
     """Infer aligned value starts and preserve unmatched wrapped descriptors."""
     from statistics import median
     from bs4 import BeautifulSoup
 
-    groups = {}
-    for col, values in enumerate(lines):
-        if len(values) >= BORDERLESS_MIN_VALUE_ROWS:
-            groups.setdefault(len(values), []).append(col)
     options = []
-    for count, columns in groups.items():
+    for seed in lines:
+        if len(seed) < BORDERLESS_MIN_VALUE_ROWS:
+            continue
+        size = median(l['size'] for l in seed)
+        tolerance = size*BORDERLESS_Y_TOLERANCE_EM
+        aligned = {}
+        for col, values in enumerate(lines):
+            matches = [[line for line in values if abs(line['y']-anchor['y']) <= tolerance]
+                       for anchor in seed]
+            if all(len(group) == 1 for group in matches):
+                aligned[col] = [group[0] for group in matches]
+        columns = list(aligned)
         if len(columns) < BORDERLESS_MIN_ALIGNED_COLUMNS:
             continue
-        size = median(l['size'] for col in columns for l in lines[col])
-        anchors = [median(lines[col][i]['y'] for col in columns) for i in range(count)]
-        if (all(abs(lines[col][i]['y']-anchors[i]) <= size*BORDERLESS_Y_TOLERANCE_EM
+        count = len(seed)
+        size = median(l['size'] for values in aligned.values() for l in values)
+        anchors = [median(aligned[col][i]['y'] for col in columns) for i in range(count)]
+        if (all(abs(aligned[col][i]['y']-anchors[i]) <= size*BORDERLESS_Y_TOLERANCE_EM
                 for col in columns for i in range(count))
                 and all(b-a >= size*BORDERLESS_MIN_ANCHOR_GAP_EM for a, b in zip(anchors, anchors[1:]))):
-            options.append((len(columns), count, columns, anchors, size))
+            option = (len(columns), count, columns, anchors, size)
+            if option not in options:
+                options.append(option)
     options.sort(key=lambda item: item[:2], reverse=True)
     if not options:
         return None, 'insufficient_aligned_columns'
@@ -6901,6 +6766,11 @@ def _borderless_plan(lines, fragments):
         return None, 'ordinary_multiline_prose_or_ambiguous_values'
     spans, assignments, extra_groups = {}, {}, []
     tolerance = size*BORDERLESS_Y_TOLERANCE_EM
+    record_start = r'^(?:\d+[.)]?\s|[A-Za-zА-Яа-яЁё]\))'
+    numeric_columns = [index for index in columns if len(fragments[index]) == count and all(
+        re.fullmatch(r'[-−–—]+|[\d\s.,+−–—/%()<>≤≥]+',
+                     BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+        for part in fragments[index])]
     for col, values in enumerate(lines):
         if not values:
             assignments[col] = {}
@@ -6909,6 +6779,20 @@ def _borderless_plan(lines, fragments):
                             for a, b in zip(values, values[1:]))
         non_atomic = not any(_borderless_atomic(BeautifulSoup(p, 'html.parser').get_text(' ', strip=True))
                              for p in fragments[col])
+        texts = [BeautifulSoup(p, 'html.parser').get_text(' ', strip=True) for p in fragments[col]]
+        owner = physical_cells[col] if physical_cells and col < len(physical_cells) else None
+        # One measured category cell remains one spanning cell. Splitting
+        # independently aligned value columns does not split its wrapped prose.
+        shared_category = bool(owner and owner.get('column') == 0
+            and owner.get('row_span') == owner.get('column_span') == 1
+            and not owner.get('source_images') and not owner.get('restored_math')
+            and len(numeric_columns) >= 2 and min(numeric_columns) > col and non_atomic
+            and texts and re.match(r'^\s*\d+[.)]?\s+[A-Za-zА-Яа-яЁё]', texts[0])
+            and not any(re.match(record_start, text) for text in texts[1:])
+            and owner.get('bbox') and owner['bbox'][1] <= anchors[0] <= anchors[-1] <= owner['bbox'][3])
+        if shared_category:
+            spans[col] = True
+            continue
         if len(values) < count and col < min(columns) and ordinary_wrap and non_atomic:
             matched_anchors = {i for line in values for i, y in enumerate(anchors)
                                if abs(line['y']-y) <= tolerance}
@@ -6935,10 +6819,40 @@ def _borderless_plan(lines, fragments):
             extra_groups.append((col, current))
     extras = []
     for col, indices in extra_groups:
+        if any(_borderless_atomic(BeautifulSoup(fragments[col][index], 'html.parser').get_text(' ', strip=True))
+               for index in indices):
+            return None, 'unmatched_value_lines_may_be_paragraph_wrap'
         top, bottom = lines[col][indices[0]]['y'], lines[col][indices[-1]]['y']
+        following_index = indices[-1] + 1
+        following = [anchor for anchor, assigned in assignments[col].items() if following_index in assigned]
+        first_text = BeautifulSoup(fragments[col][indices[0]], 'html.parser').get_text(' ', strip=True)
+        final_text = BeautifulSoup(fragments[col][indices[-1]], 'html.parser').get_text(' ', strip=True)
+        # Numbered/lettered descriptions may wrap above the final line that
+        # shares their value baseline. A colon still starts a separate heading.
+        value_columns = [index for index in columns if fragments[index] and all(
+            _borderless_atomic(BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+            for part in fragments[index])]
+        preceding_index = indices[0] - 1
+        preceding = [anchor for anchor, assigned in assignments[col].items() if preceding_index in assigned]
+        if (len(value_columns) >= 2 and col < min(value_columns) and len(preceding) == 1
+                and re.match(record_start, BeautifulSoup(fragments[col][preceding_index], 'html.parser').get_text(' ', strip=True))
+                and not any(re.match(record_start, BeautifulSoup(fragments[col][index], 'html.parser').get_text(' ', strip=True))
+                            for index in indices)
+                and all(0 < lines[col][b]['y'] - lines[col][a]['y'] <= size * BORDERLESS_MAX_WRAP_GAP_EM
+                        for a, b in zip([preceding_index, *indices[:-1]], indices))):
+            assignments[col][preceding[0]].extend(indices)
+            continue
+        if (len(value_columns) >= 2 and col < min(value_columns) and len(following) == 1 and not final_text.endswith(':')
+                and re.match(record_start, first_text)
+                and not any(re.match(record_start, BeautifulSoup(fragments[col][index], 'html.parser').get_text(' ', strip=True))
+                            for index in [*indices[1:], following_index])
+                and lines[col][following_index]['y'] - bottom <= size * BORDERLESS_MAX_WRAP_GAP_EM):
+            assignments[col][following[0]] = indices + assignments[col][following[0]]
+            continue
         before = [i for i, y in enumerate(anchors) if y < top-tolerance]
         after = [i for i, y in enumerate(anchors) if y > bottom+tolerance]
-        final_text = BeautifulSoup(fragments[col][indices[-1]], 'html.parser').get_text(' ', strip=True)
+        if not final_text.endswith(':'):
+            return None, 'unmatched_descriptor_lines_may_be_paragraph_wrap'
         if not before or not after:
             # Only an explicit heading punctuation proves an unmatched edge block.
             if not (not before and after and final_text.endswith(':')):
@@ -6950,6 +6864,133 @@ def _borderless_plan(lines, fragments):
                    +[dict(y=e['y'], extra=e) for e in extras], key=lambda slot: slot['y'])
     return dict(slots=slots, spans=spans, assignments=assignments,
                 value_columns=columns, anchors=anchors, font_size=size), None
+
+def _borderless_align_dom_lines(lines, fragments, cells, retained_images):
+    """Locate unchanged coarse DOM blocks on consecutive source text lines.
+
+    This only supplies display coordinates. A source raster may account for
+    one otherwise missing inline script, but its OCR markup is never edited.
+    """
+    from bs4 import BeautifulSoup
+    from statistics import median
+
+    numeric = []
+    for col, (values, parts) in enumerate(zip(lines, fragments)):
+        if (cells[col]['column'] > 0 and len(values) == len(parts) >= 2
+                and all(re.fullmatch(r'[\d\s.,+−–—\-/%]+', line['text'].strip())
+                        and _borderless_key(line['text']) == _borderless_key(
+                            BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+                        for line, part in zip(values, parts))):
+            numeric.append(values)
+    choices = []
+    for seed in numeric:
+        peers = [values for values in numeric if len(values) == len(seed) and all(
+            abs(a['y'] - b['y']) <= min(a['size'], b['size']) * BORDERLESS_Y_TOLERANCE_EM
+            for a, b in zip(seed, values))]
+        if len(peers) >= 2:
+            anchors = tuple(median(values[i]['y'] for values in peers) for i in range(len(seed)))
+            if anchors not in choices:
+                choices.append(anchors)
+    if len(choices) != 1:
+        return None
+    anchors = choices[0]
+    adjusted, proofs = [], []
+    for col, (values, parts, owner) in enumerate(zip(lines, fragments, cells)):
+        if len(values) == len(parts):
+            adjusted.append(values)
+            continue
+        if not 0 < len(parts) < len(values) <= 128:
+            return None
+        images = [entry for entry in retained_images if entry.get('row') == owner['row']
+                  and entry.get('column') == owner['column'] and len(entry.get('bbox', [])) == 4]
+        source = [_borderless_key(line['text']) for line in values]
+        options = []
+        for part in parts:
+            parsed = BeautifulSoup(part, 'html.parser')
+            full_text = parsed.get_text(' ', strip=True)
+            variants = [(_borderless_key(full_text), False, full_text)]
+            scripts = parsed.find_all(['sup', 'sub'])
+            if (len(images) == len(scripts) == 1 and scripts[0].get_text(strip=True)
+                    and not parsed.find(['math', 'img', 'svg', 'table'])):
+                scripts[0].decompose()
+                variants.append((_borderless_key(parsed.get_text(' ', strip=True)), True, full_text))
+            options.append(variants)
+        solutions = []
+
+        def locate(index, start, matched):
+            if len(solutions) > 1:
+                return
+            if index == len(parts):
+                if start == len(values):
+                    solutions.append(matched)
+                return
+            for key, script, text in options[index]:
+                if not key:
+                    continue
+                joined = ''
+                for end in range(start + 1, len(values) - (len(parts) - index - 1) + 1):
+                    joined += source[end - 1]
+                    if len(joined) > len(key):
+                        break
+                    if joined != key:
+                        continue
+                    if script:
+                        image = images[0]['bbox']
+                        box = owner.get('bbox', [])
+                        top = min(line['y'] - line['size'] for line in values[start:end])
+                        bottom = max(line['y'] for line in values[start:end])
+                        if (len(box) != 4 or not (box[0] <= image[0] < image[2] <= box[2]
+                                and box[1] <= image[1] < image[3] <= box[3])
+                                or min(bottom, image[3]) <= max(top, image[1])):
+                            continue
+                    locate(index + 1, end, matched + [(start, end, script, text)])
+
+        locate(0, 0, [])
+        if len(solutions) != 1:
+            return None
+        virtual = []
+        for start, end, script, text in solutions[0]:
+            group = values[start:end]
+            size = median(line['size'] for line in group)
+            located = [anchor for anchor in anchors if group[0]['y'] - size * BORDERLESS_Y_TOLERANCE_EM
+                       <= anchor <= group[-1]['y'] + size * BORDERLESS_Y_TOLERANCE_EM]
+            if len(located) > 1:
+                return None
+            y = group[-1]['y'] if text.rstrip().endswith(':') or not located else located[0]
+            virtual.append(dict(group[-1], y=y, size=size, text=text,
+                x0=min(line.get('x0', owner['bbox'][0]) for line in group),
+                x1=max(line.get('x1', owner['bbox'][2]) for line in group)))
+        adjusted.append(virtual)
+        proofs.append(dict(column=owner['column'], source_lines=len(values), primary_fragments=len(parts),
+            source_line_groups=[[start, end] for start, end, _, _ in solutions[0]],
+            source_script_image_bbox=images[0]['bbox'] if any(script for _, _, script, _ in solutions[0]) else None,
+            method='unchanged_dom_blocks_on_complete_consecutive_source_lines'))
+    return adjusted, proofs
+
+
+def _borderless_line_mapping(lines, fragments):
+    """Map primary fragments using complete source lines and aligned anchors.
+
+    An old hidden OCR layer may misread a short designation. Its coordinates
+    can still locate the unchanged primary value when another column proves
+    the same row with an exact text match.
+    """
+    from bs4 import BeautifulSoup
+    if any(len(values) != len(parts) for values, parts in zip(lines, fragments)):
+        return False
+    exact = [[_borderless_key(line['text']) == _borderless_key(
+        BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+        for line, part in zip(values, parts)] for values, parts in zip(lines, fragments)]
+    for col, values in enumerate(lines):
+        for index, line in enumerate(values):
+            if exact[col][index]:
+                continue
+            text = BeautifulSoup(fragments[col][index], 'html.parser').get_text(' ', strip=True)
+            if not (_borderless_atomic(text) and _borderless_atomic(line['text'])) or not any(other != col and exact[other][i]
+                    and abs(anchor['y']-line['y']) <= min(anchor['size'], line['size'])*BORDERLESS_Y_TOLERANCE_EM
+                    for other, group in enumerate(lines) for i, anchor in enumerate(group)):
+                return False
+    return True
 
 def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
     """Split proven logical rows; preserve primary text, spans and inline markup."""
@@ -6965,7 +7006,8 @@ def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
             continue
         geometry = entry.get('pdf_geometry') or {}
         original = routes.get(item.self_ref, '')
-        if not geometry.get('source_grid_verified') or geometry.get('hidden_ocr_direction_conflict'):
+        if (not (geometry.get('source_grid_verified') or geometry.get('positioned_source_grid_verified'))
+                or geometry.get('hidden_ocr_direction_conflict')):
             continue
         parsed = BeautifulSoup(original, 'html.parser')
         table = parsed.table
@@ -7003,15 +7045,20 @@ def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
                 if len(band) != len(cells) or [c['column'] for c in band] != [c['column'] for c in specs]:
                     continue
                 lines = [_borderless_source_lines(reader, c, page, api) for c in band]
-                if all(len(v) == len(parts) and all(_borderless_key(line['text']) == _borderless_key(
-                        BeautifulSoup(part, 'html.parser').get_text(' ', strip=True)) for line, part in zip(v, parts))
-                        for v, parts in zip(lines, fragments)):
-                    matches.append((source_row, band, lines))
+                alignment_proofs = []
+                if any(len(values) != len(parts) for values, parts in zip(lines, fragments)):
+                    aligned = _borderless_align_dom_lines(lines, fragments, band,
+                        geometry.get('retained_cell_images', []))
+                    if aligned is None:
+                        continue
+                    lines, alignment_proofs = aligned
+                if _borderless_line_mapping(lines, fragments):
+                    matches.append((source_row, band, lines, alignment_proofs))
             if len(matches) != 1:
                 _borderless_warning(manifest, api, page, item.self_ref, specs[0]['row'],
                                     'source_line_mapping_not_unique', matches=len(matches))
                 continue
-            source_row, band, lines = matches[0]
+            source_row, band, lines, alignment_proofs = matches[0]
             size = median(l['size'] for values in lines for l in values)
             box = [min(c['bbox'][0] for c in band), min(c['bbox'][1] for c in band),
                    max(c['bbox'][2] for c in band), max(c['bbox'][3] for c in band)]
@@ -7021,7 +7068,7 @@ def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
                 _borderless_warning(manifest, api, page, item.self_ref, specs[0]['row'],
                                     'source_contains_row_rules' if rules else 'source_rules_not_available', rules=rules)
                 continue
-            plan, reason = _borderless_plan(lines, fragments)
+            plan, reason = _borderless_plan(lines, fragments, physical_cells=band)
             if plan is None:
                 _borderless_warning(manifest, api, page, item.self_ref, specs[0]['row'], reason)
                 continue
@@ -7060,6 +7107,7 @@ def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
                 value_columns=[specs[i]['column'] for i in plan['value_columns']],
                 spanning_columns=[specs[i]['column'] for i in plan['spans']],
                 anchors=plan['anchors'], font_size=plan['font_size'],
+                primary_block_line_alignment=alignment_proofs,
                 method='aligned_source_baselines_and_unchanged_primary_fragments'))
         if not repairs:
             continue
@@ -8161,8 +8209,6 @@ def export_local_html(args, result, normalized, orientation, source):
                 "orientation_classifier": {"model": "PP-LCNet_x1_0_doc_ori", "sha256": ORIENTATION_MODEL_SHA256,
                                            "confidence_threshold": ORIENTATION_CONFIDENCE},
                 "pages": orientation, "tables": [], "formulas": [], "missing_pages": [],
-                "table_recovery_schema": TABLE_RECOVERY_SCHEMA, "table_join_schema": TABLE_JOIN_SCHEMA,
-                "table_cell_schema": TABLE_CELL_SCHEMA,
                 "borderless_rows_enabled": getattr(args, 'pdf_borderless_rows', True),
                 "primary_table_notes_enabled": getattr(args, 'pdf_table_notes', True),
                 "remove_duplicate_table_notes": getattr(args, 'pdf_remove_duplicate_table_notes', False),
@@ -8177,6 +8223,7 @@ def export_local_html(args, result, normalized, orientation, source):
                 "restored_mixed_math_text": [], "primary_ocr_only": args.primary_ocr_only,
                 "formula_reader": "surya", "content_source": "primary_surya"}
     args.pdf_quality_current = manifest
+    args.typed_cell_ocr_reviews = []
     records = getattr(args, "surya_records", [])
     if pdf_repair_enabled(args, 'math'):
         manifest['image_budgets'] = {'classification': {'pages': {}}, 'formula': {'pages': {}}}
@@ -8199,7 +8246,7 @@ def export_local_html(args, result, normalized, orientation, source):
     try:
         try:
             native_reader = NativeTableReader(normalized)
-            native_reader.formula_recognizer = None if args.primary_ocr_only else formula_recognizer
+            native_reader.formula_recognizer = None
             formula_recognizer.pdf_source_reader = native_reader
             native_reader.repair_subrows = pdf_repair_enabled(args, 'subrows')
             native_reader.repair_boundaries = pdf_repair_enabled(args, 'boundaries')
@@ -8208,10 +8255,17 @@ def export_local_html(args, result, normalized, orientation, source):
         except Exception as exc:
             diagnostic_event('LOCAL_NATIVE_READER_UNAVAILABLE', error_type=type(exc).__name__, error=diagnostic_summary(str(exc)))
             print(f"PDF geometry reader unavailable; retaining OCR route: {type(exc).__name__}: {exc}", file=sys.stderr)
+        from docling_pdf_mixed_page import recover_missing_pages
+        recovered_page_routes = recover_missing_pages(doc, records, args, regions, orientation,
+            manifest, sys.modules[__name__], reader=native_reader)
+        table_records = [record for record in records if '<table' in record.get('html', '').lower()]
+        original_table_refs.update(item.self_ref for item in doc.tables)
         if getattr(args, 'pdf_captioned_figures', True) and pdf_repair_enabled(args, 'boundaries'):
-            captioned_figures = capture_captioned_figures(doc, native_reader, records, manifest, sys.modules[__name__])
+            captioned_figures = capture_captioned_figures(doc, native_reader, records, manifest,
+                                                         sys.modules[__name__], regions=regions)
         from docling_pdf_forms import capture_form_figures
-        captioned_figures.update(capture_form_figures(doc, records, manifest, sys.modules[__name__]))
+        captioned_figures.update(capture_form_figures(doc, records, manifest, sys.modules[__name__],
+                                                    reader=native_reader, regions=regions))
         if captioned_figures:
             # Form source crops own their children before recovery can interpret
             # the drawing as an editable table or recreate its OCR packets.
@@ -8236,14 +8290,12 @@ def export_local_html(args, result, normalized, orientation, source):
         expose_picture_table_children(doc, picture_routes, manifest)
         restore_ocr_formula_blocks(doc, records, picture_routes, manifest)
         if pdf_repair_enabled(args, 'boundaries'):
-            from docling_pdf_structure import recover_unrouted_native_tables
+            from docling_pdf_native_discovery import recover_unrouted_native_tables
             unrouted_native_candidates=recover_unrouted_native_tables(doc,native_reader,regions,
                 routes,excluded,manifest,sys.modules[__name__],records=records)
             from docling_pdf_repairs import repair_source_tables
             note_routes, source_table_candidates = repair_source_tables(doc, native_reader, regions,
-                routes, excluded, manifest, sys.modules[__name__])
-            if args.primary_ocr_only:
-                note_routes = {}
+                routes, excluded, manifest, sys.modules[__name__], records=records)
             source_table_candidates.update(unrouted_native_candidates)
             from docling_pdf_captions import attach_source_captions
             attach_source_captions(doc,excluded,manifest,sys.modules[__name__])
@@ -8251,29 +8303,27 @@ def export_local_html(args, result, normalized, orientation, source):
         # Include newly restored blocks, and replace their actual item class
         # before HTML dispatch can treat mixed prose as a standalone formula.
         manifest["restored_mixed_math_text"] = normalize_surya_formulas(doc)
+        if args.primary_ocr_only and pdf_repair_enabled(args, 'math', format_only=True):
+            from docling_pdf_picture_math import recover_picture_math
+            recover_picture_math(doc, records, regions, args, picture_routes, excluded,
+                manifest, sys.modules[__name__], protected=captioned_figures)
 
         populated_pages = {prov.page_no for item, _ in doc.iterate_items() if hasattr(item, "prov")
                            and getattr(item, "label", None) not in {DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER}
                            for prov in item.prov}
+        verified_furniture_pages = {proof['page']
+            for proof in manifest.get('recovered_furniture_only_pages', [])
+            if proof.get('method') == 'primary_layout_and_recognition_verified_furniture_only'}
         for page_no, page_info in orientation.items():
-            if page_no in populated_pages or page_info.get("ink_fraction", 0) < 0.0001:
+            if (page_no in populated_pages or page_no in verified_furniture_pages
+                    or page_info.get("ink_fraction", 0) < 0.0001):
                 diagnostic_event('LOCAL_PAGE_IMAGE_FALLBACK_SKIP', page_no=page_no,
-                                 reason='page_has_structured_items' if page_no in populated_pages else 'blank_or_unknown_ink',
+                                 reason=('page_has_structured_items' if page_no in populated_pages else
+                                         'primary_verified_furniture_only' if page_no in verified_furniture_pages
+                                         else 'blank_or_unknown_ink'),
                                  ink_fraction=page_info.get('ink_fraction',0))
                 continue
-            image = regions.crop(page_no)
-            page = regions.pdf[page_no - 1]
-            try:
-                width, height = page.get_size()
-            finally:
-                page.close()
-            if page_no not in doc.pages:
-                doc.add_page(page_no=page_no, size=Size(width=width, height=height))
-            item = insert_source_item(doc, page_no, [0, 0, width, height], "picture")
-            picture_routes[item.self_ref] = image_html(image, width, "page")
-            manifest["missing_pages"].append({"page": page_no, "method": "source_image"})
-            diagnostic_event('LOCAL_PAGE_IMAGE_FALLBACK', page_no=page_no, ref=item.self_ref,
-                             reason='nonblank_page_without_structured_items', width=width, height=height)
+            raise RuntimeError(f'Page {page_no} contains source content but still has no structured OCR after recovery')
 
         retry_limit = table_request_limit(len(doc.tables))
         retries = 0
@@ -8346,31 +8396,25 @@ def export_local_html(args, result, normalized, orientation, source):
                         if join_geometry is None and pdf_repair_enabled(args, 'boundaries'):
                             join_geometry = native_reader.open_edge_grid(bbox)
                     if page_scans:
-                        if args.primary_ocr_only:
-                            # Scan discovery can already own a verified grid.
-                            # Reuse its exact padded render for stable cell OCR
-                            # keys; a tight crop can clip an outer source rule.
-                            render_box = (native[1].get('source_render_bbox') if native
-                                          and native[1].get('source_grid_verified') else None)
-                            if render_box:
-                                table_source_bounds = list(native[1]['bbox'])
+                        render_box = (native[1].get('source_render_bbox') if native
+                                      and native[1].get('source_grid_verified') else None)
+                        if render_box:
+                            table_source_bounds = list(native[1]['bbox'])
+                            image.close()
+                            bbox = list(render_box)
+                            image = regions.crop(page_no, bbox)
+                        else:
+                            from docling_pdf_scan_recovery import read_source_scan_grid
+                            probe = read_source_scan_grid(native_reader, regions, page_no, bbox,
+                                [raw for _, raw in raw_candidates], sys.modules[__name__])
+                            if probe and (probe['native'][1].get('source_grid_verified') or native is None):
                                 image.close()
-                                bbox = list(render_box)
-                                image = regions.crop(page_no, bbox)
-                            else:
-                                from docling_pdf_scan_recovery import read_source_scan_grid
-                                probe = read_source_scan_grid(native_reader, regions, page_no, bbox,
-                                    [raw for _, raw in raw_candidates], sys.modules[__name__])
-                                if probe and (probe['native'][1].get('source_grid_verified') or native is None):
-                                    image.close()
-                                    native, image, bbox = probe['native'], probe['image'], list(probe['region'])
-                                    table_source_bounds = list(native[1]['bbox'])
-                                elif probe:
-                                    probe['image'].close()
-                            raster_positions = raster_column_positions(image)
-                            expected = len(raster_positions)-1 if raster_positions else None
-                        elif native is None:
-                            native = native_reader.read_raster_table(page_no,bbox,image,[raw for _,raw in raw_candidates])
+                                native, image, bbox = probe['native'], probe['image'], list(probe['region'])
+                                table_source_bounds = list(native[1]['bbox'])
+                            elif probe:
+                                probe['image'].close()
+                        raster_positions = raster_column_positions(image)
+                        expected = len(raster_positions)-1 if raster_positions else None
                         if native:
                             native_method = 'raster_geometry'
                             join_geometry = native[1]
@@ -8416,12 +8460,32 @@ def export_local_html(args, result, normalized, orientation, source):
                             manifest.setdefault('source_illustration_picture_refs',[]).append(picture.self_ref)
                             sibling=picture
                     if args.primary_ocr_only and page_scans and native[1].get('source_grid_verified'):
-                        from docling_pdf_primary_cells import recover_missing_mixed_text
-                        recovered_text = recover_missing_mixed_text(native, image, bbox, page_no,
-                            args, manifest, sys.modules[__name__], reader=native_reader)
-                        if recovered_text:
-                            native = recovered_text
+                        from docling_pdf_logical_rows import restore_primary_logical_rows
+                        logical = restore_primary_logical_rows(native, records, page_no, manifest,
+                            sys.modules[__name__], reader=native_reader, source_image=image,
+                            region=bbox, ref=item.self_ref)
+                        if logical:
+                            native = logical
                             join_geometry = native[1]
+                        else:
+                            from docling_pdf_primary import preserve_primary_cells
+                            primary_native, _ = preserve_primary_cells(native[0], native[1], records,
+                                bbox, page_no, manifest, sys.modules[__name__], source_image=image,
+                                reader=native_reader, args=args, source_regions=regions, table_ref=item.self_ref)
+                            native = (primary_native, native[1])
+                            from docling_pdf_primary_cells import recover_missing_mixed_text
+                            recovered_text = recover_missing_mixed_text(native, image, bbox, page_no,
+                                args, manifest, sys.modules[__name__], reader=native_reader)
+                            if recovered_text:
+                                native = recovered_text
+                                join_geometry = native[1]
+                            from docling_pdf_primary_rows import graft_primary_body
+                            recovered_body = graft_primary_body(native, records, page_no,
+                                manifest, sys.modules[__name__], ref=item.self_ref, args=args,
+                                source_image=image, region=bbox)
+                            if recovered_body:
+                                native = recovered_body
+                                join_geometry = native[1]
                     raw_candidates.append((native_method, native[0]))
                 diagnostic_event('TABLE_NATIVE_RECOVERY_RESULT', page_no=page_no, ref=item.self_ref,
                                  recovered=native is not None, method=native_method if native else None,
@@ -8499,44 +8563,6 @@ def export_local_html(args, result, normalized, orientation, source):
                                      html=diagnostic_summary(raw))
                 try:
                     fragment = clean_table_html(raw)
-                    if image_table_support and native is None and not args.primary_ocr_only:
-                        from docling_pdf_structure import numbered_source_header_plan, apply_numbered_source_header
-                        initial_profile = table_profile(fragment)
-                        if any(issue.startswith('numbered_header_width_') for issue in initial_profile['issues']):
-                            source_bounds = image_table_support['image_bboxes'][0]
-                            source_table_image = regions.crop(page_no, source_bounds)
-                            header_plan = None
-                            try:
-                                header_plan = numbered_source_header_plan(fragment, source_table_image,
-                                    source_bounds, sys.modules[__name__])
-                                for target in header_plan['targets']:
-                                    target['source_cell_interior'] = True
-                                args.table_request_context = dict(stage='source_header',page=page_no,
-                                    bbox=source_bounds,element=item.self_ref)
-                                diagnostic_event('TABLE_SOURCE_HEADER_REQUEST',page_no=page_no,ref=item.self_ref,
-                                    source_bbox=source_bounds,targets=len(header_plan['targets']))
-                                labels = recognize_scan_header_cells(args, header_plan['targets'],
-                                    local_request_seconds([SimpleNamespace(max_tokens=2048)]))
-                                fragment, header_proof = apply_numbered_source_header(header_plan, labels,
-                                    sys.modules[__name__])
-                                from docling_pdf_structure import image_table_content_proof
-                                image_table_support['source_header_repair'] = header_proof
-                                image_table_support['verified_header_content'] = image_table_content_proof(
-                                    table_profile(fragment))
-                                join_geometry = dict(basis='source_raster_header_cells',
-                                    bbox=[header_plan['x_grid'][0],header_plan['y_grid'][0],
-                                          header_plan['x_grid'][-1],header_plan['y_grid'][-1]],
-                                    x_grid=header_plan['x_grid'],y_grid=header_plan['y_grid'],
-                                    header_rows=header_plan['source_number_row']+1)
-                                manifest.setdefault('source_numbered_headers',[]).append(
-                                    dict(page=page_no,ref=item.self_ref,**header_proof))
-                                diagnostic_event('TABLE_SOURCE_HEADER_RESTORED',page_no=page_no,
-                                    ref=item.self_ref,**header_proof)
-                            finally:
-                                source_table_image.close()
-                                if header_plan:
-                                    for target in header_plan['targets']:
-                                        target['image'].close()
                     fragment, header_repairs = repair_numbered_header_spans(fragment,span_geometry)
                     fragment, span_repairs = repair_table_spans(fragment, expected)
                     fragment, rule_repairs = align_table_spans_to_rules(fragment, span_geometry)
@@ -8584,74 +8610,9 @@ def export_local_html(args, result, normalized, orientation, source):
                                  methods=[candidate[1] for candidate in valid_candidates[:2]],
                                  comparable_cell_count=len(common), conflict=conflict)
             attempt_log = []
-            retry_stop_reason = 'attempt_limit'
-            for attempt in range(TABLE_REGION_ATTEMPTS):
-                if args.primary_ocr_only:
-                    retry_stop_reason = 'secondary_content_ocr_disabled'
-                    diagnostic_event('TABLE_RETRY_SKIP', page_no=page_no, ref=item.self_ref,
-                                     reason=retry_stop_reason)
-                    break
-                if not (chosen is None or chosen[3]['issues'] or conflict):
-                    retry_stop_reason = 'usable_candidate_without_numeric_conflict'
-                    diagnostic_event('TABLE_RETRY_SKIP', page_no=page_no, ref=item.self_ref, attempt=attempt+1,
-                                     reason=retry_stop_reason, request_count=retries, request_limit=retry_limit)
-                    break
-                try:
-                    args.table_request_context = {'page':page_no,'bbox':bbox,'attempt':attempt+1}
-                    scale = (1.0, 1.25, .85, 1.5)[attempt % 4]
-                    retry_image = image if scale == 1 else image.resize((round(image.width*scale),round(image.height*scale)))
-                    seconds = local_request_seconds([SimpleNamespace(max_tokens=8192)])
-                    retries += 1
-                    diagnostic_event('TABLE_RETRY_REQUEST', page_no=page_no, ref=item.self_ref, attempt=attempt+1,
-                                     request_count=retries, request_limit=retry_limit, timeout_seconds=seconds,
-                                     scale=scale, crop_width=retry_image.width, crop_height=retry_image.height,
-                                     numeric_conflict=conflict, current_issues=chosen[3].get('issues',[]) if chosen else ['no_candidate'])
-                    fragment = recover_table_crop(args, retry_image, seconds)
-                    if _DIAGNOSTICS is not None:
-                        diagnostic_event('TABLE_CANDIDATE_RAW', page_no=page_no, ref=item.self_ref,
-                                         method='surya_region', attempt=attempt+1, html=diagnostic_summary(fragment))
-                    fragment, span_repairs = repair_table_spans(fragment, expected)
-                    fragment, rule_repairs = align_table_spans_to_rules(fragment, span_geometry)
-                    profile = table_profile(fragment, expected)
-                    profile["span_repairs"] = span_repairs + rule_repairs
-                    retry = (profile["score"] - 3*len(profile.get('warnings',[])), "surya_region", fragment, profile)
-                    column_support = sum(not candidate[3]['issues'] and chosen is not None
-                                         and candidate[3]['columns'] == chosen[3]['columns']
-                                         for candidate in valid_candidates)
-                    if (chosen and not chosen[3]['issues'] and expected == chosen[3]['columns']
-                            and profile['columns'] < expected and column_support >= 2):
-                        # A read that loses confirmed columns cannot resolve a
-                        # disagreement in their numbers. Keep the complete reads.
-                        diagnostic_event('TABLE_RETRY_GRID_REJECT', page_no=page_no, ref=item.self_ref,
-                                         attempt=attempt+1, reason='lost_confirmed_columns',
-                                         expected_columns=expected, returned_columns=profile['columns'],
-                                         supporting_reads=column_support)
-                        attempt_log.append({'attempt':attempt+1,'reason':'lost_confirmed_columns',
-                                            'expected_columns':expected,'returned_columns':profile['columns']})
-                        continue
-                    candidates.append(retry)
-                    attempt_log.append({'attempt':attempt+1,'issues':profile['issues'],'warnings':profile.get('warnings',[])})
-                    diagnostic_event('TABLE_RETRY_RESULT', page_no=page_no, ref=item.self_ref, attempt=attempt+1,
-                                     score=profile.get('score'), ranking_score=retry[0], rows=profile.get('rows'), columns=profile.get('columns'),
-                                     issues=profile.get('issues',[]), warnings=profile.get('warnings',[]),
-                                     span_repair_count=len(span_repairs), rule_repair_count=len(rule_repairs))
-                    if chosen is None or retry[0] > chosen[0] or (conflict and not profile["issues"]):
-                        chosen = retry
-                        # Require the regional read to agree with at least one previous numeric read.
-                        read = numeric_cells(profile)
-                        comparable = [numeric_cells(candidate[3]) for candidate in valid_candidates
-                                      if (candidate[3]['rows'],candidate[3]['columns']) == (profile['rows'],profile['columns'])
-                                      and len(set(read)&set(numeric_cells(candidate[3])))>=3]
-                        # No comparable earlier read is not a disagreement.
-                        conflict = bool(comparable) and not any(all(read[k]==values[k] for k in set(read)&set(values))
-                                                                               for values in comparable)
-                        diagnostic_event('TABLE_CHOSEN', phase='regional', page_no=page_no, ref=item.self_ref,
-                                         attempt=attempt+1, method=chosen[1], numeric_conflict=conflict, profile=diagnostic_summary(chosen[3]))
-                except Exception as exc:
-                    diagnostic_event('TABLE_RETRY_ERROR', page_no=page_no, ref=item.self_ref, attempt=attempt+1,
-                                     error_type=type(exc).__name__, error=diagnostic_summary(str(exc)))
-                    attempt_log.append({'attempt':attempt+1,'error':f'{type(exc).__name__}: {exc}'})
-                    print(f"Table regional recovery: page {page_no}; {type(exc).__name__}: {exc}", file=sys.stderr)
+            retry_stop_reason = 'secondary_content_ocr_disabled'
+            diagnostic_event('TABLE_RETRY_SKIP', page_no=page_no, ref=item.self_ref,
+                             reason=retry_stop_reason)
             diagnostic_event('TABLE_RETRY_END', page_no=page_no, ref=item.self_ref,
                              reason=retry_stop_reason, attempt_count=len(attempt_log),
                              document_request_count=retries, document_request_limit=retry_limit,
@@ -8705,10 +8666,11 @@ def export_local_html(args, result, normalized, orientation, source):
                         caption=' '.join(c.resolve(doc).text for c in item.captions))
                     from docling_pdf_primary import preserve_primary_cells
                     content, primary_cells = preserve_primary_cells(content, native[1], records,
-                        bbox, page_no, manifest, sys.modules[__name__], source_image=image, reader=native_reader)
+                        bbox, page_no, manifest, sys.modules[__name__], source_image=image, reader=native_reader,
+                        args=args, source_regions=regions, table_ref=item.self_ref)
                     if primary_cells:
                         profile = table_profile(content, expected)
-                    elif args.primary_ocr_only:
+                    else:
                         primary_choices = [c for c in candidates if c[1] == 'surya_page' and not c[3]['issues']]
                         if len({c[2] for c in primary_choices}) == 1:
                             primary_profile = primary_choices[0][3]
@@ -8729,6 +8691,10 @@ def export_local_html(args, result, normalized, orientation, source):
                                 register_primary_grid_review(content,image,bbox,page_no,item.self_ref,
                                     manifest,sys.modules[__name__])
                     if args.primary_ocr_only and method in {'pdf_geometry', 'raster_geometry'}:
+                        from docling_pdf_primary_rows import verify_scan_radicals
+                        content = verify_scan_radicals(content, native[1], image, bbox, page_no,
+                            args, manifest, sys.modules[__name__], ref=item.self_ref)
+                        profile = table_profile(content, expected)
                         if source_cell_ownership:
                             content, source_kept = mask_source_owned_cells(content,native[1],image,bbox,
                                 page_no,manifest,sys.modules[__name__])
@@ -8744,60 +8710,6 @@ def export_local_html(args, result, normalized, orientation, source):
                     chosen = (chosen[0],method,content,profile)
             if chosen and not chosen[3]["issues"]:
                 method, content, profile = chosen[1:]
-                pending=(native[1].get('pending_cell_ocr',[]) if native and method=='raster_geometry'
-                         and not args.primary_ocr_only else [])
-                used=getattr(args,'scan_numeric_requests',0)
-                targets=[scan_numeric_crop(image,bbox,t) for t in pending]
-                targets=[t for t in targets if t is not None]
-                if targets:
-                    seconds=local_request_seconds([SimpleNamespace(max_tokens=2048)])
-                    if seconds>0:
-                        args.scan_numeric_requests=used+len(targets);retries+=len(targets)
-                        diagnostic_event('SCAN_NUMERIC_CELL_REQUEST',page_no=page_no,ref=item.self_ref,
-                            cells=[dict(row=t['row'],column=t['column'],bbox=t['bbox'],source_lines=t['source_lines']) for t in targets],
-                            timeout_seconds=seconds)
-                        try:
-                            labels=recognize_scan_header_cells(args,targets,seconds)
-                            parsed=BeautifulSoup(content,'html.parser');nodes=parsed.table.find_all(['th','td'])
-                            for label in labels:
-                                index=next((i for i,c in enumerate(profile['cells']) if
-                                            c['row']==label['row'] and c['column']==label['column']),None)
-                                if index is not None:
-                                    nodes[index].clear();nodes[index].append(BeautifulSoup(label['html'],'html.parser'))
-                            content=str(parsed.table);profile=table_profile(content,expected)
-                            diagnostic_event('SCAN_NUMERIC_CELL_RESTORED',page_no=page_no,ref=item.self_ref,labels=labels)
-                        except Exception as exc:
-                            diagnostic_event('SCAN_NUMERIC_CELL_ERROR',page_no=page_no,ref=item.self_ref,
-                                             error_type=type(exc).__name__,error=str(exc))
-                if method not in {'pdf_geometry','raster_geometry'} and not args.primary_ocr_only:
-                    content,header_recovery = recover_complete_table_header(content,candidates)
-                    if header_recovery:profile=table_profile(content,expected)
-                    missing=missing_scan_header_cells(content,join_geometry,image,bbox)
-                    used=getattr(args,'scan_header_requests',0)
-                    if missing:
-                        seconds=local_request_seconds([SimpleNamespace(max_tokens=2048)])
-                        if seconds>0:
-                            args.scan_header_requests=used+len(missing)
-                            retries+=len(missing)
-                            diagnostic_event('TABLE_HEADER_TEXT_REQUEST',page_no=page_no,ref=item.self_ref,
-                                cells=[dict(row=t['row'],column=t['column'],bbox=t['bbox']) for t in missing],
-                                timeout_seconds=seconds)
-                            try:
-                                labels=recognize_scan_header_cells(args,missing,seconds)
-                                parsed=BeautifulSoup(content,'html.parser')
-                                nodes=parsed.table.find_all(['th','td'])
-                                for label in labels:
-                                    index=next((i for i,c in enumerate(profile['cells']) if
-                                                c['row']==label['row'] and c['column']==label['column']),None)
-                                    if index is not None and not nodes[index].get_text(strip=True):
-                                        nodes[index].append(BeautifulSoup(label['html'],'html.parser'))
-                                content=str(parsed.table)
-                                profile=table_profile(content,expected)
-                                diagnostic_event('TABLE_HEADER_TEXT_RESTORED',page_no=page_no,ref=item.self_ref,
-                                                 labels=labels)
-                            except Exception as exc:
-                                diagnostic_event('TABLE_HEADER_TEXT_ERROR',page_no=page_no,ref=item.self_ref,
-                                                 error_type=type(exc).__name__,error=str(exc))
                 if method in {"pdf_geometry", "raster_geometry"}:
                     rendered = BeautifulSoup(content, "html.parser")
                     rendered.table["class"] = "pdf-native"
@@ -8867,29 +8779,6 @@ def export_local_html(args, result, normalized, orientation, source):
                     content,coherent_formula_repairs=restore_formula_cells(content,native[1],page_no,
                         manifest,sys.modules[__name__],formula_recognizer,image,bbox)
                     if coherent_formula_repairs:profile=table_profile(content,expected)
-                if page_scans and native and not args.primary_ocr_only:
-                    from docling_scan_text import restore as restore_raster_cell_text
-                    content,cell_text_repairs=restore_raster_cell_text(content,native[1],page_no,
-                        manifest,sys.modules[__name__],formula_recognizer,image,bbox)
-                    if cell_text_repairs:
-                        profile=table_profile(content,expected)
-                if (page_scans and native and method == 'raster_geometry' and not args.primary_ocr_only
-                        and not native[1].get('hidden_ocr_direction_conflict')):
-                    from docling_table_content import restore_scan_table_scripts
-                    def recognize_cell_script(data, metadata):
-                        nonlocal retries
-                        retries += 1
-                        if args.pdf_formula_reader=='p2t':
-                            from docling_p2t import read,resolve_device
-                            device=resolve_device() if args.pdf_formula_device=='auto' else args.pdf_formula_device
-                            return latex_math(read(data,device),'inline')
-                        return formula_recognizer(data, metadata)
-                    content, script_repairs = restore_scan_table_scripts(
-                        content, native[1], image, bbox, native_reader.chars,
-                        recognize_cell_script, image_html, diagnostic_event, page_no)
-                    if script_repairs:
-                        native[1].setdefault('restored_cell_math', []).extend(script_repairs)
-                        profile = table_profile(content, expected)
                 if pdf_repair_enabled(args, 'math') and native:
                     from docling_pdf_repairs import repair_table_math
                     args.pdf_export_context = dict(stage='table_math', page=page_no, element=item.self_ref, bbox=bbox)
@@ -8900,20 +8789,6 @@ def export_local_html(args, result, normalized, orientation, source):
                     if math_repairs:
                         native[1].setdefault('restored_cell_math', []).extend(math_repairs)
                         profile = table_profile(content, expected)
-                if native and '<img' in content and not args.primary_ocr_only:
-                    from docling_scan_text import restore as restore_raster_cell_text
-                    content,final_cell_repairs=restore_raster_cell_text(content,native[1],page_no,
-                        manifest,sys.modules[__name__],formula_recognizer,image,bbox)
-                    if final_cell_repairs:
-                        profile=table_profile(content,expected)
-                if native and not args.primary_ocr_only:
-                    from docling_scan_text import restore_unreliable_cells,restore_code_labels
-                    content,unreliable_cell_repairs=restore_unreliable_cells(content,native[1],image,bbox,
-                        page_no,manifest,sys.modules[__name__])
-                    content,code_label_repairs=restore_code_labels(content,native[1],records,bbox,
-                        page_no,manifest,sys.modules[__name__])
-                    if unreliable_cell_repairs or code_label_repairs:
-                        profile=table_profile(content,expected)
                 from docling_pdf_table_audit import source_grid as audit_source_cell_grid
                 audit_source_cell_grid(content,native[1] if native else None,page_no,item.self_ref,
                     manifest,sys.modules[__name__])
@@ -8959,12 +8834,51 @@ def export_local_html(args, result, normalized, orientation, source):
                                      selected_method=chosen[1] if chosen else None, issues=profile.get('issues',[]),
                                      numeric_conflict=conflict, retry_stop_reason=retry_stop_reason,
                                      attempted_reads=len(candidates), crop_width=image.width, crop_height=image.height)
-            # Grid uncertainty never grants permission to rasterize text or
-            # equations. Resolve every cell/table raster before publication.
-            from docling_pdf_table_content import normalize_table_content
+            from docling_pdf_table_content import (normalize_table_content, TableContentError,
+                                                    primary_table_fallback)
             typed_region = actual_source_image_bbox if method == 'source_image' else bbox
-            content = normalize_table_content(content, native[1] if native else None,
-                image, typed_region, page_no, args, manifest, sys.modules[__name__], ref=item.self_ref)
+            if (args.primary_ocr_only and native and pdf_repair_enabled(args, 'subrows')):
+                from docling_pdf_primary_rows import source_primary_subrows
+                restored_subrows = source_primary_subrows(content, native[1], records, page_no,
+                    native_reader, sys.modules[__name__])
+                if restored_subrows:
+                    content, subrow_proof = restored_subrows
+                    subrow_proof['ref'] = item.self_ref
+                    native[1]['primary_logical_rows_proof'] = subrow_proof
+                    manifest.setdefault('primary_source_logical_rows', []).append(subrow_proof)
+                    diagnostic_event('PRIMARY_SOURCE_LOGICAL_ROWS_RESTORED', **subrow_proof)
+            try:
+                content = normalize_table_content(content, native[1] if native else None,
+                    image, typed_region, page_no, args, manifest, sys.modules[__name__],
+                    ref=item.self_ref, source_reader=native_reader)
+            except TableContentError as error:
+                fallback = primary_table_fallback(records, page_no, typed_region, sys.modules[__name__],
+                    current=content, geometry=native[1] if native else None)
+                if fallback:
+                    content, proof = fallback
+                    if proof.get('basis') == 'visible_source_authority_retained':
+                        method = 'source_text_review'
+                        message = 'Сохранён исходный текст таблицы; сборка отдельных ячеек не завершена.'
+                    else:
+                        method = 'primary_surya_review'
+                        message = 'Сохранён полный первичный OCR таблицы; сборка отдельных ячеек не завершена.'
+                else:
+                    content = image_html(image, typed_region[2]-typed_region[0], 'table')
+                    actual_source_image_bbox = list(typed_region)
+                    proof = dict(source_bbox=list(typed_region))
+                    method = 'source_image_review'
+                    message = 'Таблицу не удалось полностью распознать; сохранено её исходное изображение.'
+                # A rejected assembly no longer owns external primary packets.
+                # Keep those original items available instead of deleting them
+                # using proofs belonging to the abandoned candidate.
+                manifest['typed_table_primary_ownership'] = [entry for entry in
+                    manifest.get('typed_table_primary_ownership', []) if entry['ref'] != item.self_ref]
+                from docling_pdf_table_content import _record_primary_ownership
+                _record_primary_ownership(manifest, proof.pop('preserved_footer_packets', []),
+                                          page_no, item.self_ref)
+                warning = dict(page=page_no, ref=item.self_ref, reason=str(error), message=message, **proof)
+                manifest.setdefault('table_assembly_reviews', []).append(warning)
+                diagnostic_event('TABLE_ASSEMBLY_PRIMARY_RETAINED', **warning)
             if method == 'source_image':
                 method = 'typed_source_region'
             if '<table' in content.lower():
@@ -8976,6 +8890,7 @@ def export_local_html(args, result, normalized, orientation, source):
                         column_header=c['header']) for c in profile['cells']])
             else:
                 profile = dict(issues=[], columns=0, rows=0, text=semantic_ocr_text(content))
+                item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
             diagnostic_event('TABLE_CHOSEN', phase='final', page_no=page_no, ref=item.self_ref, method=method,
                              rows=profile.get('rows'), columns=profile.get('columns'), score=profile.get('score'),
                              issues=profile.get('issues',[]), warnings=profile.get('warnings',[]), numeric_conflict=conflict,
@@ -8995,7 +8910,7 @@ def export_local_html(args, result, normalized, orientation, source):
             manifest["tables"].append({"ref": item.self_ref, "page": page_no, "bbox": table_source_bounds,
                 "source_bbox": source_bbox(table_source_bounds, orientation[page_no]),
                 "source_render_bbox": list(bbox),
-                "actual_source_image_bbox": actual_source_image_bbox if method == 'source_image' else None,
+                "actual_source_image_bbox": actual_source_image_bbox if method in {'source_image', 'source_image_review'} else None,
                 "method": method, "raster_columns": raster_expected, "selected": profile,
                 "numeric_disagreement": conflict,
                 "regional_attempts": attempt_log,
@@ -9119,9 +9034,6 @@ def export_local_html(args, result, normalized, orientation, source):
                     diagnostic_event('TABLE_SOURCE_PICTURE_DUPLICATE_REMOVED', ref=picture.self_ref,
                         table=ref, page_no=reg[0], bbox=reg[1], reason='source_image_already_structured')
                     break
-        if not args.primary_ocr_only:
-            from docling_pdf_repairs import repair_source_references
-            repair_source_references(doc,native_reader,excluded,manifest,sys.modules[__name__])
         from docling_pdf_table_rasters import suppress_layout_table_rasters
         suppress_layout_table_rasters(doc,manifest,excluded,sys.modules[__name__])
         suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded)
@@ -9177,8 +9089,7 @@ def export_local_html(args, result, normalized, orientation, source):
             from docling_pdf_repairs import repair_inline_placeholders
             repaired_slots, repaired_slot_pages = repair_inline_placeholders(doc, native_reader, regions,
                 formula_recognizer, picture_routes, excluded, manifest, sys.modules[__name__])
-        inline_math, inline_math_pages = ({}, set()) if args.primary_ocr_only else prepare_pdf_inline_math(
-            doc, native_reader, regions, picture_routes, formula_recognizer)
+        inline_math, inline_math_pages = {}, set()
         for ref, replacements in repaired_slots.items():
             inline_math.setdefault(ref, []).extend(replacements)
         inline_math_pages.update(repaired_slot_pages)
@@ -9230,14 +9141,24 @@ def export_local_html(args, result, normalized, orientation, source):
                 diagnostic_html(fragment, "table_serializer", ref=item.self_ref, route=route)
                 return create_ser_result(text=fragment, span_source=item)
 
+        from docling_pdf_annotations import annotation_context, mark_source_text, normalize_semantic_annotations
+        semantic_context = annotation_context(doc, excluded, manifest)
+
         class SourceFormulas(HTMLTextSerializer):
             def serialize(self, *, item, doc_serializer, doc, **kwargs):
+                result = self._serialize_source(item=item, doc_serializer=doc_serializer, doc=doc, **kwargs)
+                return create_ser_result(text=mark_source_text(result.text, item.self_ref, semantic_context),
+                                         span_source=item)
+
+            def _serialize_source(self, *, item, doc_serializer, doc, **kwargs):
                 region = item_region(item, doc)
                 args.pdf_export_context = dict(stage='text_serialization', element=item.self_ref,
                     page=region[0] if region else None, bbox=region[1] if region else None)
                 if item.self_ref in excluded:
                     diagnostic_event('TEXT_SERIALIZE_SKIP',ref=item.self_ref,reason='excluded')
                     return create_ser_result(text="", span_source=item)
+                if item.self_ref in recovered_page_routes:
+                    return create_ser_result(text=recovered_page_routes[item.self_ref], span_source=item)
                 if item.self_ref in note_routes:
                     return create_ser_result(text=note_routes[item.self_ref], span_source=item)
                 if item.label != DocItemLabel.FORMULA and "<math" in item.text:
@@ -9274,32 +9195,6 @@ def export_local_html(args, result, normalized, orientation, source):
                 else:
                     rendered = latex_math(formula, "inline" if is_inline_scope else "block")
                 region = item_region(item, doc)
-                if rendered and region and region[0] in inline_math_pages and not args.primary_ocr_only:
-                    page = native_reader.load_page(region[0])
-                    assets = [obj for obj in page.images if obj['width'] > 40 and obj['height'] < 35
-                              and overlap_ratio([obj['x0'],obj['top'],obj['x1'],obj['bottom']],region[1]) > .8]
-                    if len(assets) == 1:
-                        obj = assets[0]
-                        asset = regions.crop(region[0],[obj['x0']-2,obj['top']-2,obj['x1']+2,obj['bottom']+2])
-                        try:
-                            buffer=BytesIO();asset.save(buffer,'PNG')
-                            checked=formula_recognizer(buffer.getvalue(),dict(formula_item=True,
-                                width=asset.width,height=asset.height,paragraph_text='',inline=False,media_name=item.self_ref))
-                            if checked:
-                                parsed=BeautifulSoup(checked,'html.parser').math
-                                candidate=parsed.get('data-latex','')
-                                previous=BeautifulSoup(rendered,'html.parser').math
-                                def structure(math):
-                                    bases=[node.find(recursive=False).get_text() for node in math.find_all(['msub','msubsup'])
-                                           if node.find_parent(['msub','msubsup']) is None and node.find(recursive=False)]
-                                    return bases,[node.get_text() for node in math.find_all('mo')]
-                                if (candidate and re.findall(r'\d+',candidate)==re.findall(r'\d+',formula)
-                                        and structure(previous)==structure(parsed)):
-                                    formula=candidate;rendered=checked;parsed['display']='block';rendered=str(parsed)
-                                    diagnostic_event('PDF_RASTER_FORMULA_CHECK',page=region[0],ref=item.self_ref,latex=candidate)
-                        except Exception as error:
-                            diagnostic_event('PDF_RASTER_FORMULA_CHECK_ERROR',page=region[0],error=str(error))
-                        finally:asset.close()
                 if rendered is None:
                     if not formula or not formula.strip():
                         raise RuntimeError(f'Formula has no recognized source notation: {item.self_ref}')
@@ -9380,6 +9275,12 @@ def export_local_html(args, result, normalized, orientation, source):
                 b.decompose()
                 diagnostic_event('PDF_PARAGRAPH_CONTINUATION',left=left,right=right,basis='source_font_and_parentheses')
         for node in soup.select('[data-pdf-text-ref]'):del node['data-pdf-text-ref']
+        normalize_semantic_annotations(soup, semantic_context, manifest)
+        if getattr(args, 'pdf_table_notes', True) and pdf_repair_enabled(args, 'boundaries'):
+            from docling_pdf_notes import join_primary_note_table_continuations
+            join_primary_note_table_continuations(soup,manifest,records,sys.modules[__name__])
+        from docling_pdf_logical_rows import style_primary_logical_rows
+        style_primary_logical_rows(soup, manifest, sys.modules[__name__])
         for style in soup.find_all("style"):
             style.decompose()
         style = soup.new_tag("style")
@@ -9404,8 +9305,15 @@ def export_local_html(args, result, normalized, orientation, source):
             +manifest.get('source_grid_mismatches',[])+manifest.get('unreliable_cells_unresolved',[])
             +manifest.get('source_graphic_losses',[])+manifest.get('known_table_raster_policy_issues',[]))
         manifest['table_checks_policy']='diagnostic_only'
+        manifest['typed_cell_ocr_reviews'] = list(getattr(args, 'typed_cell_ocr_reviews', []))
         manifest['table_quality_warnings']=[dict(issue,severity='warning') for issue in
-            manifest['table_content_issues']+manifest.get('source_grid_reviews',[])]
+            manifest['table_content_issues']+manifest.get('source_grid_reviews',[])
+            +manifest.get('vector_source_literal_reviews',[])
+            +manifest.get('primary_cell_reconciliation_reviews',[])
+            +manifest.get('scan_formula_source_reviews',[])
+            +manifest.get('typed_cell_ocr_reviews',[])
+            +manifest.get('table_assembly_reviews',[])
+            +manifest.get('table_image_provenance_reviews',[])]
         from docling_pdf_review import annotate_primary_reviews
         annotate_primary_reviews(soup,manifest,sys.modules[__name__])
         manifest["regional_requests"] = retries
@@ -9474,27 +9382,6 @@ def discover_files(input_dir):
             path = Path(directory) / name
             if path.resolve().is_relative_to(input_dir) and path.is_file():
                 yield path
-
-
-def should_skip(args, source):
-    if getattr(args, "force", False):
-        return False
-    path = Path(f"{output_base(args, source)}.{args.format}")
-    if not path.is_file() or path.stat().st_size == 0:
-        return False
-    if path.suffix.lower() == '.html':
-        from bs4 import BeautifulSoup
-        content = path.read_text(encoding='utf-8-sig')
-        published = BeautifulSoup(content, 'html.parser')
-        marker = published.find('meta', attrs={'name': 'docling-publication-schema'})
-        embedded = any(str(image.get('src', '')).lower().startswith('data:')
-                       for image in published.find_all('img'))
-        if marker is None or marker.get('content') != '7' or embedded:
-            # This is an export migration, not an OCR/cache schema change.
-            # Reuse the existing HTML and its source pixels without inference.
-            write_atomic(path, content)
-            diagnostic_event('HTML_PUBLICATION_MIGRATED', path=path, schema=7)
-    return True
 
 
 def finalize_published_html(path, content):
@@ -9569,8 +9456,6 @@ def strip_html_hyperlinks(content):
 
 def export_office_document(args, source):
     from docling_office import export_docx_html
-    from docling_office_math import OfficeFormulaRecognizer
-
     diagnostic_event('DOCUMENT_BEGIN', source=source, mode='office-source-order', pages='all')
     diagnostic_file(source, 'source_document')
     print(f'Processing {source} | office-source-order', flush=True)
@@ -9580,11 +9465,15 @@ def export_office_document(args, source):
         diagnostic_event('OFFICE_NORMALIZE_BEGIN', source=source, target='in_memory_docx')
         data = convert_to_modern_format(source, source.suffix[1:], 'docx')
         diagnostic_event('OFFICE_NORMALIZE_END', source=source, bytes=data.getbuffer().nbytes)
-    recognizer = OfficeFormulaRecognizer(args, configure_surya, resolve_device,
-                                         local_surya_backend, latex_math, diagnostic_event)
+    recognizer = None
+    if getattr(args, "office_image_math", False):
+        from docling_office_math import OfficeFormulaRecognizer
+        recognizer = OfficeFormulaRecognizer(args, configure_surya, resolve_device,
+                                             local_surya_backend, latex_math, diagnostic_event)
     try:
         content, stats = export_docx_html(data, recognizer, diagnostic_event, source_name=source.name)
-        content = recognizer.finalize(content)
+        if recognizer is not None:
+            content = recognizer.finalize(content)
         output = Path(f'{output_base(args, source)}.{args.format}')
         output.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(output, content)
@@ -9594,7 +9483,8 @@ def export_office_document(args, source):
               f'diagrams: {stats["images"]}; links removed: {stats["links_removed"]}', flush=True)
         print(f'Saved: {output}', flush=True)
     finally:
-        recognizer.close()
+        if recognizer is not None:
+            recognizer.close()
 
 
 def parse_args(argv=None):
@@ -9609,7 +9499,8 @@ def parse_args(argv=None):
     p.add_argument("--api-key", default=None, help="ключ OpenAI; в режиме ai при отсутствии запрашивается видимым вводом")
     p.add_argument("--input", dest="selected_inputs", nargs="+", type=Path,
                    help="только указанные файлы внутри папки скрипта; относительные пути — от неё")
-    p.add_argument("--force", action="store_true", help="повторно обработать уже готовые файлы")
+    p.add_argument("--office-image-math", action="store_true",
+                   help="распознавать картинки-формулы Office через локальный OCR; по умолчанию сохранять исходные изображения")
     p.add_argument('--pdf-repairs', nargs='+', default=None,
                    choices=('boundaries', 'math', 'subrows', 'empty-columns', 'all', 'none'),
                    help='исправления локального PDF; по умолчанию все группы')
@@ -9644,8 +9535,6 @@ def parse_args(argv=None):
     p.add_argument('--pdf-math-seconds', type=float, default=None, help='необязательный общий бюджет формул на страницу, сек; по умолчанию без ограничений')
     p.add_argument('--pdf-classification-max-assets', type=int, default=None, help='необязательный лимит классификаций на страницу; по умолчанию без ограничений')
     p.add_argument('--pdf-classification-seconds', type=float, default=None, help='необязательный общий бюджет классификации на страницу, сек; по умолчанию без ограничений')
-    p.add_argument('--ocr-cache-dir', type=Path, default=DATA_DIR/'.cache'/'docling_ocr',
-                   help='постоянные OCR/layout снимки до экспорта, по SHA256 PDF и конфигурации')
     p.add_argument('--pdf-formula-reader', choices=('p2t', 'verified', 'surya'), default='surya',
                    help='surya: сохранять первичное распознавание; p2t/verified отключены для local')
     p.add_argument('--pdf-formula-device', choices=('auto', 'cpu', 'cuda'), default='auto',
@@ -9674,7 +9563,6 @@ def parse_args(argv=None):
             p.error('Optional PDF recognition limits must be nonnegative and finite')
         if value == 0:
             setattr(args, name, None)
-    args.ocr_cache_dir = args.ocr_cache_dir.expanduser().resolve()
     if _DIAGNOSTICS is not None and args.api_key:
         _DIAGNOSTICS.secrets.add(args.api_key)
     args.input_dir = DATA_DIR if args.selected_inputs else DATA_DIR/'Input'
@@ -9744,7 +9632,7 @@ def parse_args(argv=None):
     if collisions:
         p.error("Output filename collisions found before conversion: " + "; ".join(collisions))
 
-    args.pending_pdf_files = [source for source in args.pdf_files if not should_skip(args, source)]
+    args.pending_pdf_files = args.pdf_files
     if args.pages and args.office_files:
         print("WARNING: --pages applies only to PDF; Office files will be converted in full.", file=sys.stderr)
     if args.pending_pdf_files:
@@ -9830,6 +9718,31 @@ def retrying_api_pipeline(args):
     return RetryingVlmPipeline
 
 
+def configure_pdf_resources():
+    """Keep native Docling resource paths ASCII on Windows without copying them."""
+    if os.name != 'nt':
+        return
+    import docling_parse
+
+    origin = getattr(docling_parse.__spec__, 'origin', None) or docling_parse.__file__
+    if origin.isascii():
+        return
+    # docling-parse 7.22 reads the package's __file__ in each native parser
+    # constructor, then opens glyph/CMap files with narrow Windows paths.
+    # The app runs its engine from the installation folder, so an ASCII
+    # relative path avoids that encoding bug. Keep __spec__.origin intact
+    # and never change cwd: CMap files can also be opened lazily later.
+    message = ('Путь к ресурсам PDF содержит символы, которые библиотека не поддерживает. '
+               'Запустите конвертер из папки приложения.')
+    try:
+        relative = os.path.relpath(origin)
+    except ValueError as error:
+        raise RuntimeError(message) from error
+    if not relative.isascii():
+        raise RuntimeError(message)
+    docling_parse.__file__ = relative
+
+
 def build_converter(args):
     from docling.datamodel.base_models import InputFormat
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -9837,6 +9750,7 @@ def build_converter(args):
     if not args.pending_pdf_files:
         return DocumentConverter()
 
+    configure_pdf_resources()
     from docling.datamodel.accelerator_options import AcceleratorOptions
 
     if args.mode == "local":
@@ -10215,42 +10129,24 @@ def convert_document(args, converter, source):
     diagnostic_file(source,'source_document')
     print(f"Processing {source} | {mode} | pages {pages}")
     if is_pdf and args.mode == "local":
-        from docling_pdf_runtime import OcrSnapshot, DiagnosticExportError, write_failure_artifacts, CachedPostprocessModel
+        from docling_pdf_runtime import file_hash, DiagnosticExportError, write_failure_artifacts
         args.pdf_diagnostics_current = None
         args.pdf_quality_current = {}
         args.pdf_export_context = {'stage': 'ocr'}
         args.surya_records = []
-        args.table_region_memory = {}
         args.scan_header_requests = 0
         args.scan_numeric_requests = 0
-        snapshot = OcrSnapshot(source, args, sys.modules[__name__])
-        cached = snapshot.load()
-        if not cached and os.environ.get('DOCLING_REQUIRE_OCR_CACHE') == '1':
-            raise RuntimeError('Required primary OCR snapshot is missing or invalid; new inference is disabled')
-        if cached and getattr(args, 'surya_ocr_model', None) is None:
-            args._cached_postprocess_model = CachedPostprocessModel()
-            args.surya_ocr_model = args._cached_postprocess_model
-        context = nullcontext((cached.normalized, cached.orientation)) if cached else normalized_pdf(source, args)
-        with context as (normalized, orientation):
-            args.current_source_hash = snapshot.source_hash
+        args.current_source_hash = file_hash(source)
+        with normalized_pdf(source, args) as (normalized, orientation):
             args.current_orientation = orientation
             kwargs["source"] = normalized
-            if not cached:
-                progress.start(len(orientation))
-            if cached:
-                result = cached
-                args.surya_records = cached.records
-                progress.successful_pages.update(orientation)
-                print(f'Конвертация: OCR cache; {len(orientation)} из {len(orientation)} страниц восстановлено', flush=True)
-            else:
-                converter = shared_converter(args, converter)
-                result = converter.convert(**kwargs)
+            progress.start(len(orientation))
+            converter = shared_converter(args, converter)
+            result = converter.convert(**kwargs)
             diagnostic_model(result.document,getattr(args,'surya_records',()))
             diagnostic_event('CONVERTER_RESULT',status=str(result.status),errors=diagnostic_summary(getattr(result,'errors',())))
             if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
                 raise RuntimeError(f"Docling failed: {result.status}. Errors: {result.errors}")
-            if not cached:
-                snapshot.save(result, args.surya_records, normalized, orientation)
             if getattr(args, 'diagnostics_dir', None):
                 diagnostics = args.diagnostics_dir/f'{source.stem[:64]}_{uuid4().hex[:12]}'
                 diagnostics.mkdir(parents=True, exist_ok=False)
@@ -10281,7 +10177,7 @@ def convert_document(args, converter, source):
                 write_atomic(Path(f"{base}.html"), content)
             except Exception as error:
                 artifacts = write_failure_artifacts(source, args, sys.modules[__name__], error,
-                    snapshot=snapshot, document=result.document, content=content)
+                    document=result.document, content=content)
                 raise DiagnosticExportError(str(error), artifacts) from error
             audit=diagnostic_html(content,'published_local_html',source=str(source),output=str(Path(f'{base}.html').resolve()))
             diagnostic_event('DOCUMENT_END',source=str(source),source_table_fragments=len(quality['tables']),
@@ -10320,8 +10216,6 @@ def convert_document(args, converter, source):
 
         content = doc.export_to_html(image_mode=ImageRefMode.EMBEDDED)
         content = normalize_html_table_words(content)
-        if is_pdf and args.mode == "local":
-            content = render_surya_math(content)
         write_atomic(output_file, content)
         diagnostic_html(content,'published_html',source=str(source),output=str(output_file))
         tables = len(doc.tables)
@@ -10331,7 +10225,7 @@ def convert_document(args, converter, source):
 
 
 def shared_converter(args, converter=None):
-    """Cache hits need no layout/OCR models; all misses share one converter."""
+    """Keep one loaded converter for the current batch's fresh OCR requests."""
     converter = converter or getattr(args, '_shared_converter', None)
     if converter is None:
         diagnostic_event('SHARED_CONVERTER_INITIALIZING')
@@ -10371,15 +10265,6 @@ def run_conversion(args, report_router, report_lock):
         current_source = str(source)
         save_status('running')
         try:
-            skip_error = None
-            try:
-                skip = should_skip(args, source)
-            except Exception as error:
-                skip, skip_error = False, error
-            if skip:
-                print(f"SKIP: {source}; output already exists: {output_base(args, source)}.{args.format}")
-                record(source, 'SKIP')
-                continue
             with diagnostic_document_log(report_router, report_lock, log_paths[source], source, args) as report:
                 try:
                     report_event(
@@ -10389,8 +10274,6 @@ def run_conversion(args, report_router, report_lock):
                         f'pages={args.pages or "all"}; supported_files={len(args.input_files)}; '
                         f'image_scale={IMAGE_SCALE}; threads={NUM_THREADS}',
                     )
-                    if skip_error is not None:
-                        raise skip_error
                     report_event(report, report_lock, "memory",
                                  f"before document: {source}; {memory_snapshot(args.device)}")
                     outcome = convert_document(args, converter, source)
@@ -10470,13 +10353,6 @@ def main():
                 except Exception as error:
                     diagnostic_event('SOURCE_TEXT_RUNTIME_CLOSE_ERROR',error=str(error))
                     print(f'SOURCE_TEXT_RUNTIME_CLOSE_ERROR: {error}',file=sys.stderr)
-            cached_model = getattr(locals().get('args'), '_cached_postprocess_model', None)
-            if cached_model is not None:
-                try:
-                    cached_model.close()
-                except Exception as error:
-                    diagnostic_event('POSTPROCESS_RUNTIME_CLOSE_ERROR', error=str(error))
-                    print(f'POSTPROCESS_RUNTIME_CLOSE_ERROR: {error}', file=sys.stderr)
             sys.stdout.flush()
             sys.stderr.flush()
         finally:

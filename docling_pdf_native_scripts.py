@@ -32,6 +32,9 @@ def attach_source_scripts(chars, render_math):
             if (i==j or not base['text'].isalnum() or child['size']>=.85*base['size']
                     or child['x0']<base['x0']+.35*(base['x1']-base['x0'])
                     or child['x0']-base['x1']>.55*base['size']):continue
+            if any(c['text'].isspace() and _positioned(c)
+                and base['x1'] <= (c['x0']+c['x1'])/2 <= child['x0']
+                and abs(c['matrix'][5]-child['matrix'][5])<.03*child['size'] for c in chars):continue
             centre=(child['top']+child['bottom']-base['top']-base['bottom'])/2
             rise=child['matrix'][5]-base['matrix'][5]
             if not .08*base['size']<abs(centre)<.75*base['size']:continue
@@ -39,7 +42,7 @@ def attach_source_scripts(chars, render_math):
             overlap=min(child['bottom'],base['bottom'])-max(child['top'],base['top'])
             if overlap<.15*min(child['size'],base['size']):continue
             if any(k not in (i,j) and chars[k]['text'].strip()
-                and chars[k]['x0']>=base['x1'] and chars[k]['x1']<=child['x0']
+                and base['x1'] <= (chars[k]['x0']+chars[k]['x1'])/2 <= child['x0']
                 and chars[k]['size']>=.85*base['size']
                 and abs(chars[k]['matrix'][5]-base['matrix'][5])<.15*base['size'] for k in eligible):continue
             # Ordinary smaller words beside a formula can have a slightly
@@ -50,10 +53,31 @@ def attach_source_scripts(chars, render_math):
                 and min(abs(chars[k]['x0']-child['x1']),abs(child['x0']-chars[k]['x1']))<.3*child['size']
                 for k in eligible)
             if child['text'].isalpha() and word_peer and abs(rise)<.15*base['size']:continue
+            # Different formula fonts can place a larger symbol above the
+            # ordinary prose baseline. Text continuing that same prose on
+            # both sides of the symbol is not an index, even if its origin
+            # differs enough to pass the shifted-glyph test.
+            prose_before=any(k not in (i,j) and chars[k]['text'].isalpha()
+                and 0 <= base['x0']-chars[k]['x1'] < base['size']
+                and abs(chars[k]['size']-child['size'])<.05*child['size']
+                and abs(chars[k]['matrix'][5]-child['matrix'][5])<.03*child['size']
+                for k in eligible)
+            if child['text'].isalpha() and word_peer and prose_before:continue
             choices.append((abs(child['x0']-base['x1']),j,'sup' if rise>0 else 'sub'))
         choices.sort()
         if choices and (len(choices)==1 or choices[1][0]-choices[0][0]>.05*chars[choices[0][1]]['size']):
             owners[i]=choices[0][1:]
+    # A sentence comma beside a fraction denominator cannot start a script.
+    # Keep separators in an actual i,j index only after a same-baseline atom.
+    for i,owner in tuple(owners.items()):
+        child=chars[i]
+        if child['text']==',' and not any(other==owner and chars[k]['text'].isalnum()
+            and chars[k]['x1']<=child['x0']+.05*child['size']
+            and child['x0']-chars[k]['x1']<.35*child['size']
+            and abs(chars[k]['size']-child['size'])<.05*child['size']
+            and abs(chars[k]['matrix'][5]-child['matrix'][5])<.03*child['size']
+            for k,other in owners.items() if k!=i):
+            del owners[i]
     groups={}
     for child,(base,role) in owners.items():groups.setdefault(base,{}).setdefault(role,[]).append(child)
     # Continue a source index along its own baseline, rather than truncating
@@ -67,7 +91,11 @@ def attach_source_scripts(chars, render_math):
                     and chars[i]['x0']>=last['x1']-.05*last['size']
                     and chars[i]['x0']-last['x1']<.35*last['size']
                     and abs(chars[i]['size']-last['size'])<.05*last['size']
-                    and abs(chars[i]['matrix'][5]-last['matrix'][5])<.03*last['size']]
+                    and abs(chars[i]['matrix'][5]-last['matrix'][5])<.03*last['size']
+                    and not any(c['text'].isspace()
+                        and last['x1']-.05*last['size'] <= (c['x0']+c['x1'])/2 <= chars[i]['x0']
+                        and _positioned(c)
+                        and abs(c['matrix'][5]-last['matrix'][5])<.03*last['size'] for c in chars)]
                 if not tail:break
                 i=min(tail,key=lambda i:chars[i]['x0']);values.append(i);owners[i]=(base,role)
     # Nested scripts retain the established OCR/MathML path. This simple

@@ -146,7 +146,156 @@ def _note_paragraphs(lines, api):
     return groups
 
 
-def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api):
+def _primary_note_tail(records, page_no, cell, text, api):
+    """Recognize an already retained compound OCR tail in its source cell."""
+    expected = api.cell_text_key(text)
+    if not expected:
+        return None
+    for record in records:
+        bounds = record.get('bbox')
+        if record.get('page_no') != page_no or not bounds:
+            continue
+        if _coverage(cell, [bounds[0]-4, bounds[1]-4, bounds[2]+4, bounds[3]+4]) < .95:
+            continue
+        parsed = BeautifulSoup(record.get('html', ''), 'html.parser')
+        tables = parsed.find_all('table')
+        if len(tables) != 1:
+            continue
+        tail = ''.join(str(node) for node in tables[0].next_siblings)
+        # Render existing notation only for equality with the literal source
+        # glyphs; the OCR markup remains the publication payload.
+        rendered = BeautifulSoup(api.render_surya_math(tail), 'html.parser')
+        if api.cell_text_key(rendered.get_text(' ', strip=True)) == expected:
+            return record
+    return None
+
+
+def _primary_note_footer(records, page_no, cell, text, glyphs, lines, images, api):
+    """Retain a complete primary footer, including math missing from PDF text."""
+    import unicodedata
+
+    expected = api.cell_text_key(text)
+    if not expected:
+        return None
+
+    def keyed_chars(values):
+        chars, owners = [], []
+        for value, owner in values:
+            for char in unicodedata.normalize('NFKC', value):
+                if not char.isspace():
+                    chars.append(char); owners.append(owner)
+        drop = {i for i, char in enumerate(chars) if char in '-\u00ad' and 0 < i < len(chars)-1
+                and re.fullmatch(r'[A-Za-zА-Яа-яЁё]', chars[i-1])
+                and re.fullmatch(r'[A-Za-zА-Яа-яЁё]', chars[i+1])}
+        return (''.join(char for i, char in enumerate(chars) if i not in drop),
+                [owner for i, owner in enumerate(owners) if i not in drop])
+
+    image_boxes = [[obj['x0'], obj['top'], obj['x1'], obj['bottom']] for obj in images
+                   if obj.get('x1', 0) > obj.get('x0', 0) and obj.get('bottom', 0) > obj.get('top', 0)
+                   and _coverage([obj['x0'], obj['top'], obj['x1'], obj['bottom']], cell) >= .95]
+    line_chars = []
+    for index, line in enumerate(lines):
+        key = api.cell_text_key(line['text'])
+        line_chars.extend((char, (index, offset)) for offset, char in enumerate(key))
+    source_key, source_owners = keyed_chars(line_chars)
+    matches = {}
+    for record in records:
+        bounds = record.get('bbox')
+        if (record.get('page_no') != page_no or not bounds
+                or _coverage(cell, [bounds[0]-4, bounds[1]-4, bounds[2]+4, bounds[3]+4]) < .95):
+            continue
+        parsed = BeautifulSoup(record.get('html', ''), 'html.parser')
+        if len(parsed.find_all('table')) != 1:
+            continue
+        table = parsed.table
+        rows = [row for row in table.find_all('tr') if row.find_parent('table') is table]
+        tail = []
+        for row in reversed(rows):
+            occupied = [node for node in row.find_all(['td', 'th'], recursive=False)
+                        if node.get_text(strip=True) or node.find('math')]
+            if len(occupied) != 1 or int(occupied[0].get('colspan', 1)) <= 1:
+                break
+            tail.insert(0, occupied[0])
+        starts = [i for i, node in enumerate(tail)
+                  if re.match(r'^\s*Примечани[ея]\b', node.get_text(' ', strip=True), re.I)]
+        if len(starts) != 1:
+            continue
+        tail = tail[starts[0]:]
+        if any(node.find(['table', 'img', 'svg', 'script', 'style']) for node in tail):
+            continue
+        output = BeautifulSoup('', 'html.parser')
+        for original in tail:
+            content = BeautifulSoup(original.decode_contents(), 'html.parser')
+            for block in reversed(content.find_all(['p', 'div'])):
+                block.insert_before(' '); block.unwrap()
+            paragraph = output.new_tag('p')
+            for child in list(content.contents):
+                paragraph.append(child.extract())
+            output.append(paragraph)
+        try:
+            rendered = BeautifulSoup(api.render_surya_math(str(output)), 'html.parser')
+        except (ValueError, RuntimeError):
+            continue
+        valid_math = True
+        for equation in list(rendered.find_all('math')):
+            if equation.find(['mi', 'mn', 'mo', 'mrow', 'mfrac', 'msub', 'msup', 'mtext']):
+                continue
+            formatted = api.latex_math(equation.get('data-latex') or equation.get_text(),
+                                       equation.get('display', 'inline'))
+            if not formatted:
+                valid_math = False; break
+            equation.replace_with(BeautifulSoup(formatted, 'html.parser').math)
+        if not valid_math:
+            continue
+        if rendered.find(['img', 'svg', 'table', 'script', 'style']):
+            continue
+        equations = rendered.find_all('math')
+        placements = []
+        if api.cell_text_key(rendered.get_text(' ', strip=True)) != expected:
+            # A math island can be absent from the text layer only where a
+            # unique owned source image occupies its exact glyph gap.
+            if not equations or len(equations) != len(image_boxes) or source_key != expected:
+                continue
+            marked = BeautifulSoup(str(rendered), 'html.parser')
+            for equation in marked.find_all('math'):
+                equation.replace_with('\ue000')
+            parts = [api.cell_text_key(part) for part in marked.get_text(' ', strip=True).split('\ue000')]
+            if ''.join(parts) != expected:
+                continue
+            used, offset, complete = set(), 0, True
+            for part in parts[:-1]:
+                offset += len(part)
+                if not 0 < offset < len(source_owners):
+                    complete = False; break
+                (left_line, left_char), (right_line, right_char) = source_owners[offset-1:offset+1]
+                if left_line != right_line:
+                    complete = False; break
+                line = lines[left_line]
+                members = sorted((g for g in glyphs
+                    if abs(g['bottom']-line['y']) <= .5*max(g['size'], line['size'])
+                    and line['x0']-.1 <= (g['x0']+g['x1'])/2 <= line['x1']+.1), key=lambda g: g['x0'])
+                key, owners = keyed_chars((g['text'], g) for g in members)
+                if key != api.cell_text_key(line['text']) or right_char >= len(owners):
+                    complete = False; break
+                before, after = owners[left_char], owners[right_char]
+                padding = max(.5, line['size']*.18)
+                candidates = [i for i, box in enumerate(image_boxes) if i not in used
+                    and before['x1']-padding <= box[0] < box[2] <= after['x0']+padding
+                    and min(before['top'], after['top'])-line['size'] <= box[1]
+                    and box[3] <= max(before['bottom'], after['bottom'])+line['size']*.5]
+                if len(candidates) != 1:
+                    complete = False; break
+                used.add(candidates[0]); placements.append(image_boxes[candidates[0]])
+            if not complete:
+                continue
+        html = str(rendered)
+        matches.setdefault(html, dict(html=html, source_record_sha256=hashlib.sha256(record['html'].encode()).hexdigest(),
+            source_footer_rows=len(tail), source_math_images=placements,
+            method='complete_primary_footer_with_literal_glyphs_and_positioned_math_images'))
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api, *, records=()):
     """Coalesce same-page layout pieces; recover omitted full-width note cells.
 
     A single native ruled table must contain each layout piece and have the
@@ -295,6 +444,16 @@ def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api):
                 text = '\n'.join(line['text'] for line in lines)
                 if not re.match(r'^\s*(?:<\*+>|Примечани[ея]\b)', text, re.I):
                     continue
+                primary = _primary_note_tail(records, page_no, cell, text, api)
+                if primary is not None:
+                    api.diagnostic_event('SOURCE_TABLE_NOTES_KEEP', page=page_no, bbox=cell,
+                        reason='complete_primary_ocr_tail_already_retained',
+                        source_record_sha256=hashlib.sha256(primary.get('html', '').encode()).hexdigest())
+                    continue
+                images = [obj for obj in reader.page.images
+                          if cell[0] <= (obj['x0']+obj['x1'])/2 <= cell[2]
+                          and cell[1] <= (obj['top']+obj['bottom'])/2 <= cell[3]]
+                primary_footer = _primary_note_footer(records, page_no, cell, text, glyphs, lines, images, api)
                 # An already positioned text item, even an incomplete one, is
                 # not silently duplicated or replaced by this recovery route.
                 existing = [item for item in doc.texts if item.self_ref not in excluded
@@ -305,14 +464,17 @@ def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api):
                                          reason='existing_positioned_text', refs=[t.self_ref for t in existing])
                     continue
                 paragraphs = _note_paragraphs(lines, api)
-                plain = '\n'.join(paragraphs)
+                html = primary_footer['html'] if primary_footer else ''.join('<p>'+escape(p)+'</p>' for p in paragraphs)
+                plain = api.semantic_ocr_text(html) if primary_footer else '\n'.join(paragraphs)
                 prov = ProvenanceItem(page_no=page_no, charspan=(0, len(plain)),
                     bbox=BoundingBox(l=cell[0], t=cell[1], r=cell[2], b=cell[3], origin=CoordOrigin.TOPLEFT))
                 item = doc.insert_text(sibling=above[0][0], after=True, label=DocItemLabel.TEXT,
                                        text=plain, orig=plain, prov=prov)
-                note_routes[item.self_ref] = ''.join('<p>'+escape(p)+'</p>' for p in paragraphs)
+                note_routes[item.self_ref] = html
                 entry = dict(ref=item.self_ref, table=above[0][0].self_ref, page=page_no, bbox=list(cell), glyphs=len(glyphs),
-                             method='literal_notes_in_source_fullwidth_cell', text=plain)
+                             method='literal_notes_in_source_fullwidth_cell', text=plain, html=html)
+                if primary_footer:
+                    entry.update(primary_footer)
                 manifest['recovered_source_notes'].append(entry)
                 api.diagnostic_event('SOURCE_TABLE_NOTES_RESTORED', **entry)
     return note_routes, native_candidates
@@ -330,7 +492,7 @@ def attach_recovered_source_notes(routes, excluded, note_routes, manifest, api):
         target, seen = note['table'], set()
         while target in parents and target not in seen:
             seen.add(target); target = parents[target]
-        content = note_routes.get(note['ref']) or '<p>'+escape(note['text'])+'</p>'
+        content = note_routes.get(note['ref']) or note.get('html') or '<p>'+escape(note['text'])+'</p>'
         if not content or not routes.get(target, ''):
             raise RuntimeError('Recovered source notes have no verified output table')
         note_key = api.cell_text_key(BeautifulSoup(content, 'html.parser').get_text(' ', strip=True))
@@ -1219,53 +1381,6 @@ def retain_source_matched_table_tokens(doc, records, routes, excluded, manifest,
         api.diagnostic_event('TABLE_MATCHING_TOKEN_RETAINED',**proof)
     recover_unassigned_text(doc,remaining,routes,excluded,manifest,api)
     manifest['table_unassigned_token_retention'] = covered + manifest['table_unassigned_token_retention']
-
-
-def source_reference_text(text, native):
-    """Correct a terminal OCR 6/б only when a unique native reference proves it."""
-    pattern=re.compile(r'\b(?P<label>рисун(?:ок|ке|ка|ку|ки)|таблиц[аеыу])\s*'
-        r'(?P<id>[А-ЯЁA-Z]?\.?\d+(?:\.\d+)*[а-яёa-z]?)(?!\w)',re.I)
-    def key(value):
-        return re.sub(r'\W+','',value.casefold().replace('ё','е'))
-    native_matches=list(pattern.finditer(native));changes=[]
-    for target in pattern.finditer(text):
-        old=target['id']
-        if not old.endswith('6'):continue
-        matches=[]
-        for source in native_matches:
-            new=source['id']
-            if (source['label'].casefold()!=target['label'].casefold() or not new.endswith('б')
-                    or old[:-1]!=new[:-1]):continue
-            left,right=key(text[:target.start('id')]),key(text[target.end('id'):])
-            native_left,native_right=key(native[:source.start('id')]),key(native[source.end('id'):])
-            size=min(24,len(left),len(native_left));tail=min(12,len(right),len(native_right))
-            if size<16 or left[-size:]!=native_left[-size:]:continue
-            if right[:tail]!=native_right[:tail] or bool(right)!=bool(native_right):continue
-            matches.append(new)
-        if len(matches)==1:changes.append(dict(start=target.start('id'),end=target.end('id'),old=old,new=matches[0],label=target['label']))
-    for change in reversed(changes):text=text[:change['start']]+change['new']+text[change['end']:]
-    return text,changes
-
-
-def repair_source_references(doc, reader, excluded, manifest, api):
-    if reader is None:return
-    proofs=[]
-    for item in doc.texts:
-        if '<math' in item.orig:continue  # keep independently rendered math untouched
-        if item.self_ref in excluded or not re.search(r'(?:рисун|таблиц)\w*\s*[А-ЯA-Z]?\.?\d*[.]?\d*6\b',item.text,re.I):continue
-        region=api.item_region(item,doc)
-        if not region:continue
-        reader.load_page(region[0]);glyphs=_cell_glyphs(reader,region[1])
-        if not glyphs or any(re.search(r'\(cid:|[\ufffd\x00-\x08]',g['text']) or not g.get('upright',True) for g in glyphs):continue
-        native=' '.join(line['text'] for line in api.native_cell_lines(glyphs))
-        fixed,changes=source_reference_text(item.text,native)
-        if not changes:continue
-        item.text=fixed
-        item.orig=source_reference_text(item.orig,native)[0]
-        for change in changes:
-            proof=dict(page=region[0],bbox=region[1],ref=item.self_ref,**change,method='unique_native_reference_and_matching_prose_anchors')
-            proofs.append(proof);api.diagnostic_event('OCR_SOURCE_REFERENCE_RESTORED',**proof)
-    manifest['source_reference_repairs']=proofs
 
 
 @contextmanager

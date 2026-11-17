@@ -11,6 +11,117 @@ import numpy as np
 from PIL import Image,ImageOps
 
 
+def _table_rows(element):
+    """Use only the owning table's rows, matching table_profile coordinates."""
+    table=element if element.name=='table' else element.find_parent('table')
+    return [row for row in element.find_all('tr') if row.find_parent('table') is table]
+
+
+def _table_cells(element):
+    return [cell for row in _table_rows(element) for cell in row.find_all(['td','th'],recursive=False)]
+
+
+def refine_header_only_grid(fragment, geometry, following_geometry, api, *,
+                            page_width, following_page_width):
+    """Project an unfinished header onto its continuation's measured columns.
+
+    A group heading need not contain every vertical divider printed in the
+    body on the next page. Its actual boundaries must be an unambiguous
+    subset of that finer source grid. Only colspans change; every cell keeps
+    its payload, rowspan and physical bounds. The caller still owns page,
+    caption, intervening-content and continuation checks.
+    """
+    source_bases = {'pdf_rules', 'raster_rules', 'raster_edge_rules',
+                    'raster_parallel_rules', 'raster_cell_rules',
+                    'raster_numbered_header_rules', 'source_raster_header_cells'}
+    if (not geometry or not following_geometry or page_width <= 0 or following_page_width <= 0
+            or geometry.get('basis') not in source_bases
+            or following_geometry.get('basis') not in source_bases):
+        return None
+    xs, following = geometry.get('x_grid', []), following_geometry.get('x_grid', [])
+    if (len(xs) < 3 or len(following) <= len(xs)
+            or any(b <= a for a, b in zip(xs, xs[1:]))
+            or any(b <= a for a, b in zip(following, following[1:]))):
+        return None
+    projected = [x * page_width / following_page_width for x in following]
+    # The existing continuation matcher tolerates page-relative rail shifts.
+    # Require one unique match for every old boundary, including both edges.
+    tolerance = .008 * page_width
+    mapping = []
+    for x in xs:
+        matches = [i for i, target in enumerate(projected) if abs(x - target) < tolerance]
+        if len(matches) != 1:
+            return None
+        mapping.append(matches[0])
+    if (mapping[0] != 0 or mapping[-1] != len(projected) - 1
+            or any(b <= a for a, b in zip(mapping, mapping[1:]))):
+        return None
+    parsed = BeautifulSoup(fragment, 'html.parser')
+    if len(parsed.find_all('table')) != 1:
+        return None
+    table = parsed.table
+    head = table.find('thead', recursive=False)
+    rows = _table_rows(table)
+    if head is None or not rows or any(row.find_parent('thead') is not head for row in rows):
+        return None
+    profile = api.table_profile(str(table))
+    if profile['issues'] or profile['columns'] != len(xs) - 1:
+        return None
+    cells = _table_cells(table)
+    if len(cells) != len(profile['cells']):
+        return None
+    payloads = [node.decode_contents() for node in cells]
+    for cell, node in zip(profile['cells'], cells):
+        start, end = cell['column'], cell['column'] + cell['column_span']
+        span = mapping[end] - mapping[start]
+        if span == 1:
+            node.attrs.pop('colspan', None)
+        else:
+            node['colspan'] = str(span)
+    logical_xs = list(projected)
+    for x, index in zip(xs, mapping):
+        logical_xs[index] = x
+    if any(b <= a for a, b in zip(logical_xs, logical_xs[1:])):
+        return None
+    for group in table.find_all('colgroup', recursive=False):
+        group.decompose()
+    group = parsed.new_tag('colgroup')
+    for left, right in zip(logical_xs, logical_xs[1:]):
+        col = parsed.new_tag('col', attrs={
+            'style': f'width:{100 * (right - left) / (logical_xs[-1] - logical_xs[0]):.3f}%'})
+        group.append(col)
+    table.insert(0, group)
+    if table.get('style'):
+        table['style'] = re.sub(r'\bmin-width\s*:[^;]*',
+                               f'min-width:{(len(following) - 1) * 6}em', table['style'], flags=re.I)
+    result = str(table)
+    checked = api.table_profile(result, len(following) - 1)
+    if (checked['issues'] or checked['rows'] != profile['rows']
+            or payloads != [node.decode_contents() for node in _table_cells(table)]):
+        return None
+    physical_cells = geometry.get('cells', [])
+    logical_cells = []
+    for cell in physical_cells:
+        start, end = cell.get('column', -1), cell.get('column', -1) + cell.get('column_span', 0)
+        if not 0 <= start < end < len(mapping):
+            return None
+        copied = dict(cell)
+        copied.setdefault('physical_column', start)
+        copied.setdefault('physical_column_span', end - start)
+        copied.update(column=mapping[start], column_span=mapping[end] - mapping[start])
+        logical_cells.append(copied)
+    proof = dict(method='header_only_source_rails_refined_by_continued_body',
+                 physical_x_grid=list(xs), logical_x_grid=logical_xs,
+                 following_x_grid=list(following), boundary_mapping=mapping,
+                 source_columns=profile['columns'], logical_columns=checked['columns'],
+                 payloads_unchanged=True)
+    refined = dict(geometry, x_grid=logical_xs, cells=logical_cells,
+                   header_grid_refinement=proof)
+    refined.setdefault('physical_x_grid', list(xs))
+    refined.setdefault('physical_cells', [dict(cell) for cell in physical_cells])
+    return result, refined, proof
+
+
 def grid_ink(image,region,xs):
     """Separate only measured table-rule components from the comparison ink."""
     gray=np.asarray(image.convert('L'))
@@ -25,11 +136,12 @@ def grid_ink(image,region,xs):
     horizontal=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((1,max(3,round(3*glyph_height))),np.uint8))
     vertical=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((max(3,round(3*glyph_height)),1),np.uint8))
     projected=np.array([(x-region[0])*sx for x in xs])
-    rules=np.zeros_like(ink);full=[]
+    rules=np.zeros_like(ink);full=[];segments=[]
     count,labels,boxes,_=cv2.connectedComponentsWithStats(horizontal,8)
     for i,(x,y,w,h,area) in enumerate(boxes[1:],1):
         if min(abs(projected-x))>2*radius+2 or min(abs(projected-(x+w)))>2*radius+2:continue
         rules[labels==i]=255
+        segments.append([region[0]+x/sx,region[1]+(y+h/2)/sy,region[0]+(x+w)/sx])
         if w>=.94*(xs[-1]-xs[0])*sx:
             full.append(region[1]+(y+h/2)/sy)
     for x in projected:
@@ -45,7 +157,7 @@ def grid_ink(image,region,xs):
     rules[fringe]=255
     nongrid=cv2.bitwise_and(ink,cv2.bitwise_not(rules))
     return dict(ink=ink,nongrid=nongrid,rules=rules,glyph_height=glyph_height/sy,
-                stroke_radius=radius,full_width_rules=sorted(full),sx=sx,sy=sy)
+                stroke_radius=radius,full_width_rules=sorted(full),horizontal_rule_segments=segments,sx=sx,sy=sy)
 
 
 def empty_rule_bands(fragment,geometry,image,region,glyphs,api):
@@ -54,24 +166,33 @@ def empty_rule_bands(fragment,geometry,image,region,glyphs,api):
     if table is None:return fragment,None
     profile=api.table_profile(str(table));xs=geometry.get('x_grid',[]);ys=geometry.get('y_grid',[])
     if profile['issues'] or profile['rows']!=len(ys)-1 or len(xs)-1!=profile['columns']:return fragment,None
-    rows=table.find_all('tr');nodes=table.find_all(['td','th'])
+    rows=_table_rows(table);nodes=_table_cells(table)
     candidates=[r for r,row in enumerate(rows) if not row.get_text(strip=True) and not row.find(['img','math','svg','table'])]
     if not candidates:return fragment,None
     source=grid_ink(image,region,xs)
     if source is None:return fragment,None
+    font_sizes=[g.get('size',0) for g in glyphs if g.get('text','').strip() and g.get('size',0)>0
+                and xs[0]<=(g['x0']+g['x1'])/2<=xs[-1] and ys[0]<=(g['top']+g['bottom'])/2<=ys[-1]]
+    max_empty_height=max(source['glyph_height'],median(font_sizes) if font_sizes else 0)
     removed=[]
     for row in candidates:
         top,bottom=ys[row:row+2]
-        if bottom-top>=source['glyph_height']:continue
-        if any(not any(abs(y-rule)<=max(1/source['sy'],source['stroke_radius']/source['sy'])
-                       for rule in source['full_width_rules']) for y in (top,bottom)):continue
+        tolerance=max(1/source['sy'],source['stroke_radius']/source['sy'])
+        complete=lambda y:any(abs(y-rule)<=tolerance for rule in source['full_width_rules'])
+        # PDF rectangle end caps can become a false first row in TableFinder.
+        # Its lower edge has no horizontal ink; the actual top rail remains.
+        cap_only=(row==0 and geometry.get('positioned_source_grid_verified') and complete(top)
+                  and not any(abs(bottom-segment[1])<=tolerance for segment in source['horizontal_rule_segments']))
+        if bottom-top>=(max_empty_height if cap_only else source['glyph_height']):continue
+        if not (complete(top) and complete(bottom) or cap_only):continue
         if any(g.get('text','').strip() and top<=(g['top']+g['bottom'])/2<bottom
                and xs[0]<=(g['x0']+g['x1'])/2<=xs[-1] for g in glyphs):continue
         y0=max(0,round((top-region[1])*source['sy']));y1=min(image.height,round((bottom-region[1])*source['sy'])+1)
         x0=max(0,round((xs[0]-region[0])*source['sx']));x1=min(image.width,round((xs[-1]-region[0])*source['sx'])+1)
         residual=int(np.count_nonzero(source['nongrid'][y0:y1,x0:x1]))
         if residual:continue
-        removed.append(dict(row=row,bbox=[xs[0],top,xs[-1],bottom],nongrid_ink_pixels=0,positioned_glyphs=0))
+        removed.append(dict(row=row,bbox=[xs[0],top,xs[-1],bottom],nongrid_ink_pixels=0,positioned_glyphs=0,
+                            absent_lower_source_rule=bool(cap_only)))
     if not removed:return fragment,None
     deleted={r['row'] for r in removed}
     before=[n.decode_contents() for n in nodes if n.get_text(strip=True) or n.find(['img','math','svg','table'])]
@@ -96,10 +217,12 @@ def empty_rule_bands(fragment,geometry,image,region,glyphs,api):
         tr=soup.new_tag('tr')
         for _,_,node in sorted((p for p in placements if p[0]==old_row),key=lambda p:p[1]):tr.append(node)
         group.append(tr)
-    after=[n.decode_contents() for n in table.find_all(['td','th']) if n.get_text(strip=True) or n.find(['img','math','svg','table'])]
+    after=[n.decode_contents() for n in _table_cells(table) if n.get_text(strip=True) or n.find(['img','math','svg','table'])]
     result=str(table);checked=api.table_profile(result)
     if before!=after or checked['issues'] or checked['columns']!=profile['columns']:return fragment,None
-    return result,dict(method='empty_band_between_close_complete_source_rules',removed=removed,
+    method=('empty_top_band_from_vertical_rectangle_end_caps' if any(r['absent_lower_source_rule'] for r in removed)
+            else 'empty_band_between_close_complete_source_rules')
+    return result,dict(method=method,removed=removed,
         source_glyph_height=source['glyph_height'],source_rows=profile['rows'],logical_rows=checked['rows'],payloads_unchanged=True)
 
 
@@ -111,7 +234,10 @@ def compact_row_geometry(geometry,proof):
     geometry.setdefault('physical_y_grid',list(ys))
     # Assign the zero-content rail to the preceding row's source envelope;
     # all following source coordinates remain physical PDF coordinates.
-    geometry['y_grid']=[y for i,y in enumerate(ys) if i not in deleted]
+    removed_boundaries=deleted-{0}
+    if 0 in deleted:
+        removed_boundaries.add(next((row for row in range(proof['source_rows']) if row not in deleted),len(ys)-1))
+    geometry['y_grid']=[y for i,y in enumerate(ys) if i not in removed_boundaries]
     cells=[]
     for cell in geometry.get('cells',[]):
         start=cell['row'];end=start+cell['row_span']
@@ -120,7 +246,10 @@ def compact_row_geometry(geometry,proof):
         c=dict(cell)
         c.setdefault('physical_row',start);c.setdefault('physical_row_span',cell['row_span'])
         c['row']=kept[0]-sum(r<kept[0] for r in deleted)
-        c['row_span']=len(kept);cells.append(c)
+        c['row_span']=len(kept)
+        if 0 in deleted and c['row']==0 and c.get('bbox'):
+            c['bbox']=list(c['bbox']);c['bbox'][1]=ys[0]
+        cells.append(c)
     if 'cells' in geometry:geometry['cells']=cells
     for name in ('retained_cell_images','restored_cell_math','restored_cell_text'):
         for item in geometry.get(name,[]):
@@ -147,10 +276,11 @@ def compact_source_rule_rows(doc,routes,manifest,reader,regions,api):
         if table is None or entry['ref'] not in items:continue
         geometry=entry.get('pdf_geometry') or entry.get('join_geometry') or {}
         ys=geometry.get('y_grid',[]);xs=geometry.get('x_grid',[])
-        count=len(table.thead.find_all('tr')) if table.thead else 0
+        header=table.find('thead',recursive=False)
+        count=len(_table_rows(header)) if header else 0
         if count and len(ys)>count and len(xs)>1:
             entry['source_header_bbox']=[xs[0],ys[0],xs[-1],ys[count]]
-        if not ys or not xs or not any(not r.get_text(strip=True) and not r.find(['img','math','svg','table']) for r in table.find_all('tr')):continue
+        if not ys or not xs or not any(not r.get_text(strip=True) and not r.find(['img','math','svg','table']) for r in _table_rows(table)):continue
         bounds=[xs[0],ys[0],xs[-1],ys[-1]];image=regions.crop(entry['page'],bounds)
         try:
             reader.load_page(entry['page'])
@@ -160,7 +290,8 @@ def compact_source_rule_rows(doc,routes,manifest,reader,regions,api):
             compact_row_geometry(geometry,proof)
             routes[entry['ref']]=result;set_table(items[entry['ref']],entry,result,api)
             parsed=BeautifulSoup(result,'html.parser')
-            count=len(parsed.thead.find_all('tr')) if parsed.thead else 0
+            header=parsed.table.find('thead',recursive=False)
+            count=len(_table_rows(header)) if header else 0
             if count and len(geometry['y_grid'])>count:
                 entry['source_header_bbox']=[xs[0],geometry['y_grid'][0],xs[-1],geometry['y_grid'][count]]
             entry['empty_rule_row_repair']=proof
@@ -184,7 +315,8 @@ def join_double_rule_headers(doc,routes,manifest,reader,regions,api):
             old=previous;old_geo=old['join_geometry']
             left=BeautifulSoup(routes.get(old['ref'],''),'html.parser')
             a,b=left.table,parsed.table
-            header_only=(a is not None and a.thead is not None and all(r.find_parent('thead') is a.thead for r in a.find_all('tr')))
+            header=a.find('thead',recursive=False) if a is not None else None
+            header_only=(header is not None and all(r.find_parent('thead') is header for r in _table_rows(a)))
             same_grid=(len(old_geo['x_grid'])==len(geo['x_grid']) and
                 all(abs(x-y)<=2 for x,y in zip(old_geo['x_grid'],geo['x_grid'])))
             gap=geo['bbox'][1]-old_geo['bbox'][3]
@@ -213,7 +345,8 @@ def join_double_rule_headers(doc,routes,manifest,reader,regions,api):
                 finally:image.close()
                 for group in b.find_all(['thead','tbody','tfoot'],recursive=False):
                     group.name='tbody'
-                    for th in group.find_all('th'):th.name='td'
+                    for th in _table_cells(group):
+                        if th.name=='th':th.name='td'
                     a.append(group.extract())
                 result=str(a);profile=api.table_profile(result,lp['columns'])
                 if profile['issues']:previous=current;continue
@@ -310,9 +443,10 @@ def _header_literal(image,language='ru'):
 
 
 def _heading_cells(table,api):
-    profile=api.table_profile(str(table));nodes=table.find_all(['td','th'])
+    profile=api.table_profile(str(table));nodes=_table_cells(table)
+    header=table.find('thead',recursive=False)
     return {(c['row'],c['column'],c['row_span'],c['column_span']):(c,n)
-            for c,n in zip(profile['cells'],nodes) if n.find_parent('thead')}
+            for c,n in zip(profile['cells'],nodes) if header is not None and n.find_parent('thead') is header}
 
 
 def _footnote_reference(node):
@@ -337,8 +471,10 @@ def confirmed_header_copy(left_table,right_table,left_entry,left_box,right_box,r
     from docling_pdf_native_scripts import script_terms
     a=_heading_cells(left_table,api);b=_heading_cells(right_table,api)
     if a.keys()!=b.keys():return None,None
-    chosen=BeautifulSoup(str(left_table.thead),'html.parser').thead
-    targets=chosen.find_all(['td','th']);left_nodes=left_table.thead.find_all(['td','th'])
+    left_header=left_table.find('thead',recursive=False)
+    if left_header is None:return None,None
+    chosen=BeautifulSoup(str(left_header),'html.parser').thead
+    targets=_table_cells(chosen);left_nodes=_table_cells(left_header)
     repairs=[]
     geo=left_entry.get('pdf_geometry') or left_entry['join_geometry']
     xs=geo['x_grid'];ys=geo.get('y_grid',[])
@@ -421,12 +557,14 @@ def confirmed_header_copy(left_table,right_table,left_entry,left_box,right_box,r
 
 def repeated_source_header(old,current,left_table,right_table,regions,api):
     """Resolve OCR differences only when the actual printed heads agree."""
-    if regions is None or not left_table.thead or not right_table.thead:return None,None
+    left_header=left_table.find('thead',recursive=False)
+    right_header=right_table.find('thead',recursive=False)
+    if regions is None or left_header is None or right_header is None:return None,None
     left_geo=old.get('pdf_geometry') or old.get('join_geometry') or {}
     right_geo=current.get('join_geometry') or {}
     ax,bx=left_geo.get('x_grid',[]),right_geo.get('x_grid',[])
     if len(ax)<3 or len(ax)!=len(bx):return None,None
-    count=len(left_table.thead.find_all('tr'));box=old.get('source_header_bbox')
+    count=len(_table_rows(left_header));box=old.get('source_header_bbox')
     if box is None:
         ys=left_geo.get('y_grid',[])
         if len(ys)<=count:return None,None

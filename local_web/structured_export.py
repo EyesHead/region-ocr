@@ -204,14 +204,17 @@ def strip_review_annotations(soup):
 
 
 def table_is_complex(table):
-    """Only effective cell unions make a table complex; formulas do not."""
-    return any(item['rowspan'] > 1 or item['colspan'] > 1 for item in _grid(table)[1])
+    """Preserve cell unions and source-specific logical row borders in HTML."""
+    return (table.get('data-source-logical-rows') == 'true'
+            or any(item['rowspan'] > 1 or item['colspan'] > 1 for item in _grid(table)[1]))
 
 
 def normalize_table_notes(soup):
     """Move proved full-width trailing notes outside the table before export."""
     warnings = []
     for table in reversed(list(soup.find_all('table'))):
+        if table.get('data-source-logical-rows') == 'true':
+            continue
         moved = []
         while True:
             rows, entries, width = _grid(table)
@@ -244,6 +247,11 @@ def normalize_table_notes(soup):
             if cell.find('table'):
                 break
             wrapper = soup.new_tag('div', attrs={'class': 'table-notes', 'role': 'note', 'data-table-note': 'true'})
+            if not table.get('id'):
+                table['id'] = 'table-' + str(list(soup.find_all('table')).index(table) + 1)
+            wrapper['data-annotation-owner'] = table['id']
+            wrapper['data-annotation-owner-kind'] = 'table'
+            wrapper['id'] = table['id'] + '-note-' + str(len(moved) + 1)
             if cell.find(['p', 'ul', 'ol', 'div'], recursive=False):
                 for child in list(cell.contents):
                     wrapper.append(child.extract())
@@ -311,7 +319,8 @@ def _list_entries(node):
                 counter = int(item['value'])
             except (ValueError, TypeError):
                 pass
-        yield item, counter, _list_marker(counter, node.get('type')) + '.' if ordered else '-'
+        marker = item.get('data-source-clause') or (_list_marker(counter, node.get('type')) + '.' if ordered else '-')
+        yield item, counter, marker
         counter += step
 
 
@@ -319,6 +328,11 @@ def _list_json(node, render_item):
     entries = list(_list_entries(node))
     result = {'type': 'list', 'ordered': node.name == 'ol',
               'items': [render_item(item) for item, _, _ in entries]}
+    if any(item.get('id') for item, _, _ in entries):
+        result['item_ids'] = [item.get('id') for item, _, _ in entries]
+        result['item_metadata'] = [_source_metadata(item, {}) for item, _, _ in entries]
+    if any(item.get('data-source-clause') for item, _, _ in entries):
+        result['source_clauses'] = [item.get('data-source-clause') for item, _, _ in entries]
     if node.name == 'ol':
         result['item_values'] = [number for _, number, _ in entries]
         if entries:
@@ -498,8 +512,8 @@ def _rich(node):
     if node.name == 'table':
         return _table_json(node)
     if node.name in {'ol', 'ul'}:
-        return _list_json(node, lambda item: [part for child in item.children
-                          if (part := _rich(child)) is not None])
+        return _source_metadata(node, _list_json(node, lambda item: [part for child in item.children
+                          if (part := _rich(child)) is not None]))
     children = [_rich(child) for child in node.children]
     children = [child for child in children if child is not None]
     types = {'strong': 'strong', 'b': 'strong', 'em': 'emphasis', 'i': 'emphasis',
@@ -507,7 +521,7 @@ def _rich(node):
     result = {'type': types.get(node.name, 'group'), 'children': children}
     if node.name == 'a' and node.get('href'):
         result['href'] = node['href']
-    return result
+    return _source_metadata(node, result)
 
 
 def _table_json(table):
@@ -519,6 +533,10 @@ def _table_json(table):
     ident = table.get('id') or 'table-' + str(table_index)
     result = {'type': 'table', 'id': ident, 'complex': table_is_complex(table),
               'meta': {'rows': len(rows), 'cols': width}, 'cells': []}
+    annotations = root.find_all(attrs={'data-annotation-owner': ident})
+    annotation_ids = list(dict.fromkeys(node['id'] for node in annotations if node.get('id')))
+    if annotation_ids:
+        result['annotation_ids'] = annotation_ids
     caption = table.find('caption', recursive=False)
     if caption:
         result['caption'] = _plain(caption).strip()
@@ -564,7 +582,8 @@ def _table_json(table):
         if cell.find(['em', 'i']):
             item['italic'] = True
         for attr, field in (('data-cell', 'source_cell'), ('data-cell-type', 'source_type'),
-                            ('data-raw-value', 'raw_value'), ('data-spreadsheet-formula', 'spreadsheet_formula')):
+                            ('data-raw-value', 'raw_value'), ('data-spreadsheet-formula', 'spreadsheet_formula'),
+                            ('data-source-review', 'source_review'), ('data-source-authority', 'source_authority')):
             if cell.get(attr) is not None:
                 item[field] = str(cell[attr])
         if cell.get('headers'):
@@ -590,6 +609,17 @@ def _table_json(table):
     return result
 
 
+def _source_metadata(node, item):
+    for attribute, field in (('id', 'id'), ('data-source-ref', 'source_ref'),
+                             ('data-source-clause', 'source_clause'),
+                             ('data-annotation-kind', 'annotation'),
+                             ('data-annotation-owner', 'owner_id'),
+                             ('data-annotation-owner-kind', 'owner_kind')):
+        if node.get(attribute):
+            item[field] = str(node[attribute])
+    return item
+
+
 def _json_blocks(container):
     output = []
     for node in container.children:
@@ -608,12 +638,18 @@ def _json_blocks(container):
         elif node.name == 'img':
             output.append(_rich(node))
         elif node.name in {'ul', 'ol'}:
-            output.append(_list_json(node, _json_blocks))
-        elif node.name in {'figure', 'blockquote'} or node.get('role') == 'note' or node.has_attr('data-table-note'):
-            kind = 'note' if node.get('role') == 'note' or node.has_attr('data-table-note') else 'figure' if node.name == 'figure' else 'quote'
-            output.append({'type': kind, 'children': _json_blocks(node)})
+            output.append(_source_metadata(node, _list_json(node, _json_blocks)))
+        elif (node.name in {'figure', 'blockquote'} or node.get('role') == 'note'
+              or node.has_attr('data-table-note') or node.has_attr('data-source-annotation')):
+            kind = node.get('data-source-annotation') or ('note' if node.get('role') == 'note' or node.has_attr('data-table-note') else 'figure' if node.name == 'figure' else 'quote')
+            output.append(_source_metadata(node, {'type': kind, 'children': _json_blocks(node)}))
         elif node.name in BLOCK_TAGS - {'p'}:
-            output.extend(_json_blocks(node))
+            metadata = _source_metadata(node, {})
+            children = _json_blocks(node)
+            if metadata:
+                output.append(dict(type='group', children=children, **metadata))
+            else:
+                output.extend(children)
         else:
             kind = 'heading' if re.fullmatch('h[1-6]', node.name) else 'code' if node.name == 'pre' else 'caption' if node.name == 'figcaption' else 'paragraph'
             item = {'type': kind, 'value': _plain(node).strip()}
@@ -623,13 +659,14 @@ def _json_blocks(container):
             rich = [child for child in rich if child is not None]
             if rich and (len(rich) != 1 or rich[0]['type'] != 'text'):
                 item['content'] = rich
-            output.append(item)
+            output.append(_source_metadata(node, item))
     return output
 
 
 def to_json_document(soup, source: Path, stats: dict):
     source = Path(source)
-    return {'schema_version': 2, 'source': {'name': source.name, 'format': source.suffix.lower().lstrip('.')},
+    return {'schema_version': 2, 'id': (soup.body or soup).get('id') or 'pdf-body',
+            'source': {'name': source.name, 'format': source.suffix.lower().lstrip('.')},
             'title': soup.title.get_text(strip=True) if soup.title else source.stem,
             'blocks': _json_blocks(soup.body or soup), 'stats': dict(stats)}
 

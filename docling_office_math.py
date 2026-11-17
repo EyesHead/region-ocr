@@ -1,8 +1,8 @@
 """Recognition of source Office image equations using the existing local OCR.
 
-Recognition results live only in this document's memory. Source diagrams are
-kept, and a failed equation reading raises before publication instead of silently
-publishing the same raster equation as a successful conversion.
+Recognition results live only in this document's memory. Source diagrams and
+unconfirmed image candidates are kept. A failed confirmed equation reading
+raises before publication rather than being counted as successful recognition.
 """
 
 import hashlib
@@ -100,6 +100,14 @@ def chemical_math(content, latex_math):
     return latex_math(''.join(parts), 'inline') if elements and not stack else None
 
 
+def _ordinary_prose_response(content):
+    soup = BeautifulSoup(content, 'html.parser')
+    if soup.find(['math', 'chem', 'sub', 'sup']):
+        return False
+    text = re.sub(r'\\[A-Za-z]+', '', soup.get_text(' ', strip=True))
+    return bool(re.search(r'[А-Яа-яЁё]{3,}|[A-Za-z]{4,}', text))
+
+
 def parsed_formula(content, latex_math, source_row_count=None):
     """Accept mathematical content only; never turn diagram labels into prose."""
     content = re.sub(r'^```(?:html|latex)?\s*|\s*```$', '', content.strip())
@@ -182,6 +190,10 @@ def parsed_formula(content, latex_math, source_row_count=None):
             latex = latex[2:-2]
         if latex.startswith('\\[') and latex.endswith('\\]'):
             latex = latex[2:-2]
+        # Generic OCR may hallucinate a page marker for a small variable.
+        # An ordinary page marker is not a mathematical transcription.
+        if re.fullmatch(r'[-—–]\s*\d+\s*[-—–]', latex):
+            return None
         # A few isolated letters/operators often arrive as <p>, rather than
         # <math>. Russian explanations and OCR narratives are not equations.
         if re.search(r'[А-Яа-яЁё]{3,}|[A-Za-z]{4,}', re.sub(r'\\[A-Za-z]+', '', latex)):
@@ -277,6 +289,10 @@ class OfficeFormulaRecognizer:
                             reason='unsupported_source_image', error=str(exc))
             raise RuntimeError('Cannot classify Office asset ' + str(metadata.get('media_name'))) from exc
         candidate = formula_image_candidate(metadata)
+        confirmed_formula = bool(metadata.get('formula_item')
+                                 or metadata.get('source_script_kind')
+                                 or metadata.get('chemical')
+                                 or layout['math'] or equation_context(metadata))
         # Labels in a drawing are not the whole drawing. Never erase a figure
         # containing a mathematical axis/dimension by replacing it with math.
         figure_only = layout['graphics'] and not layout['math']
@@ -299,6 +315,7 @@ class OfficeFormulaRecognizer:
         from docling_backend_health import request_with_backend_recovery
         from docling_pdf_quantities import source_multiline_ink, single_symbol_ink
         multiline = source_multiline_ink(data)
+        rejected_responses = 0
         for attempt in range(2):
             variable_retry = bool(attempt and not metadata.get('chemical')
                                   and not metadata.get('source_script_kind')
@@ -350,7 +367,8 @@ class OfficeFormulaRecognizer:
                     max_retries=0, request_logprobs_default=False), self.diagnostic)
                 if outputs and outputs[0].token_count >= max_tokens:
                     raise RuntimeError('Formula reached model output capacity; partial MathML rejected')
-                raw = outputs[0].raw if outputs and not outputs[0].error else ''
+                valid_output = bool(outputs and not outputs[0].error)
+                raw = outputs[0].raw if valid_output else ''
                 payload = raw
                 if variable_retry and raw.lstrip().startswith('{'):
                     parsed = json.loads(raw)
@@ -379,6 +397,13 @@ class OfficeFormulaRecognizer:
                             media=metadata.get('media_name'), source_proof=multiline)
                 self.diagnostic('OFFICE_FORMULA_RESPONSE', media=metadata.get('media_name'),
                                 attempt=attempt + 1, response=raw[:1000], accepted=bool(result))
+                if not result and valid_output:
+                    rejected_responses += 1
+                    if not confirmed_formula and _ordinary_prose_response(raw):
+                        self.diagnostic('OFFICE_FORMULA_SOURCE_FALLBACK',
+                            media=metadata.get('media_name'), reason='prose_response',
+                            attempt=attempt + 1, labels=layout['labels'])
+                        return None
                 # A single triangle-shaped variable in a prose definition is
                 # ambiguous; ask for a variable reading before accepting it.
                 ambiguous_shape = (result and attempt == 0 and equation_context(metadata)
@@ -395,6 +420,11 @@ class OfficeFormulaRecognizer:
             except Exception as exc:
                 self.diagnostic('OFFICE_FORMULA_ERROR', media=metadata.get('media_name'),
                                 attempt=attempt + 1, error=str(exc))
+        if not confirmed_formula and rejected_responses == 2:
+            self.diagnostic('OFFICE_FORMULA_SOURCE_FALLBACK',
+                media=metadata.get('media_name'), reason='unrecognized_candidate',
+                attempt=2, labels=layout['labels'])
+            return None
         raise RuntimeError('Could not recognize Office equation ' + str(metadata.get('media_name')) +
                            '; see OFFICE_FORMULA_* in the document log. Previous HTML was kept.')
 

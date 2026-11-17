@@ -379,7 +379,7 @@ class DocxHtmlExporter:
             return ""
         if tag == _q("w", "t"):
             return html.escape(node.text or "")
-        if tag in {_q("w", "drawing"), _q("w", "pict")}:
+        if tag in {_q("w", "drawing"), _q("w", "pict"), _q("w", "object")}:
             return self._image(node, paragraph, in_table)
         if tag in {_q("m", "oMath"), _q("m", "oMathPara")}:
             return self._math(node)

@@ -176,9 +176,9 @@ class PersistentEngine:
     def run(self, source, destination, pages, on_progress=None, cancel_event=None):
         # Import lazily: converter imports this lifecycle class only for a real app.
         if __package__:
-            from .converter import ConversionCancelled, RESULT_MARKER, _check_cancel
+            from .converter import ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER, _check_cancel
         else:
-            from converter import ConversionCancelled, RESULT_MARKER, _check_cancel
+            from converter import ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER, _check_cancel
         import re
         with self.run_lock:
             _check_cancel(cancel_event)
@@ -197,7 +197,7 @@ class PersistentEngine:
             log_path = Path(destination) / 'engine.log'
             output = queue.Queue()
             ident = uuid.uuid4().hex
-            result = None
+            result, failure = None, None
             error_detail = last_error = ''
             try:
                 if on_progress:
@@ -237,7 +237,8 @@ class PersistentEngine:
                         if event and event.get('event') == 'complete' and event.get('id') == ident:
                             if not event.get('ok') or result is None:
                                 detail = error_detail or last_error or event.get('message', '')
-                                raise RuntimeError('Локальный конвертер завершился с ошибкой. ' + detail + ' Журнал: engine.log')
+                                raise ConversionFailure('Локальный конвертер завершился с ошибкой. ' + detail + ' Журнал: engine.log',
+                                                        event.get('failure') or failure)
                             return result
                         if re.search(r'error:', line, re.I):
                             last_error = line.strip()[-800:]
@@ -245,7 +246,9 @@ class PersistentEngine:
                                 error_detail = last_error
                         if line.startswith(RESULT_MARKER):
                             result = json.loads(line[len(RESULT_MARKER):])
-                        match = re.search(r'(?:сконвертировано страниц:\s*|OCR cache;\s*)(\d+) из (\d+)', line)
+                        if line.startswith(ERROR_MARKER):
+                            failure = json.loads(line[len(ERROR_MARKER):])
+                        match = re.search(r'сконвертировано страниц:\s*(\d+) из (\d+)', line)
                         if match and on_progress:
                             n, total = int(match[1]), max(1, int(match[2]))
                             on_progress(min(85, 10 + int(75*n/total)), f'Распознано страниц: {n} из {total}')

@@ -107,7 +107,8 @@ def write_quality_report(output, source, quality, api):
         lines += ['', 'Проверки таблиц носят диагностический характер и не отклоняют результат.', '']
         for warning in warnings:
             lines.append(f'- Страница {warning.get("page", "?")}, '
-                         f'{warning.get("ref", warning.get("element", "?"))}: {warning.get("reason", "table_quality_warning")}')
+                         f'{warning.get("ref", warning.get("element", "?"))}: '
+                         f'{warning.get("message") or warning.get("reason", "table_quality_warning")}')
     if not reviews and not warnings:
         lines += ['Предупреждений таблиц не найдено. Это не посимвольная проверка точности первичного OCR.']
     api.write_atomic(report, '\n'.join(lines)+'\n')

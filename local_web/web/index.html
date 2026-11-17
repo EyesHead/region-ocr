@@ -19,6 +19,46 @@
     <button id="installed-button" class="button button-quiet installed-menu-button" aria-haspopup="dialog" aria-controls="installed-dialog"><span>История</span></button>
   </header>
   <main class="workspace">
+    <section class="results" aria-labelledby="screen-title">
+      <div class="results-toolbar">
+        <div><h1 id="screen-title">Документы</h1><p id="screen-subtitle">Документы и сканы в удобном формате</p></div>
+        <button type="button" class="button button-primary" id="add-files-button">Добавить файлы</button>
+      </div>
+      <div class="output-location" aria-label="Место сохранения результатов">
+        <div class="output-location-text"><span class="output-caption">Папка сохранения</span><p id="output-directory">Подключение…</p><p id="output-storage-error" class="output-storage-error" role="status" hidden></p></div>
+        <div class="output-location-actions">
+          <button type="button" class="button button-outline" id="download-all" aria-describedby="output-directory" hidden>Сохранить все результаты</button>
+          <button type="button" class="button button-quiet" id="output-change" aria-haspopup="dialog" aria-controls="output-dialog">Изменить папку</button>
+        </div>
+      </div>
+      <div class="document-list-toolbar">
+        <label class="document-search"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Найти документ</span><input id="job-search" type="search" placeholder="Найти документ" autocomplete="off" aria-controls="job-list"></label>
+        <div class="document-filters" role="group" aria-label="Состояние документов">
+          <button type="button" class="document-filter selected" data-job-filter="all" aria-pressed="true">Все <span id="filter-all-count">0</span></button>
+          <button type="button" class="document-filter" data-job-filter="queued" aria-pressed="false">К обработке <span id="filter-queued-count">0</span></button>
+          <button type="button" class="document-filter" data-job-filter="active" aria-pressed="false">В работе <span id="filter-active-count">0</span></button>
+          <button type="button" class="document-filter" data-job-filter="done" aria-pressed="false">Готовые <span id="filter-done-count">0</span></button>
+          <button type="button" class="document-filter" data-job-filter="error" aria-pressed="false">Ошибки <span id="filter-error-count">0</span></button>
+        </div>
+        <label class="document-sort"><span class="sr-only">Порядок документов</span><select id="job-sort" aria-controls="job-list">
+          <option value="newest">Сначала новые</option>
+          <option value="oldest">Сначала старые</option>
+          <option value="name-asc">По названию А–Я</option>
+          <option value="name-desc">По названию Я–А</option>
+        </select></label>
+      </div>
+      <div class="queue-toolbar">
+        <p id="queue-summary" role="status">Файлы появятся здесь после загрузки</p>
+        <div class="toolbar-actions"><button class="text-button" id="clear-button" title="Убрать строки из списка. Все файлы останутся в Истории" hidden>Очистить список</button></div>
+      </div>
+      <div id="connection-error" class="connection-error" role="status" hidden><span>Нет связи с локальным приложением.</span><button class="text-button" id="reconnect-button">Повторить</button></div>
+      <div class="job-list" id="job-list" role="list" aria-label="Очередь документов"></div>
+      <div class="empty-state" id="empty-state">
+        <svg viewBox="0 0 92 110" width="82" height="98" fill="none" aria-hidden="true"><path d="M15 3h39l25 25v76H15zM53 3v27h26M29 48h36M29 61h36M29 74h25" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 108h77" stroke="currentColor" stroke-width="2"/></svg>
+        <h3>Добавьте документы</h3><p>Перетащите файлы в область слева или выберите их на компьютере</p><span class="empty-detail">Текст, таблицы, формулы и изображения<br>в одном структурированном документе</span>
+      </div>
+      <div class="results-footnote" id="results-footnote">Готовые документы можно открыть или сохранить в выбранную папку</div>
+    </section>
     <aside class="controls" aria-label="Настройки конвертации">
       <div class="workspace-scope">Рабочее пространство<strong>Документы компании</strong></div>
       <nav class="workspace-navigation" aria-label="Документы"><button type="button" class="workspace-nav selected" data-job-filter="all" aria-pressed="true">Все документы <span id="nav-all-count">0</span></button><button type="button" class="workspace-nav" data-job-filter="done" aria-pressed="false">Готовые <span id="nav-done-count">0</span></button></nav>
@@ -53,37 +93,6 @@
         <p id="update-status" role="status">Проверка версии…</p>
       </section>
     </aside>
-    <section class="results" aria-labelledby="screen-title">
-      <div class="results-toolbar">
-        <div><h1 id="screen-title">Документы</h1><p id="screen-subtitle">Документы и сканы в удобном формате</p></div>
-        <button type="button" class="button button-primary" id="add-files-button">Добавить файлы</button>
-      </div>
-      <div class="output-location" aria-label="Место сохранения результатов">
-        <div class="output-location-text"><span class="output-caption">Папка сохранения</span><p id="output-directory">Подключение…</p><p id="output-storage-error" class="output-storage-error" role="status" hidden></p></div>
-        <button type="button" class="button button-outline" id="output-change" aria-haspopup="dialog" aria-controls="output-dialog">Изменить</button>
-      </div>
-      <div class="document-legend" aria-label="Обозначения состояний документов">
-        <span class="legend-caption">Условные обозначения:</span>
-        <span><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg><span><strong>В очереди</strong> — ожидает обработки</span></span>
-        <span><svg class="legend-done" viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m7 12 3 3 7-7"/></svg><span><strong>OCR выполнен</strong> — результат готов к открытию</span></span>
-      </div>
-      <div class="document-list-toolbar">
-        <label class="document-search"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Найти документ</span><input id="job-search" type="search" placeholder="Найти документ" autocomplete="off" aria-controls="job-list"></label>
-        <div class="document-filters" role="group" aria-label="Состояние документов"><button type="button" class="document-filter selected" data-job-filter="all" aria-pressed="true">Все <span id="filter-all-count">0</span></button><button type="button" class="document-filter" data-job-filter="active" aria-pressed="false">В работе <span id="filter-active-count">0</span></button><button type="button" class="document-filter" data-job-filter="done" aria-pressed="false">Готовые <span id="filter-done-count">0</span></button></div>
-        <span class="document-sort">Сначала новые <svg viewBox="0 0 24 24" width="17" height="17" fill="none" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></span>
-      </div>
-      <div class="queue-toolbar">
-        <p id="queue-summary" role="status">Файлы появятся здесь после загрузки</p>
-        <div class="toolbar-actions"><button class="text-button" id="clear-button" title="Убрать строки из списка. Все файлы останутся в Истории" hidden>Очистить список</button><button type="button" class="button button-primary" id="download-all" title="Сохранить все готовые результаты в выбранную папку" hidden>Скачать всё</button></div>
-      </div>
-      <div id="connection-error" class="connection-error" role="status" hidden><span>Нет связи с локальным приложением.</span><button class="text-button" id="reconnect-button">Повторить</button></div>
-      <div class="job-list" id="job-list" role="list" aria-label="Очередь документов"></div>
-      <div class="empty-state" id="empty-state">
-        <svg viewBox="0 0 92 110" width="82" height="98" fill="none" aria-hidden="true"><path d="M15 3h39l25 25v76H15zM53 3v27h26M29 48h36M29 61h36M29 74h25" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 108h77" stroke="currentColor" stroke-width="2"/></svg>
-        <h3>Добавьте документы</h3><p>Перетащите файлы в область слева или выберите их на компьютере</p><span class="empty-detail">Текст, таблицы, формулы и изображения<br>в одном структурированном документе</span>
-      </div>
-      <div class="results-footnote" id="results-footnote">Готовые документы можно открыть или сохранить в выбранную папку</div>
-    </section>
   </main>
   <footer class="status-bar">
     <div class="local-status"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="1" stroke="currentColor" stroke-width="1.5"/><path d="M8 22h8M12 17v5" stroke="currentColor" stroke-width="1.5"/></svg><span>Обработка на этом компьютере</span></div>
@@ -108,8 +117,8 @@
     <div class="installed-footer"><span id="installed-summary">Выбранный формат и ресурсы документа</span></div>
   </dialog>
   <dialog id="log-dialog" class="log-dialog" aria-labelledby="log-title">
-    <div class="preview-header"><div><p class="preview-eyebrow">Полный лог конвертации</p><h2 id="log-title"></h2></div><button type="button" class="icon-button" id="close-log" aria-label="Закрыть лог">×</button></div>
-    <p class="log-message" id="log-message" role="status">Загрузка лога…</p>
+    <div class="preview-header"><div><p class="preview-eyebrow">Журнал обработки</p><h2 id="log-title"></h2></div><button type="button" class="icon-button" id="close-log" aria-label="Закрыть журнал">×</button></div>
+    <p class="log-message" id="log-message" role="status">Загрузка журнала…</p>
     <pre id="log-content" class="log-content" tabindex="0" hidden></pre>
     <textarea id="log-copy-fallback" class="log-copy-fallback" aria-label="Полный лог для ручного копирования" readonly hidden></textarea>
     <div class="preview-footer"><span id="log-caption">Полный текст без сокращений</span><button type="button" class="button button-primary" id="copy-log-button" disabled>Копировать лог</button></div>

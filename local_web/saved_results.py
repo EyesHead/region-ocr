@@ -440,11 +440,15 @@ class SavedResults:
                 shutil.rmtree(native_path(folder))
             native_path(log_path).unlink(missing_ok=True)
             self._delete_preview(record)
+            previous_records = self.records.copy()
+            previous_removed = self.removed_result_ids.copy()
             del self.records[ident]
+            self.removed_result_ids.add(ident)
             try:
                 self._persist()
             except Exception:
-                self.records[ident] = record
+                self.records = previous_records
+                self.removed_result_ids = previous_removed
                 raise
 
     def validate_delete_job(self, job_id):

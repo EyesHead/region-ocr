@@ -13,6 +13,43 @@ def _image_digest(image):
     except (ValueError,IndexError):return None
 
 
+def protected_source_graphic_cell(node,cell,geometry,page,ref,manifest):
+    """Keep a native diagram only under its exact source-byte/owner proof."""
+    if (not cell or not ref or cell.get('source_text_unreliable')
+            or (geometry or {}).get('hidden_ocr_direction_conflict')):
+        return False
+    images=node.find_all('img')
+    if not images or node.find(['svg','table']):return False
+    proofs=[*manifest.get('protected_source_graphic_assets',[]),
+            *(geometry or {}).get('source_graphic_assets',[])]
+    for image in images:
+        digest=_image_digest(image)
+        if digest is None or image.get('data-source-cell')!='true':return False
+        if not any(proof.get('source_image_sha256')==digest and proof.get('page')==page
+            and proof.get('ref')==ref and proof.get('row')==cell.get('row')
+            and proof.get('column')==cell.get('column')
+            and proof.get('bbox')==cell.get('bbox') for proof in proofs):return False
+    return True
+
+
+def register_protected_source_graphic_cell(node,cell,geometry,page,ref,manifest):
+    """Register existing native bytes as pictures without making another crop."""
+    if not protected_source_graphic_cell(node,cell,geometry,page,ref,manifest):return []
+    records=manifest.setdefault('typed_table_picture_assets',[])
+    proofs=[]
+    for image in node.find_all('img'):
+        digest=_image_digest(image)
+        proof=dict(page=page,source_ref=ref,label='Picture',
+            cell={key:cell[key] for key in ('row','column','row_span','column_span')},
+            source_cell_bbox=list(cell['bbox']),source_image_sha256=digest,
+            source_sha256=sha256(image['src'].encode()).hexdigest(),
+            method='original_pdf_image_bytes_in_verified_graphic_source_cell')
+        if proof not in records:records.append(proof)
+        image['data-table-content']='picture'
+        proofs.append(proof)
+    return proofs
+
+
 def record_source_cell_assets(geometry,page,ref,manifest,api):
     """Keep original positioned PDF image identity before table joins.
 
@@ -45,7 +82,7 @@ def record_source_cell_assets(geometry,page,ref,manifest,api):
 def _graphic_column_roles(table,profile):
     nodes=[n for n in table.find_all(['td','th']) if n.find_parent('table') is table]
     roles={}
-    role_pattern=re.compile(r'цветографическ\w*\s+изображен\w*|геометрическ\w*\s+форм\w*|эскиз\w*|схем\w*|черт[её]ж\w*',re.I)
+    role_pattern=re.compile(r'\bизображен\w*|цветографическ\w*\s+изображен\w*|геометрическ\w*\s+форм\w*|эскиз\w*|схем\w*|черт[её]ж\w*',re.I)
     excluded_pattern=re.compile(r'формул|уравнен|математическ|выражени',re.I)
     for node,position in zip(nodes,profile['cells']):
         if not position.get('header'):continue
@@ -87,7 +124,8 @@ def protect_source_graphic_assets(fragment,geometry,page,ref,manifest,api,captio
         if same_grid and adjacent and continued and old.get('roles'):
             roles=old['roles'];inherited=old['ref']
             caption_id=caption_id or old.get('caption_id','')
-    contexts.append(dict(page=page,ref=ref,x_grid=list(columns),roles=roles,caption_id=caption_id))
+    contexts.append(dict(page=page,ref=ref,x_grid=list(columns),roles=roles,caption_id=caption_id,
+                         caption=caption,inherited_from=inherited))
     assets={}
     for asset in manifest.get('source_cell_image_assets',[]):
         if asset['ref']==ref:assets.setdefault((asset['row'],asset['column'],asset['source_image_sha256']),asset)

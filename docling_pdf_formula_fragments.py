@@ -65,6 +65,26 @@ def fraction_bar_context(data, entry, source):
         if not box[0]-.1*size<=center<=box[2]+.1*size:continue
         if -.08*gs<=box[1]-b[3]<=1.2*gs:above.append(g)
         if -.08*gs<=b[1]-box[3]<=1.2*gs:below.append(g)
+    # A measured index belongs to its base even when its font box slightly
+    # crosses the bar. Never borrow an unproved neighboring script glyph.
+    glyph_key=lambda g:(g['text'],tuple(g['bbox']))
+    available={glyph_key(g):g for g in glyphs}
+    for items,role in ((above,'numerator'),(below,'denominator')):
+        owned={glyph_key(g) for g in items}
+        for line in source.get('lines',[]):
+            for script in line.get('source_scripts',[]):
+                group=script.get('glyphs',[])
+                if (script.get('method')!='source_glyph_size_text_origin_and_adjacent_base' or not group
+                        or glyph_key(group[0]) not in owned
+                        or any(glyph_key(g) not in available for g in group)):
+                    continue
+                boxes=[g['bbox'] for g in group]
+                if any(not box[0]-.1*size <= (b[0]+b[2])/2 <= box[2]+.1*size for b in boxes):continue
+                if role=='numerator' and max(b[3] for b in boxes)>box[3]+.1*size:continue
+                if role=='denominator' and min(b[1] for b in boxes)<box[1]-.1*size:continue
+                for g in group:
+                    if glyph_key(g) not in owned:
+                        items.append(available[glyph_key(g)]);owned.add(glyph_key(g))
     if not above or not below:return None
     literal=lambda items:''.join(g['text'] for g in sorted(items,key=lambda g:g['bbox'][0]))
     numerator,denominator=literal(above),literal(below)
@@ -74,6 +94,100 @@ def fraction_bar_context(data, entry, source):
         numerator_glyphs=[dict(text=g['text'],bbox=g['bbox']) for g in above],
         denominator_glyphs=[dict(text=g['text'],bbox=g['bbox']) for g in below],
         rule_ink_bbox=[int(xx.min()),int(yy.min()),int(xx.max()+1),int(yy.max()+1)])
+
+
+def graft_source_fraction_fragment(fragment, recognized, source, entries, api):
+    """Insert one proved OCR fraction while retaining surrounding native HTML.
+
+    The numerator and denominator must occupy complete, separate native
+    lines around a measured raster bar. The OCR prefix supplies no text.
+    """
+    import base64
+    from collections import Counter
+    from copy import deepcopy
+    from hashlib import sha256
+    from bs4 import BeautifulSoup
+
+    if not source or source.get('source_text_unreliable') or len(entries) != 1:
+        return None
+    lines = source.get('lines', [])
+    expected = '<br/>'.join(line.get('html', '') for line in lines)
+    canonical = lambda value: str(BeautifulSoup(value, 'html.parser'))
+    if canonical(expected) != canonical(fragment):
+        return None  # Never discard a newer editable fragment or its markup.
+    original = BeautifulSoup(fragment, 'html.parser')
+    images = original.find_all('img')
+    if len(images) != 1 or images[0].get('data-source-cell') != 'true':
+        return None
+    uri = images[0].get('src', '')
+    if not re.match(r'^data:image/[^;]+;base64,', uri):
+        return None
+    try:
+        data = base64.b64decode(uri.split(',', 1)[1], validate=True)
+        evidence = fraction_bar_context(data, entries[0], source)
+    except (ValueError, OSError):
+        return None
+    if not evidence:
+        return None
+    candidate = BeautifulSoup(recognized, 'html.parser')
+    fractions = candidate.find_all('mfrac')
+    if len(fractions) != 1:
+        return None
+    fraction = fractions[0]
+    terms = fraction.find_all(recursive=False)
+    if len(terms) != 2 or fraction.find(['mfrac', 'msqrt', 'mroot', 'mtable']):
+        return None
+    if any(api.cell_text_key(node.get_text()) != api.cell_text_key(evidence[name])
+           for node, name in zip(terms, ('numerator', 'denominator'))):
+        return None
+
+    owned_lines = []
+    for role in ('numerator', 'denominator'):
+        glyphs = evidence[role + '_glyphs']
+        left = min(g['bbox'][0] for g in glyphs)
+        right = max(g['bbox'][2] for g in glyphs)
+        height = max(g['bbox'][3]-g['bbox'][1] for g in glyphs)
+        baseline = max(g['bbox'][3] for g in glyphs if g['bbox'][3]-g['bbox'][1]>=height*.9)
+        matches = [index for index, line in enumerate(lines)
+            if api.cell_text_key(line.get('text', '')) == api.cell_text_key(evidence[role])
+            and abs(line.get('x0', left) - left) <= line['size'] * .1
+            and abs(line.get('x1', right) - right) <= line['size'] * .1
+            and abs(line['y'] - baseline) <= line['size'] * .1
+            and not BeautifulSoup(line.get('html', ''), 'html.parser').find('img')]
+        if len(matches) != 1:
+            return None
+        from docling_pdf_native_scripts import script_terms
+        from docling_pdf_text_cells import _source_script_math
+        native = BeautifulSoup(lines[matches[0]]['html'], 'html.parser')
+        approved = _source_script_math(native, source.get('glyphs', []), lines[matches[0]].get('source_scripts', []))
+        if (any(id(node) not in approved for node in native.find_all('math'))
+                or script_terms(str(native)) != script_terms(str(terms[len(owned_lines)]))):
+            return None
+        owned_lines.append(matches[0])
+    owners = [index for index, line in enumerate(lines)
+              if len(BeautifulSoup(line.get('html', ''), 'html.parser').find_all('img')) == 1]
+    if (len(owners) != 1 or len(set(owned_lines + owners)) != 3
+            or not owned_lines[0] < owners[0] < owned_lines[1]):
+        return None
+    wrapper = BeautifulSoup('', 'html.parser')
+    math = wrapper.new_tag('math', attrs={'display': 'inline', 'xmlns': 'http://www.w3.org/1998/Math/MathML'})
+    math.append(deepcopy(fraction))
+    owner = BeautifulSoup(lines[owners[0]]['html'], 'html.parser')
+    owner.img.replace_with(math)
+    result = '<br/>'.join(str(owner) if index == owners[0] else line['html']
+                         for index, line in enumerate(lines) if index not in owned_lines)
+    payload = lambda value: Counter(api.cell_text_key(BeautifulSoup(value, 'html.parser').get_text()))
+    if payload(result) != payload(fragment) or BeautifulSoup(result, 'html.parser').find('img'):
+        return None
+    bounds = [*evidence['numerator_glyphs'], *evidence['denominator_glyphs'], dict(bbox=evidence['bbox'])]
+    proof = dict(method='native_lines_with_exact_ocr_fraction_on_proved_source_bar',
+        source_fraction_bbox=[min(g['bbox'][0] for g in bounds), min(g['bbox'][1] for g in bounds),
+                              max(g['bbox'][2] for g in bounds), max(g['bbox'][3] for g in bounds)],
+        numerator=evidence['numerator'], denominator=evidence['denominator'],
+        source_bar_bbox=evidence['bbox'], native_prefix_preserved=True,
+        source_html_sha256=sha256(fragment.encode()).hexdigest(),
+        ocr_fraction_sha256=sha256(str(fraction).encode()).hexdigest())
+    return result, proof
 
 
 def formula_cell_parts(source, entries):

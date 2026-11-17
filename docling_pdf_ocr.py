@@ -6,7 +6,15 @@ import math
 
 
 def _layout_error(item, output):
-    if output is None or output.error:
+    if output is None:
+        return 'inference_failed_or_empty'
+    if item.prompt_type == 'block' and output.raw:
+        from surya.recognition import _detect_repeat_loop
+        if _detect_repeat_loop(output.raw):
+            return 'repeating_output'
+        if item.max_tokens and output.token_count >= item.max_tokens:
+            return 'output_token_limit'
+    if output.error:
         return 'inference_failed_or_empty'
     if not output.raw:
         from surya.common.blank import is_blank_region
@@ -26,6 +34,28 @@ def _layout_error(item, output):
         except (ValueError, TypeError, KeyError) as error:
             return f'invalid_full_page: {error}'
     return None
+
+
+def _complete_block_output(item, output, request, diagnostic):
+    """Correct an underestimated block length without extending decoder loops."""
+    reason = _layout_error(item, output)
+    if item.prompt_type != 'block' or reason != 'output_token_limit':
+        return item, output, reason
+    from surya.settings import settings
+    ceiling = settings.SURYA_MAX_TOKENS_BLOCK_CEILING
+    while reason == 'output_token_limit' and item.max_tokens < ceiling:
+        previous = item.max_tokens
+        item = replace(item, max_tokens=min(ceiling, previous*4), temperature=0.0)
+        diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
+                   image_size=list(item.image.size), metadata=item.metadata,
+                   previous_max_tokens=previous, max_tokens=item.max_tokens,
+                   method='underestimated_block_output_budget')
+        repeated = request([item])
+        if len(repeated) != 1:
+            raise RuntimeError('Local block budget retry result count mismatch')
+        output = repeated[0]
+        reason = _layout_error(item, output)
+    return item, output, reason
 
 
 def _layout_parts(image):
@@ -50,7 +80,7 @@ def _layout_parts(image):
 
 
 def recovering_generate(batch, request, diagnostic):
-    """Retry failed requests once; split malformed layout at source white gutters.
+    """Complete truncated blocks; retry errors and split malformed layout.
 
     No document/page/element count budget is imposed. A persistent error is
     raised with context instead of returning an apparently successful blank OCR.
@@ -60,19 +90,25 @@ def recovering_generate(batch, request, diagnostic):
         raise RuntimeError('Local inference result count mismatch')
     recovered = []
     for item, output in zip(batch, outputs, strict=True):
-        reason = _layout_error(item, output)
+        retry, output, reason = _complete_block_output(item, output, request, diagnostic)
         if not reason:
+            if retry.max_tokens != item.max_tokens:
+                diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
+                           image_size=list(item.image.size), method='completed_block_output_budget',
+                           max_tokens=retry.max_tokens)
             recovered.append(output)
             continue
-        diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
-                   image_size=list(item.image.size), metadata=item.metadata)
-        retry = item
-        if item.prompt_type == 'layout':
-            from surya.inference.prompts import LAYOUT_JSON_SCHEMA
-            retry = replace(item, guided_json=LAYOUT_JSON_SCHEMA, temperature=0.0)
-        repeated = request([retry])
-        output = repeated[0] if len(repeated) == 1 else None
-        reason = _layout_error(retry, output)
+        # Repeating the same greedy loop or a known exhausted budget cannot
+        # complete its transcription. Keep those failures explicit.
+        if reason not in {'output_token_limit', 'repeating_output'}:
+            diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
+                       image_size=list(item.image.size), metadata=item.metadata)
+            if item.prompt_type == 'layout':
+                from surya.inference.prompts import LAYOUT_JSON_SCHEMA
+                retry = replace(retry, guided_json=LAYOUT_JSON_SCHEMA, temperature=0.0)
+            repeated = request([retry])
+            output = repeated[0] if len(repeated) == 1 else None
+            retry, output, reason = _complete_block_output(retry, output, request, diagnostic)
         if not reason:
             diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
                        image_size=list(item.image.size), method='single_request_retry')

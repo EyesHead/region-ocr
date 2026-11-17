@@ -236,7 +236,14 @@ def _rewrite_refs(soup, mapping):
 
 
 def _merge(soup, first, current, old_grid, new_grid):
+    source_owner = current.get('id')
     _remap_header_ids(soup, first, current, old_grid, new_grid)
+    target_owner = first.get('id')
+    if source_owner and target_owner and source_owner != target_owner:
+        # Notes outside either fragment still belong to the retained table.
+        # Source refs and clause/header ownership are historical evidence.
+        for node in soup.find_all(attrs={'data-annotation-owner': source_owner}):
+            node['data-annotation-owner'] = target_owner
     # A footer of an intermediate piece precedes the later body in source order.
     for footer in first.find_all('tfoot', recursive=False):
         footer.name = 'tbody'

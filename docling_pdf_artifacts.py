@@ -10,6 +10,39 @@ import re
 import unicodedata
 
 
+def primary_body_text(item, region, records, repeated_pages, api):
+    """Keep a unique primary Text block mislabelled as running furniture."""
+    if len(repeated_pages) > 1 or re.fullmatch(
+            r'\s*(?:(?:Лист|Стр(?:аница)?\.?|Page)\s*(?:№\s*)?)?'
+            r'(?:\d{1,5}|[IVXLCDMivxlcdm]{1,8})\s*', item.text):
+        return None
+    page, box = region
+    key = api.furniture_key(item.text)
+    if not key:
+        return None
+    matches = []
+    for record in records:
+        bounds = record.get('bbox')
+        if (record.get('page_no') != page or not bounds or len(bounds) != 4
+                or any(abs(a-b) > 1 for a, b in zip(box, bounds))):
+            continue
+        text = record.get('text')
+        if not isinstance(text, str):
+            continue
+        if api.furniture_key(text) != key:
+            continue
+        label = str(record.get('label', '')).casefold().replace('-', '').replace('_', '')
+        if label in {'pageheader', 'pagefooter'}:
+            return None  # An explicit primary furniture classification still owns it.
+        if label == 'text':
+            matches.append(record)
+    if len(matches) != 1:
+        return None
+    return dict(ref=item.self_ref, page=page, bbox=list(box),
+                source_record_sha256=hashlib.sha256(matches[0].get('html', '').encode()).hexdigest(),
+                reason='unique_primary_text_preserved_over_secondary_layout_furniture')
+
+
 def _key(text):
     return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold()
                    if not c.isspace() and c != '\u00ad')

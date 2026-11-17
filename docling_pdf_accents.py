@@ -5,6 +5,7 @@ an accent may have a formula-sized canvas over native Q, its index and number.
 Rendering that canvas as a separate formula clips and duplicates native text.
 """
 from io import BytesIO
+from functools import lru_cache
 import math
 import re
 
@@ -140,6 +141,29 @@ def restore_raster_accents(reader, page_no, glyphs, objects, api):
     return proofs
 
 
+@lru_cache(maxsize=1)
+def _extended_symbol_encoding():
+    """Read Adobe's Symbol byte slots from the bundled standard font metrics."""
+    from importlib.resources import files
+    from pdfminer.encodingdb import name2unicode
+
+    try:
+        metrics=files('docling_parse').joinpath('pdf_resources','fonts','standard','Symbol.afm').read_text('ascii')
+    except (ImportError,OSError,UnicodeError):
+        return {}
+    encoding={}
+    for code,name in re.findall(r'^C (\d+)\s*;[^\r\n]*?\bN (\w+)\s*;',metrics,re.M):
+        slot=int(code)
+        if not 0x80<=slot<=0xFE:continue
+        try:value=name2unicode(name)
+        except KeyError:continue
+        # Extender pieces without a public Unicode character retain their
+        # original slot; they must not become a guessed complete delimiter.
+        if len(value)==1 and not 0xE000<=ord(value)<=0xF8FF:
+            encoding[chr(slot)]=value
+    return encoding
+
+
 def decode_symbol_glyphs(chars):
     """Decode Microsoft's F000 Symbol cmap only for a declared Symbol font.
 
@@ -157,8 +181,11 @@ def decode_symbol_glyphs(chars):
         text=glyph.get('text','')
         family=re.sub(r'^[A-Z]{6}\+','',glyph.get('fontname',''))
         if (re.fullmatch(r'Symbol(?:MT)?(?:-(?:Regular|Bold|Italic|BoldItalic))?',family) and len(text)==1
-                and 0xF020 <= ord(text) <= 0xF07E and chr(ord(text)-0xF000) in encoding):
-            glyph=dict(glyph,text=encoding[chr(ord(text)-0xF000)],source_unicode=text,
-                       unicode_method='declared_legacy_symbol_encoding')
+                and 0xF020 <= ord(text) <= 0xF0FE):
+            slot=chr(ord(text)-0xF000)
+            value=encoding.get(slot) if ord(slot)<0x80 else _extended_symbol_encoding().get(slot)
+            if value is not None:
+                glyph=dict(glyph,text=value,source_unicode=text,
+                           unicode_method='declared_legacy_symbol_encoding')
         result.append(glyph)
     return result

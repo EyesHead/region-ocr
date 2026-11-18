@@ -31,6 +31,8 @@
 
 Surya 2, включая используемые GGUF, имеет modified OpenRAIL-M и **разрешена по этому исключению**. Код `surya-ocr==0.22.1` — Apache-2.0, отдельно от весов. Установленные настройки указывают `datalab-to/surya-ocr-2-gguf`, `surya-2.gguf` и `surya-2-mmproj.gguf`. Локальный snapshot: `6a3a4c30e5e74446d4f8b6afd05b2f2da970f470`. [Карточка GGUF](https://huggingface.co/datalab-to/surya-ocr-2-gguf), [README релиза 0.22.1](https://github.com/datalab-to/surya/blob/v0.22.1/README.md). Исключение для весов не является разрешением всего окружения или неподтверждённых других моделей Surya.
 
+В REGION OCR 1.9.0 используется `surya-ocr==0.24.0` под Apache-2.0. Установщик загружает `surya-2.5.gguf` и `surya-2.5-mmproj.gguf` из закреплённой ревизии `eb78671ae9af9bdddfac2e25507c55337b6098e2`. Условия modified OpenRAIL-M в этой ревизии совпадают с условиями проверенных весов Surya 2. [Релиз Surya 0.24.0](https://github.com/datalab-to/surya/releases/tag/v0.24.0) · [Лицензия GGUF Surya 2.5](https://huggingface.co/datalab-to/surya-ocr-2.5-gguf/blob/eb78671ae9af9bdddfac2e25507c55337b6098e2/LICENSE)
+
 ## Согласованные исключения для словаря и tqdm
 
 **По прямому решению пользователя от 2026-11-02 для этой программы постоянно разрешены словарные данные `pymorphy3-dicts-ru` под CC-BY-SA-3.0 и `tqdm` под MPL-2.0 AND MIT.** Это разрешение относится к указанным компонентам и не ограничено данным прогоном или проверенными номерами версий. Фактическая лицензия каждой новой версии по-прежнему проверяется. Другие CC-BY-SA/MPL-компоненты, включая certifi, этим решением не разрешены.

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "version": "1.8.12",
+  "version": "1.9.0",
   "python_version": "3.12.10",
   "python": {
     "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
@@ -843,11 +843,11 @@
     },
     {
       "name": "surya-ocr",
-      "version": "0.22.1",
-      "url": "https://files.pythonhosted.org/packages/1c/6a/5fb9e3526a18d70d4b4047f0efe553dc7e199664cf40722d07ec3ff35351/surya_ocr-0.22.1-py3-none-any.whl",
-      "filename": "surya_ocr-0.22.1-py3-none-any.whl",
-      "bytes": 191800,
-      "sha256": "f84cdba18b99cd8d010d19db8b89d79cdcd3d0cd4e3bdba52a473023ccd69a2d"
+      "version": "0.24.0",
+      "url": "https://files.pythonhosted.org/packages/31/47/af27bb14a90a4fbfc58d21c25346983ef5c1d52a77a0986322ae7aa14083/surya_ocr-0.24.0-py3-none-any.whl",
+      "filename": "surya_ocr-0.24.0-py3-none-any.whl",
+      "bytes": 103774,
+      "sha256": "4d4e79ff77cd3e7f2bbb66761ca1edc14eede995363d50ddbd22441f89e70189"
     },
     {
       "name": "sympy",
@@ -1082,16 +1082,16 @@
       "url": "https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx/resolve/7330ab7039123e46af2dc03154b9969aa412c61d/inference.onnx"
     },
     {
-      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/snapshots/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2-mmproj.gguf",
-      "bytes": 204986688,
-      "sha256": "98c0563673b1657ff6d021d1e5f04af06cbf61bb40c63ac613e8bb71b42fb2c0",
-      "url": "https://huggingface.co/datalab-to/surya-ocr-2-gguf/resolve/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2-mmproj.gguf"
+      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2.5-gguf/snapshots/eb78671ae9af9bdddfac2e25507c55337b6098e2/surya-2.5-mmproj.gguf",
+      "bytes": 207345920,
+      "sha256": "f245dbf784cf73683a273a37fefae0d0d7983b083a5d2fecf9309476f861f659",
+      "url": "https://huggingface.co/datalab-to/surya-ocr-2.5-gguf/resolve/eb78671ae9af9bdddfac2e25507c55337b6098e2/surya-2.5-mmproj.gguf?download=true"
     },
     {
-      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/snapshots/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2.gguf",
-      "bytes": 1266400864,
-      "sha256": "1f18abe17b1ed8b4e47ee9b1ad0e274c93daf5efbb6b29a04ff1712e37051e05",
-      "url": "https://huggingface.co/datalab-to/surya-ocr-2-gguf/resolve/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2.gguf"
+      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2.5-gguf/snapshots/eb78671ae9af9bdddfac2e25507c55337b6098e2/surya-2.5.gguf",
+      "bytes": 1180178976,
+      "sha256": "45fa3e587cf5a475f06e949fbe40e67b759dbcee1830e7effbcb172445d4b6bf",
+      "url": "https://huggingface.co/datalab-to/surya-ocr-2.5-gguf/resolve/eb78671ae9af9bdddfac2e25507c55337b6098e2/surya-2.5.gguf?download=true"
     },
     {
       "path": "models/huggingface/hub/models--docling-project--docling-layout-heron/snapshots/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/.gitattributes",
@@ -1180,8 +1180,8 @@
   ],
   "cache_files": [
     {
-      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/refs/main",
-      "text": "6a3a4c30e5e74446d4f8b6afd05b2f2da970f470"
+      "path": "models/huggingface/hub/models--datalab-to--surya-ocr-2.5-gguf/refs/main",
+      "text": "eb78671ae9af9bdddfac2e25507c55337b6098e2"
     },
     {
       "path": "models/huggingface/hub/models--docling-project--docling-layout-heron/refs/main",

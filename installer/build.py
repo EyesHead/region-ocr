@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VERSION = '1.8.12'
+VERSION = '1.9.0'
 
 
 def build(output):
@@ -54,9 +54,9 @@ def build(output):
                   'value="Switch.System.IO.UseLegacyPathHandling=false;Switch.System.IO.BlockLongPaths=false"/>'
                   '</runtime></configuration>')
         (work / 'app.config').write_text(config, encoding='utf-8')
-        (work / 'installer.manifest').write_text('''<?xml version="1.0" encoding="utf-8"?>
+        (work / 'installer.manifest').write_text(f'''<?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.8.12.0" name="EyesHead.RegionOCR.Setup"/>
+  <assemblyIdentity version="{VERSION}.0" name="EyesHead.RegionOCR.Setup"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
     <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
   </requestedPrivileges></security></trustInfo>
@@ -65,7 +65,7 @@ def build(output):
     <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
   </windowsSettings></application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1"><application>
-    <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/>
   </application></compatibility>
 </assembly>''', encoding='utf-8')
         exe = output / f'REGION-OCR-{VERSION}-Setup.exe'

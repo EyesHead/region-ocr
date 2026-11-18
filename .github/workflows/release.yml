@@ -56,6 +56,6 @@ jobs:
           $tag = "v$version"
           gh release view $tag --json tagName 2>$null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to overwrite it" }
-          $notes = "Убраны предупреждения о сверке с исходным PDF. Исправлены схлопывание строк в таблицах и распознавание вложенных дробей и корней. Обновление доступно через кнопку «Проверить обновления»."
+          $notes = "Surya 2.5 распознаёт PDF и изображения в локальном конвертере. Обновление через кнопку «Проверить обновления» устанавливает новые компоненты и сохраняет данные приложения."
           gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

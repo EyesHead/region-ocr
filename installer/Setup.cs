@@ -19,13 +19,13 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("REGION OCR — установка")]
 [assembly: AssemblyProduct("REGION OCR")]
-[assembly: AssemblyVersion("1.8.12.0")]
-[assembly: AssemblyFileVersion("1.8.12.0")]
+[assembly: AssemblyVersion("1.9.0.0")]
+[assembly: AssemblyFileVersion("1.9.0.0")]
 
 internal static class Setup
 {
     internal const string Product = "REGION OCR";
-    internal const string Version = "1.8.12";
+    internal const string Version = "1.9.0";
     internal const string Marker = ".region-ocr-install.json";
     internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\RegionOCR";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
@@ -267,12 +267,9 @@ internal static class Setup
             throw new InvalidDataException("Версия обновления должна быть новее установленной");
         string profile = Convert.ToString(marker["profile"]);
         if (profile != "cpu" && profile != "cu128") throw new InvalidDataException("Неизвестный профиль установки");
-        // Source-only updates reuse the exact installed dependency/model plan.
-        // A future dependency change requires the full installer rather than silently mixing ABIs.
         var oldPlan = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "installer", "install-plan.json")));
-        var newPlan = Plan(); oldPlan.Remove("version"); newPlan.Remove("version");
-        if (Json.Serialize(oldPlan) != Json.Serialize(newPlan))
-            throw new InvalidDataException("В этой версии изменились компоненты. Установите новую версию через полный установщик GitHub; текущая установка сохранена.");
+        var newPlan = Plan();
+        bool updateSurya = SuryaUpdateRequired(oldPlan, newPlan);
         status("Ожидание закрытия конвертера…");
         try
         {
@@ -304,17 +301,31 @@ internal static class Setup
         changes[Path.Combine(folder, "Uninstall.exe")] = File.ReadAllBytes(Assembly.GetExecutingAssembly().Location);
         marker["version"] = Version;
         changes[Path.Combine(folder, Marker)] = new UTF8Encoding(false).GetBytes(Json.Serialize(marker));
-        // Keep rollback bytes in memory: never copy user documents or create backup folders.
+        // The source payload is small enough to roll back in memory.
         var before = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var written = new List<string>();
+        var componentRollback = new List<Action>();
         foreach (string file in changes.Keys)
         {
             ValidateUpdatePath(folder, file);
             before.Add(file, File.Exists(file) ? File.ReadAllBytes(file) : null);
         }
-        status("Обновление файлов приложения…");
+        string staging = null;
+        bool cleanupStaging = true;
         try
         {
+            if (updateSurya)
+            {
+                staging = SafePath(folder, ".region-ocr-update-" + Guid.NewGuid().ToString("N"));
+                ValidateUpdatePath(folder, staging);
+                Directory.CreateDirectory(staging);
+                var componentPaths = new List<string>(SuryaUpdatePaths(newPlan));
+                PrepareSuryaUpdate(folder, staging, profile, changes, componentPaths, status);
+                EnsureApplicationClosed(folder);
+                foreach (string relative in componentPaths)
+                    ReplaceSuryaPath(folder, staging, relative, componentRollback);
+            }
+            status("Обновление файлов приложения…");
             foreach (var change in changes)
             {
                 ValidateUpdatePath(folder, change.Key);
@@ -328,13 +339,160 @@ internal static class Setup
         }
         catch
         {
-            written.Reverse();
-            foreach (string file in written)
-                if (before[file] == null) File.Delete(file); else File.WriteAllBytes(file, before[file]);
+            try
+            {
+                written.Reverse();
+                foreach (string file in written)
+                    if (before[file] == null) File.Delete(file); else File.WriteAllBytes(file, before[file]);
+            }
+            finally
+            {
+                // Keep the component backups if rollback itself fails.
+                cleanupStaging = false;
+                componentRollback.Reverse();
+                foreach (Action undo in componentRollback) undo();
+                cleanupStaging = true;
+            }
             throw;
+        }
+        finally
+        {
+            if (cleanupStaging && staging != null && Directory.Exists(staging)) DeleteTree(staging);
         }
         status("Обновление установлено. Запуск конвертера…");
         Process.Start(new ProcessStartInfo(Path.Combine(folder, "DocumentConverter.exe"), restartArguments) { WorkingDirectory = folder, UseShellExecute = false, CreateNoWindow = true });
+    }
+
+    const string OldSuryaCache = "models/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/";
+    const string NewSuryaCache = "models/huggingface/hub/models--datalab-to--surya-ocr-2.5-gguf/";
+    const string SitePackages = "runtime/Lib/site-packages/";
+
+    static string SuryaPackageVersion(Dictionary<string, object> plan)
+    {
+        foreach (Dictionary<string, object> entry in (IEnumerable)plan["packages"])
+            if ((string)entry["name"] == "surya-ocr") return (string)entry["version"];
+        return null;
+    }
+
+    static string ComparablePlan(Dictionary<string, object> plan, bool omitSurya)
+    {
+        var comparable = new Dictionary<string, object>(plan);
+        comparable.Remove("version");
+        if (omitSurya)
+        {
+            foreach (string section in new[] { "packages", "models", "cache_files" })
+            {
+                var kept = new List<Dictionary<string, object>>();
+                foreach (Dictionary<string, object> entry in (IEnumerable)plan[section])
+                {
+                    bool surya = section == "packages" ? (string)entry["name"] == "surya-ocr" :
+                        ((string)entry["path"]).StartsWith(OldSuryaCache, StringComparison.Ordinal) ||
+                        ((string)entry["path"]).StartsWith(NewSuryaCache, StringComparison.Ordinal);
+                    if (!surya) kept.Add(entry);
+                }
+                comparable[section] = kept;
+            }
+        }
+        return Json.Serialize(comparable);
+    }
+
+    static bool SuryaUpdateRequired(Dictionary<string, object> oldPlan, Dictionary<string, object> newPlan)
+    {
+        if (ComparablePlan(oldPlan, false) == ComparablePlan(newPlan, false)) return false;
+        if (SuryaPackageVersion(oldPlan) == "0.22.1" && SuryaPackageVersion(newPlan) == "0.24.0" &&
+            ComparablePlan(oldPlan, true) == ComparablePlan(newPlan, true)) return true;
+        throw new InvalidDataException("Установщик не может обновить изменённые компоненты этой версии автоматически. Текущая установка сохранена.");
+    }
+
+    static IEnumerable<string> SuryaUpdatePaths(Dictionary<string, object> plan)
+    {
+        yield return SitePackages + "surya";
+        yield return SitePackages + "surya_ocr-0.22.1.dist-info";
+        yield return SitePackages + "surya_ocr-0.24.0.dist-info";
+        foreach (string name in new[] { "surya_detect", "surya_gui", "surya_layout", "surya_ocr", "surya_screenshot", "surya_table" })
+            yield return "runtime/Scripts/" + name + ".exe";
+        foreach (string section in new[] { "models", "cache_files" })
+            foreach (Dictionary<string, object> entry in (IEnumerable)plan[section])
+            {
+                string path = (string)entry["path"];
+                if (path.StartsWith(NewSuryaCache, StringComparison.Ordinal)) yield return path;
+            }
+    }
+
+    static void PrepareSuryaUpdate(string folder, string staging, string profile,
+                                   Dictionary<string, byte[]> changes, IEnumerable<string> componentPaths,
+                                   Action<string> status)
+    {
+        string installer = SafePath(staging, "installer");
+        Directory.CreateDirectory(installer);
+        foreach (string name in new[] { "bootstrap.py", "install-plan.json" })
+            File.WriteAllBytes(SafePath(installer, name), changes[SafePath(folder, "installer/" + name)]);
+
+        string python = SafePath(folder, "runtime/python.exe");
+        ValidateUpdatePath(folder, python);
+        var info = new ProcessStartInfo(python, "-B -s -u " + Quote(SafePath(installer, "bootstrap.py")) + " " + Quote(staging) + " " + profile + " --surya-update");
+        info.WorkingDirectory = staging; info.UseShellExecute = false; info.CreateNoWindow = true;
+        info.RedirectStandardOutput = true; info.RedirectStandardError = true;
+        info.StandardOutputEncoding = info.StandardErrorEncoding = Encoding.UTF8;
+        info.EnvironmentVariables["PYTHONUTF8"] = "1";
+        info.EnvironmentVariables["PYTHONNOUSERSITE"] = "1";
+        info.EnvironmentVariables.Remove("PYTHONPATH");
+        string errorMessage = null;
+        status("Загрузка компонентов Surya 2.5…");
+        using (var process = new Process { StartInfo = info })
+        {
+            process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (String.IsNullOrWhiteSpace(e.Data)) return;
+                try
+                {
+                    var line = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(e.Data);
+                    if (line != null && line.ContainsKey("error")) errorMessage = (string)line["error"];
+                    if (line != null && line.ContainsKey("message")) status((string)line["message"]);
+                }
+                catch (ArgumentException) { }
+            };
+            process.Start();
+            process.BeginOutputReadLine();
+            Task<string> errors = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+            if (process.ExitCode != 0) throw new IOException(errorMessage ?? errors.Result.Trim());
+        }
+
+        foreach (string path in componentPaths)
+        {
+            if (path == SitePackages + "surya_ocr-0.22.1.dist-info" || path == "runtime/Scripts/surya_detect.exe" ||
+                path == "runtime/Scripts/surya_screenshot.exe") continue;
+            string prepared = SafePath(staging, path);
+            if (!File.Exists(prepared) && !Directory.Exists(prepared))
+                throw new IOException("Не подготовлен компонент обновления: " + path);
+        }
+    }
+
+    static void ReplaceSuryaPath(string folder, string staging, string relative, List<Action> rollback)
+    {
+        string target = SafePath(folder, relative), prepared = SafePath(staging, relative);
+        string backup = SafePath(staging, "previous/" + relative);
+        ValidateUpdatePath(folder, target);
+        if (Directory.Exists(target) || File.Exists(target))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(backup));
+            bool directory = Directory.Exists(target);
+            MoveSuryaPath(target, backup, directory);
+            rollback.Add(() => MoveSuryaPath(backup, target, directory));
+        }
+        if (Directory.Exists(prepared) || File.Exists(prepared))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(target));
+            bool directory = Directory.Exists(prepared);
+            MoveSuryaPath(prepared, target, directory);
+            rollback.Add(() => MoveSuryaPath(target, prepared, directory));
+        }
+    }
+
+    static void MoveSuryaPath(string from, string to, bool directory)
+    {
+        if (directory) Directory.Move(from, to); else File.Move(from, to);
     }
 
     static void ValidateUpdatePath(string folder, string target)
@@ -540,7 +698,7 @@ internal sealed class Wizard : Form
                 }
                 DownloadStatus(target, "Загрузка " + name + " с " + host + ": попытка " + (attempt + 1) + "/8, сохранено " + offset + " байт.");
                 var request = (HttpWebRequest)WebRequest.Create((string)item["url"]);
-                request.UserAgent = "REGION-OCR-Setup/1.8.5"; request.Timeout = request.ReadWriteTimeout = 180000;
+                request.UserAgent = "REGION-OCR-Setup/" + Setup.Version; request.Timeout = request.ReadWriteTimeout = 180000;
                 if (offset > 0) request.AddRange(offset);
                 using (token.Register(request.Abort))
                 using (var response = (HttpWebResponse)request.GetResponse())

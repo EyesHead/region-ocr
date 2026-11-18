@@ -8,7 +8,7 @@
 docling==2.141.0
 docling-core==2.103.1
 docling-surya-ocr==0.2.0
-surya-ocr==0.22.1
+surya-ocr==0.24.0
 torch==2.8.0
 torchvision==0.23.0
 

@@ -7,7 +7,7 @@ NVIDIA: install CUDA PyTorch before the other requirements.
 Default launch: python convert_docling.py
 
 Modes:
-  local : Surya 2 plugin with automatic CUDA / Metal / CPU setup (default)
+  local : Surya 2.5 with automatic CUDA / Metal / CPU setup (default)
   ai    : OpenAI vision API; prompts visibly for a missing API key
 
 Whole-page orientation uses PP-LCNet on CPU through ONNX Runtime, with
@@ -45,6 +45,9 @@ from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
 
 from portable_runtime import configure_runtime
+from docling_surya_profile import (
+    SURYA25_VERSION, configure_surya25_backend, configure_surya25_model,
+)
 configure_runtime()
 
 
@@ -132,7 +135,6 @@ DATA_DIR = SCRIPT_DIR
 if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-SURYA_VERSIONS = {'docling-surya-ocr': '0.2.0', 'surya-ocr': '0.22.1'}
 SURYA_INSTALL = 'python -m pip install -r requirements-docling-surya.txt'
 
 
@@ -899,13 +901,14 @@ def resolve_device():
 
 def configure_surya(args):
     """Set Surya settings BEFORE plugin discovery imports surya.settings."""
-    for package, expected in SURYA_VERSIONS.items():
+    for package, expected in (('docling-surya-ocr', '0.2.0'), ('surya-ocr', SURYA25_VERSION)):
         try:
             installed = version(package)
         except PackageNotFoundError:
             installed = None
         if installed != expected:
             raise ValueError(f"Requires {package}=={expected} (installed: {installed}). {SURYA_INSTALL}")
+    configure_surya25_model(SCRIPT_DIR)
     os.environ["TORCH_DEVICE"] = args.device
     os.environ["SURYA_INFERENCE_BACKEND"] = SURYA_BACKEND
     os.environ["SURYA_INFERENCE_PARALLEL"] = str(OCR_BATCH_SIZE)
@@ -915,7 +918,6 @@ def configure_surya(args):
     # server directly, even when the computer uses a VPN/proxy for the internet.
     bypass = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
     os.environ["NO_PROXY"] = ",".join(filter(None, (bypass, "localhost", "127.0.0.1", "::1")))
-    os.environ.pop("SURYA_INFERENCE_URL", None)
     name = "llama-server.exe" if os.name == "nt" else "llama-server"
     candidates = [SCRIPT_DIR / ".runtime" / "llamacpp" / name]
     cached = runtime_directory(args.device)
@@ -952,13 +954,14 @@ def configure_surya(args):
     os.environ["LLAMA_CPP_NO_MMPROJ_OFFLOAD"] = "true" if args.device == "cpu" else "false"
     # Keep the vision encoder and KV cache within a laptop's memory budget.
     os.environ["LLAMA_CPP_EXTRA_ARGS"] = f"--threads {NUM_THREADS}"
-    print(f"Surya 2 runtime: {binary}; device: {args.device}", flush=True)
+    configure_surya25_backend()
+    print(f"Surya 2.5 runtime: {binary}; device: {args.device}", flush=True)
     if os.name == "nt":
         from surya.inference.backends import spawn
 
         def stop_windows_server(pid, name):
-            # Surya 0.22.1's POSIX os.kill(pid, 0) polling is not a safe
-            # liveness check on Windows. Its atexit owner still decides
+            # POSIX os.kill(pid, 0) polling is not a safe liveness check on
+            # Windows. Surya's atexit owner still decides
             # which server may be stopped; only the stop primitive differs.
             # taskkill can hang while waiting for a process tree to exit. Do
             # not let that escape Surya's atexit callback; terminate the known
@@ -1002,6 +1005,10 @@ def configure_surya(args):
                       f"and direct termination failed ({exc})", file=sys.stderr)
 
         spawn._stop_process = stop_windows_server
+
+    from docling_backend_health import guard_managed_process_cleanup
+    from surya.inference.backends import spawn
+    guard_managed_process_cleanup(spawn)
 
 
 def runtime_directory(device):
@@ -2160,8 +2167,7 @@ def generate_local_ocr_requests(batch, request, diagnostic):
 
 def local_surya_backend(model):
     """Bound local VLM requests, including retries hidden inside Surya's adapter."""
-    from surya.inference.backends.openai_client import chat_completions_batch
-    from docling_backend_health import request_with_backend_recovery
+    from docling_backend_health import request_local_ocr
 
     backend = model._get_runtime()._manager.backend
     if not getattr(backend, "_convert_docling_bounded", False):
@@ -2173,19 +2179,22 @@ def local_surya_backend(model):
                 if timeout>LOCAL_REQUEST_SECONDS:
                     diagnostic_event('OCR_REQUEST_TOKEN_TIME_ALLOWANCE',seconds=timeout,
                         max_tokens=max(item.max_tokens or 2048 for item in items))
-                outputs = request_with_backend_recovery(backend, lambda: chat_completions_batch(
-                    items, client=backend._client.with_options(max_retries=0),
-                    model_name=backend.handle.model_name, timeout=timeout,
-                    max_workers=1, max_retries=0, request_logprobs_default=False), diagnostic_event)
+                outputs = request_local_ocr(backend, items, timeout, diagnostic_event)
                 from surya.recognition import _detect_repeat_loop
                 for item, output in zip(items, outputs):
-                    reason = ('output_token_limit' if item.max_tokens and output.token_count >= item.max_tokens
+                    at_limit = (getattr(output, 'finish_reason', None) == 'length'
+                                or item.max_tokens and output.token_count >= item.max_tokens)
+                    reason = ('output_token_limit' if at_limit
                               else 'repeating_output' if _detect_repeat_loop(output.raw) else None)
                     if reason:
                         output.error = True
                         diagnostic_event('OCR_RESPONSE_REQUIRES_RECOVERY', reason=reason,
                             prompt_type=item.prompt_type, tokens=output.token_count,
                             max_tokens=item.max_tokens, metadata=item.metadata)
+                    elif item.prompt_type == 'block' and not output.error and output.raw:
+                        # Some PDF crop readers consume raw block HTML without a predictor.
+                        from surya.inference.parsers import clean_block_html
+                        output.raw = clean_block_html(output.raw)
                 return outputs
             return generate_local_ocr_requests(batch, request, diagnostic_event)
         backend.generate = generate
@@ -9500,7 +9509,7 @@ def parse_args(argv=None):
     p.add_argument("--pages", metavar="START-END", default=None,
                    help="страницы PDF, например 1-10 (по умолчанию все)")
     p.add_argument("--mode", choices=("ai", "local"), default="local",
-                   help="local: локальная Surya 2 (по умолчанию); ai: OpenAI")
+                   help="local: локальная Surya 2.5 (по умолчанию); ai: OpenAI")
     p.add_argument("--format", choices=("html",), default="html", help="формат результата (html)")
     p.add_argument("--api-key", default=None, help="ключ OpenAI; в режиме ai при отсутствии запрашивается видимым вводом")
     p.add_argument("--input", dest="selected_inputs", nargs="+", type=Path,

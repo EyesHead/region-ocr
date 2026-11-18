@@ -45,82 +45,11 @@ def borrow_manager_class(owner):
     return SessionManager
 
 
-class ManagedProcessCleanup:
-    """Constrain Surya's PID-only atexit callbacks to proven session children."""
-    def __init__(self, spawn):
-        self.spawn = spawn
-        self.births = {}
-        self.original_write = spawn._write_sentinel
-        self.original_delete = spawn._delete_sentinel
-        self.stop_callback = self.stop
-        self.refresh_stop()
-        spawn._write_sentinel = self.write
-        spawn._delete_sentinel = self.delete
-
-    def refresh_stop(self):
-        # configure_surya replaces the Windows primitive on every CLI run.
-        if self.spawn._stop_process is not self.stop_callback:
-            self.primitive = self.spawn._stop_process
-        self.spawn._stop_process = self.stop_callback
-
-    def write(self, backend, data):
-        import psutil
-        pid = data.get('pid')
-        if data.get('cleanup_kind') == 'process' and type(pid) is int:
-            try:
-                process = psutil.Process(pid)
-                if any(parent.pid == os.getpid() for parent in process.parents()):
-                    self.births[pid] = process.create_time()
-            except psutil.Error:
-                pass
-        self.original_write(backend, data)
-
-    def stop(self, pid, name):
-        import psutil
-        birth = self.births.get(pid)
-        if birth is None:
-            return
-        try:
-            if psutil.Process(pid).create_time() == birth:
-                self.primitive(pid, name)
-        except psutil.NoSuchProcess:
-            pass
-
-    def delete(self, backend):
-        import psutil
-        registry = self.spawn._read_sentinel(backend) or {}
-        pid = registry.get('pid')
-        if pid not in self.births:
-            return
-        try:
-            if psutil.Process(pid).create_time() != self.births[pid]:
-                return
-        except psutil.NoSuchProcess:
-            pass
-        self.original_delete(backend)
-
-
 def warm_runtime():
     import convert_docling as core
     core.offer_llama_install = lambda device: (_ for _ in ()).throw(
         RuntimeError('Локальный OCR runtime отсутствует. Настройте его по README_convert_docling.md.'))
     core.configure_surya(SimpleNamespace(device=core.resolve_device()))
-    from surya.inference.backends import spawn
-    cleanup = ManagedProcessCleanup(spawn)
-    configure = core.configure_surya
-    def configure_session(args):
-        configure(args)
-        cleanup.refresh_stop()
-    core.configure_surya = configure_session
-    from surya.settings import settings
-    # Startup must use installed weights, not download new components in the
-    # background. A missing cache is reported without blocking the application.
-    if not (settings.SURYA_GGUF_LOCAL_MODEL_PATH and settings.SURYA_GGUF_LOCAL_MMPROJ_PATH):
-        from huggingface_hub import hf_hub_download
-        settings.SURYA_GGUF_LOCAL_MODEL_PATH = hf_hub_download(
-            repo_id=settings.SURYA_GGUF_REPO, filename=settings.SURYA_GGUF_MODEL_FILE, local_files_only=True)
-        settings.SURYA_GGUF_LOCAL_MMPROJ_PATH = hf_hub_download(
-            repo_id=settings.SURYA_GGUF_REPO, filename=settings.SURYA_GGUF_MMPROJ_FILE, local_files_only=True)
     import surya.inference as inference
     owner = inference.SuryaInferenceManager(method='llamacpp', lazy=False)
     inference.SuryaInferenceManager = borrow_manager_class(owner)

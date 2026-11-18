@@ -8,11 +8,13 @@ import math
 def _layout_error(item, output):
     if output is None:
         return 'inference_failed_or_empty'
-    if item.prompt_type == 'block' and output.raw:
-        from surya.recognition import _detect_repeat_loop
-        if _detect_repeat_loop(output.raw):
-            return 'repeating_output'
-        if item.max_tokens and output.token_count >= item.max_tokens:
+    if item.prompt_type == 'block':
+        if output.raw:
+            from surya.recognition import _detect_repeat_loop
+            if _detect_repeat_loop(output.raw):
+                return 'repeating_output'
+        if getattr(output, 'finish_reason', None) == 'length' or (
+                output.raw and item.max_tokens and output.token_count >= item.max_tokens):
             return 'output_token_limit'
     if output.error:
         return 'inference_failed_or_empty'
@@ -39,7 +41,7 @@ def _layout_error(item, output):
 def _complete_block_output(item, output, request, diagnostic):
     """Correct an underestimated block length without extending decoder loops."""
     reason = _layout_error(item, output)
-    if item.prompt_type != 'block' or reason != 'output_token_limit':
+    if item.prompt_type != 'block' or reason != 'output_token_limit' or not item.max_tokens:
         return item, output, reason
     from surya.settings import settings
     ceiling = settings.SURYA_MAX_TOKENS_BLOCK_CEILING
@@ -142,8 +144,9 @@ def recovering_generate(batch, request, diagnostic):
             finally:
                 for crop,_ in parts:
                     crop.close()
-            from surya.inference.schema import GenerationResult
-            output = GenerationResult(raw=json.dumps(blocks) if item.prompt_type == 'layout' else ''.join(blocks),token_count=tokens,error=False)
+            from surya.inference.schema import BatchOutputItem
+            output = BatchOutputItem(raw=json.dumps(blocks) if item.prompt_type == 'layout' else ''.join(blocks),
+                                     token_count=tokens, error=False, metadata=item.metadata)
             diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
                        image_size=list(item.image.size), method='source_gutter_layout_parts')
             recovered.append(output)

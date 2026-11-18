@@ -18,6 +18,7 @@ import zipfile
 
 DOWNLOAD_TIMEOUT = 180
 DOWNLOAD_ATTEMPTS = 8
+SURYA_CACHE_PREFIX = 'models/huggingface/hub/models--datalab-to--surya-ocr-2.5-gguf/'
 
 
 def safe_path(root, name):
@@ -72,7 +73,7 @@ class Installer:
                               f'{count}/{expected} bytes; source: {item["url"]}\n')
                 tick = 0.0
                 if count < expected:
-                    headers = {'User-Agent': 'REGION-OCR-Setup/1.8.4', 'Accept-Encoding': 'identity'}
+                    headers = {'User-Agent': f'REGION-OCR-Setup/{self.plan["version"]}', 'Accept-Encoding': 'identity'}
                     if count:
                         headers['Range'] = f'bytes={count}-'
                     req = urllib.request.Request(item['url'], headers=headers)
@@ -126,12 +127,15 @@ class Installer:
                             f'сохранено {saved // 1048576} МБ', saved)
                 time.sleep(min(2 ** attempt, 16))
 
-    def pip(self, archive, *, target=None):
+    def pip(self, archive, *, target=None, prefix=None):
         args = [str(self.python), '-s', '-m', 'pip', '--isolated', 'install',
                 '--no-deps', '--no-index', '--no-cache-dir', '--no-compile',
                 '--disable-pip-version-check', '--no-warn-script-location']
         if target is not None:
             args += ['--target', str(target), '--upgrade']
+        if prefix is not None:
+            # Stage the new distribution without uninstalling the working copy.
+            args += ['--prefix', str(prefix), '--ignore-installed']
         args.append(str(archive))
         env = os.environ.copy()
         env.pop('PYTHONPATH', None)
@@ -164,6 +168,17 @@ class Installer:
             if not found:
                 raise RuntimeError('Unexpected proxy-tools distribution layout')
 
+    def install_models(self, models, cache_files):
+        for item in models:
+            source = self.download(item)
+            target = safe_path(self.root, item['path'])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+        for item in cache_files:
+            target = safe_path(self.root, item['path'])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(item['text'], encoding='utf-8')
+
     def run(self):
         try:
             site = self.root / 'runtime/Lib/site-packages'
@@ -190,20 +205,13 @@ class Installer:
             native.unlink()
             if not (self.root / '.runtime/llamacpp/llama-server.exe').is_file():
                 raise RuntimeError('В загруженной сборке отсутствует llama-server.exe')
-            for item in self.plan['models']:
-                source = self.download(item)
-                target = safe_path(self.root, item['path'])
-                target.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(target)
-            for item in self.plan['cache_files']:
-                target = safe_path(self.root, item['path'])
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(item['text'], encoding='utf-8')
+            self.install_models(self.plan['models'], self.plan['cache_files'])
             shutil.copy2(self.root / 'THIRD-PARTY-NOTICES/llama-MIT-LICENSE.txt',
                          self.root / '.runtime/llamacpp/LICENSE')
             self.report('Проверка Python, интерфейса и моделей')
             check = (
                 "import sys; from pathlib import Path; import portable_runtime; portable_runtime.configure_runtime(); "
+                "from importlib.metadata import version; assert version('surya-ocr') == '0.24.0'; "
                 "import torch,docling,numpy,PIL,pypdfium2,onnxruntime; "
                 "from local_web.desktop import prepare_runtime; prepare_runtime(); import webview; "
                 "from huggingface_hub import snapshot_download; "
@@ -220,11 +228,30 @@ class Installer:
         finally:
             shutil.rmtree(self.cache, ignore_errors=True)
 
+    def stage_surya_update(self):
+        self.python = Path(sys.executable)
+        wheel = next(p for p in self.plan['packages'] if p['name'] == 'surya-ocr' and p['version'] == '0.24.0')
+        models = [item for item in self.plan['models'] if item['path'].startswith(SURYA_CACHE_PREFIX)]
+        refs = [item for item in self.plan['cache_files'] if item['path'].startswith(SURYA_CACHE_PREFIX)]
+        self.total = wheel['bytes'] + sum(item['bytes'] for item in models)
+        try:
+            archive = self.download(wheel)
+            self.report('Установка Surya 2.5')
+            self.pip(archive, prefix=self.root / 'runtime')
+            archive.unlink()
+            self.install_models(models, refs)
+        finally:
+            shutil.rmtree(self.cache, ignore_errors=True)
+
 
 def main():
     root = Path(sys.argv[1]).resolve()
     plan = json.loads((root / 'installer/install-plan.json').read_text('utf-8'))
-    Installer(root, plan, sys.argv[2]).run()
+    installer = Installer(root, plan, sys.argv[2])
+    if sys.argv[3:] == ['--surya-update']:
+        installer.stage_surya_update()
+    else:
+        installer.run()
 
 
 if __name__ == '__main__':

@@ -95,8 +95,7 @@ def _layout_predictor(manager):
 
 
 def _generate(batch, backend, timeout, diagnostic=None):
-    from surya.inference.backends.openai_client import chat_completions_batch
-    from docling_backend_health import request_with_backend_recovery
+    from docling_backend_health import request_local_ocr
     if backend.handle is None or backend._client is None:
         backend.start()
     from docling_pdf_ocr import recovering_generate
@@ -104,10 +103,7 @@ def _generate(batch, backend, timeout, diagnostic=None):
         from surya.settings import settings
         tokens = max(item.max_tokens or settings.SURYA_MAX_TOKENS_LAYOUT for item in items)
         seconds = max(90, timeout or 0, math.ceil(tokens/80)+15)
-        return request_with_backend_recovery(backend, lambda: chat_completions_batch(
-            items, client=backend._client.with_options(max_retries=0, timeout=seconds),
-            model_name=backend.handle.model_name, timeout=seconds, max_workers=1,
-            max_retries=0, request_logprobs_default=False), diagnostic)
+        return request_local_ocr(backend, items, seconds, diagnostic)
     return recovering_generate(batch, request, diagnostic or (lambda *a,**kw: None))
 
 

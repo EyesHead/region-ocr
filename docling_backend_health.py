@@ -6,18 +6,84 @@ The caller may repeat its original request once after a True return, resolving
 ``backend._client`` and ``backend.handle`` again rather than reusing old ones.
 """
 import json
-from pathlib import Path
+import os
 from threading import RLock
 from urllib.parse import urlsplit
+
+from docling_surya_profile import surya25_cache_path
 
 
 _RECOVERY_LOCK = RLock()
 
 
+class ManagedProcessCleanup:
+    """Constrain Surya's PID-only atexit callbacks to proven session children."""
+    def __init__(self, spawn):
+        self.spawn = spawn
+        self.births = {}
+        self.original_write = spawn._write_sentinel
+        self.original_delete = spawn._delete_sentinel
+        self.stop_callback = self.stop
+        self.refresh_stop()
+        spawn._write_sentinel = self.write
+        spawn._delete_sentinel = self.delete
+
+    def refresh_stop(self):
+        # configure_surya replaces the Windows primitive on every CLI run.
+        if self.spawn._stop_process is not self.stop_callback:
+            self.primitive = self.spawn._stop_process
+        self.spawn._stop_process = self.stop_callback
+
+    def write(self, backend, data):
+        import psutil
+        pid = data.get('pid')
+        if data.get('cleanup_kind') == 'process' and type(pid) is int:
+            try:
+                process = psutil.Process(pid)
+                if any(parent.pid == os.getpid() for parent in process.parents()):
+                    self.births[pid] = process.create_time()
+            except psutil.Error:
+                pass
+        self.original_write(backend, data)
+
+    def stop(self, pid, name):
+        import psutil
+        birth = self.births.get(pid)
+        if birth is None:
+            return
+        try:
+            if psutil.Process(pid).create_time() == birth:
+                self.primitive(pid, name)
+        except psutil.NoSuchProcess:
+            pass
+
+    def delete(self, backend):
+        import psutil
+        registry = self.spawn._read_sentinel(backend) or {}
+        pid = registry.get('pid')
+        if pid not in self.births:
+            return
+        try:
+            if psutil.Process(pid).create_time() != self.births[pid]:
+                return
+        except psutil.NoSuchProcess:
+            pass
+        self.original_delete(backend)
+
+
+def guard_managed_process_cleanup(spawn):
+    cleanup = getattr(spawn, '_region_ocr_managed_cleanup', None)
+    if cleanup is None:
+        cleanup = spawn._region_ocr_managed_cleanup = ManagedProcessCleanup(spawn)
+    else:
+        cleanup.refresh_stop()
+    return cleanup
+
+
 def _read_sentinel(name):
     # Unlike Surya's private reader, this read does not mkdir outside the
     # workspace merely to discover that no managed endpoint is registered.
-    path = Path.home() / '.cache' / 'datalab' / 'surya' / f'{name}_server.json'
+    path = surya25_cache_path() / f'{name}_server.json'
     return json.loads(path.read_text('utf-8'))
 
 
@@ -64,6 +130,7 @@ def recover_dead_local_backend(backend, diagnostic, *, failed_request=False,
                     or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
                     or endpoint.hostname.casefold() != configured_host or endpoint.port is None):
                 return skip('not_the_configured_managed_loopback_endpoint')
+            expected_model = getattr(config, 'SURYA_MODEL_CHECKPOINT', model_name)
             registry = (read_sentinel or _read_sentinel)(name)
         except (OSError, ValueError, TypeError, AttributeError) as error:
             return skip('registry_or_endpoint_unavailable', error_type=type(error).__name__)
@@ -74,7 +141,6 @@ def recover_dead_local_backend(backend, diagnostic, *, failed_request=False,
                 or registry.get('backend') != name or registry.get('cleanup_kind') != 'process'
                 or registry.get('cleanup_id') != str(pid)):
             return skip('registry_process_identity_invalid')
-        expected_model = getattr(config, 'SURYA_MODEL_CHECKPOINT', model_name)
         if (port != endpoint.port or registry.get('model') != model_name
                 or registry.get('model') != expected_model):
             return skip('registry_endpoint_or_model_mismatch')
@@ -100,8 +166,13 @@ def recover_dead_local_backend(backend, diagnostic, *, failed_request=False,
             return skip('endpoint_responding_or_health_unknown', pid=pid)
         diagnostic('LOCAL_BACKEND_PROCESS_DEAD', backend=name, pid=pid,
                    base_url=handle.base_url, model=handle.model_name)
-        # Official stop resets the cached client/handle; it does not kill the
-        # process. Official start re-probes and takes Surya's own file lock.
+        # The recorded process is gone. Surya 0.24 also tries owned cleanup
+        # in stop(); skip that stale callback before taking the spawn lock.
+        cleanup = getattr(handle, 'cleanup_fn', None)
+        if cleanup is not None:
+            from atexit import unregister
+            unregister(cleanup)
+            handle.cleanup_fn = None
         try:
             backend.stop()
             backend.start()
@@ -135,3 +206,14 @@ def request_with_backend_recovery(backend, request_closure, diagnostic, **recove
         if recover_dead_local_backend(backend, diagnostic, failed_request=True, **recovery_options):
             return request_closure()
     return outputs
+
+
+def request_local_ocr(backend, items, timeout, diagnostic):
+    from surya.inference.backends.openai_client import chat_completions_batch
+
+    # With --special, llama.cpp rejects constrained JSON decoding.
+    return request_with_backend_recovery(backend, lambda: chat_completions_batch(
+        items, client=backend._client.with_options(max_retries=0, timeout=timeout),
+        model_name=backend.handle.model_name, timeout=timeout, max_workers=1,
+        max_retries=0, request_logprobs_default=False, allow_guided_json=False,
+        allow_stop_token_ids=False), diagnostic)

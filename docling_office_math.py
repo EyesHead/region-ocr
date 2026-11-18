@@ -310,9 +310,8 @@ class OfficeFormulaRecognizer:
             return None
         backend = self._backend()
         from surya.inference.schema import BatchInputItem, PROMPT_TYPE_BLOCK
-        from surya.inference.backends.openai_client import chat_completions_batch
         from surya.settings import settings
-        from docling_backend_health import request_with_backend_recovery
+        from docling_backend_health import request_local_ocr
         from docling_pdf_quantities import source_multiline_ink, single_symbol_ink
         multiline = source_multiline_ink(data)
         rejected_responses = 0
@@ -359,13 +358,11 @@ class OfficeFormulaRecognizer:
                             source_sha256=key, attempt=attempt + 1, timeout=seconds,
                             max_tokens=max_tokens)
             try:
-                outputs = request_with_backend_recovery(backend, lambda: chat_completions_batch(
-                    [BatchInputItem(image=prepare_formula_image(data, attempt), prompt_type=PROMPT_TYPE_BLOCK,
-                                    prompt=prompt, max_tokens=max_tokens, guided_json=guided)],
-                    client=backend._client.with_options(max_retries=0, timeout=seconds),
-                    model_name=backend.handle.model_name, timeout=seconds, max_workers=1,
-                    max_retries=0, request_logprobs_default=False), self.diagnostic)
-                if outputs and outputs[0].token_count >= max_tokens:
+                item = BatchInputItem(image=prepare_formula_image(data, attempt), prompt_type=PROMPT_TYPE_BLOCK,
+                                      prompt=prompt, max_tokens=max_tokens, guided_json=guided)
+                outputs = request_local_ocr(backend, [item], seconds, self.diagnostic)
+                if outputs and (outputs[0].token_count >= max_tokens
+                                or getattr(outputs[0], 'finish_reason', None) == 'length'):
                     raise RuntimeError('Formula reached model output capacity; partial MathML rejected')
                 valid_output = bool(outputs and not outputs[0].error)
                 raw = outputs[0].raw if valid_output else ''

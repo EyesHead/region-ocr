@@ -441,7 +441,7 @@
     const warnings = Array.isArray(job.warnings) ? job.warnings.filter(message => typeof message === 'string' && message.trim()).map(message => message.trim()) : [];
     if (!warnings.length) return null;
     const details = element('details', 'job-warnings');
-    const caption = extension(job.name) === 'pdf' ? 'Предупреждения по исходному PDF' : 'Предупреждения по документу';
+    const caption = 'Предупреждения по документу';
     const summary = element('summary', '', `${caption} (${warnings.length})`);
     summary.setAttribute('aria-label', `${caption}: ${job.name}`);
     const list = element('ul', 'job-warning-list');

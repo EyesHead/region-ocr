@@ -37,7 +37,7 @@ else:
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.8.11"
+VERSION = "1.8.12"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -222,8 +222,11 @@ class JobStore:
         result = {key: value for key, value in job.items()
                   if key not in {"source", "source_pdf", "artifacts", "packages", "replay_html", "attempt_id", "review_count", "reviewed_count", "review_error_count"}
                   and not key.startswith(('_', 'technical_'))}
-        result['warnings'] = [text for text in result.get('warnings', [])
-                              if 'Движок пометил результат для визуальной проверки таблиц' not in str(text)]
+        result['warnings'] = [text for text in result.get('warnings', []) if not (
+            re.match(r'^Страница PDF \d+: ', str(text))
+            or str(text).startswith(('Результат требует сверки с исходным документом.',
+                                     'Проверьте строки, столбцы и значения таблицы: её сетка',
+                                     'Движок пометил результат для визуальной проверки таблиц')))]
         if job.get('status') == 'error':
             result.update(self._diagnose_failure(job))
             result['error'] = result['user_error']

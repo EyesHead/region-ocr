@@ -2241,6 +2241,12 @@ def surya_pdf_pipeline(args):
                 for work_item in work_items:
                     local_surya_backend(model)
                     prediction = recognize([work_item])[0]
+                    from docling_pdf_scan_quality import refine_primary_table_blocks, refine_primary_formula_blocks
+                    page_no = model._quality_page_numbers[work_item.page_index]
+                    prediction = refine_primary_table_blocks(
+                        work_item.image, prediction, model, args, page_no, sys.modules[__name__], work_rect=work_item.rect)
+                    prediction = refine_primary_formula_blocks(
+                        prediction, model, args, page_no, work_item.rect, sys.modules[__name__])
                     predictions.append(prediction)
                 result = []
                 for work_item, prediction in zip(work_items, predictions, strict=True):
@@ -9541,6 +9547,7 @@ def parse_args(argv=None):
                    help='устройство Pix2Text; auto: CUDA при доступном ONNX CUDA provider и свободной памяти, иначе CPU')
     p.add_argument('--formula-corrections', type=Path, default=None,
                    help='карта визуально сверенных формул с SHA256 исходного PDF и изображения')
+    p.add_argument('--desktop-output', action='store_true', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if re.search(r'[<>:"/\\|?*\x00-\x1f]', args.output_suffix) or args.output_suffix.endswith(('.', ' ')):
         p.error('--output-suffix must contain only filename characters and cannot end in a dot or space')
@@ -10134,11 +10141,14 @@ def convert_document(args, converter, source):
         args.pdf_quality_current = {}
         args.pdf_export_context = {'stage': 'ocr'}
         args.surya_records = []
+        args.primary_table_refinements = []
+        args.primary_table_refinement_reviews = []
         args.scan_header_requests = 0
         args.scan_numeric_requests = 0
         args.current_source_hash = file_hash(source)
         with normalized_pdf(source, args) as (normalized, orientation):
             args.current_orientation = orientation
+            args.current_normalized_pdf = normalized
             kwargs["source"] = normalized
             progress.start(len(orientation))
             converter = shared_converter(args, converter)
@@ -10172,8 +10182,10 @@ def convert_document(args, converter, source):
                 args.pdf_export_context = {'stage': 'publication'}
                 base = output_base(args, source)
                 base.parent.mkdir(parents=True, exist_ok=True)
-                from docling_pdf_review import write_quality_report
-                publication = write_quality_report(Path(f'{base}.html'),source,quality,sys.modules[__name__])
+                publication = {'status': 'OK'}
+                if not getattr(args, 'desktop_output', False):
+                    from docling_pdf_review import write_quality_report
+                    publication = write_quality_report(Path(f'{base}.html'),source,quality,sys.modules[__name__])
                 write_atomic(Path(f"{base}.html"), content)
             except Exception as error:
                 artifacts = write_failure_artifacts(source, args, sys.modules[__name__], error,

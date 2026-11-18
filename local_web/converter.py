@@ -228,43 +228,6 @@ def _process_exit_message(code):
     return f'Процесс локального OCR завершился без результата: {detail}.'
 
 
-def _conversion_review_warnings(record):
-    """Carry quality warnings to the UI without inserting them into source text."""
-    if record.get('status') != 'REVIEW':
-        return []
-    fallback = ('Результат требует сверки с исходным документом. '
-                'Подробности доступны в журнале конвертации.')
-    try:
-        report = json.loads(native_path(Path(record['quality_report'])).read_text(encoding='utf-8'))
-        if not isinstance(report, dict):
-            return [fallback]
-    except (KeyError, OSError, TypeError, ValueError):
-        return [fallback]
-    warnings, seen = [], set()
-    for field in ('table_warnings', 'source_grid_reviews'):
-        entries = report.get(field)
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            message = entry.get('message')
-            if not isinstance(message, str) or not re.search(r'[А-Яа-яЁё]', message):
-                message = ('Проверьте строки, столбцы и значения таблицы: её сетка '
-                           'не подтверждена исходным PDF.') if field == 'source_grid_reviews' else fallback
-            message = ' '.join(message.split())
-            page = entry.get('page', entry.get('page_no'))
-            if isinstance(page, str) and page.strip().isdecimal():
-                page = int(page.strip())
-            if not isinstance(page, int) or isinstance(page, bool) or page < 1:
-                page = None
-            identity = page, message
-            if identity not in seen:
-                seen.add(identity)
-                warnings.append(f'Страница PDF {page}: {message}' if page else message)
-    return warnings or [fallback]
-
-
 def _validate_pages(pages: str) -> str:
     pages = (pages or '').strip()
     if not pages:
@@ -529,7 +492,6 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         content = Path(engine['html']).read_text(encoding='utf-8')
         resource_root = Path(engine['html']).parent
         page_count = engine.get('pages')
-        warnings.extend(engine.get('warnings', []))
         technical_status = engine.get('technical_status')
     _check_cancel(cancel_event)
     if pages and source.suffix.lower() != '.pdf':
@@ -580,7 +542,7 @@ def _worker(source: Path, destination: Path, pages: str):
     # parse_args constrains explicit input paths to DATA_DIR. This private worker
     # scopes it to its single uploaded source.
     core.DATA_DIR = engine_source.parent
-    argv = ['--mode', 'local', '--input', str(engine_source),
+    argv = ['--mode', 'local', '--desktop-output', '--input', str(engine_source),
             '--output-dir', str(destination / 'html'), '--log-dir', str(destination / 'logs'),
             '--diagnostics-dir', str(destination / 'diagnostics')]
     if pages and source.suffix.lower() == '.pdf':
@@ -604,13 +566,12 @@ def _worker(source: Path, destination: Path, pages: str):
     output = Path(record['output'])
     if not output.is_file():
         raise RuntimeError('Опубликованный HTML отсутствует')
-    warnings = _conversion_review_warnings(record)
     page_count = image_pages
     inputs = list((destination / 'diagnostics').glob('*/input.json'))
     if inputs:
         metadata = json.loads(inputs[0].read_text(encoding='utf-8'))
         page_count = len(metadata.get('orientation') or []) or page_count
-    print(RESULT_MARKER + json.dumps(dict(html=str(output.resolve()), warnings=warnings, pages=page_count,
+    print(RESULT_MARKER + json.dumps(dict(html=str(output.resolve()), pages=page_count,
                                          technical_status=record.get('status', 'OK')), ensure_ascii=False), flush=True)
 
 

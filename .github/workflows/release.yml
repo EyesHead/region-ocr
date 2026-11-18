@@ -97,7 +97,7 @@ jobs:
               assert.deepEqual(await page.locator('.job-name').allTextContents(), jobs.toReversed().map(job => job.name));
               assert.equal(await page.locator('[data-status="queued"]').count(),2);
               const completed = page.locator('[data-status="done"]');
-              assert.equal(await completed.filter({hasText:'Договор_подряда.pdf'}).locator('.job-status').textContent(),'OCR выполнен');
+              assert.equal(await completed.filter({hasText:'Договор_подряда.pdf'}).locator('.job-status').textContent(),'Результат готов');
               assert.equal(await completed.filter({hasText:'Спецификация.pdf'}).locator('.job-status').textContent(),'Результат готов');
               const aligned = await page.locator('.job-state').evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().left));
               assert.ok(Math.max(...aligned)-Math.min(...aligned)<1,'Status columns must align');

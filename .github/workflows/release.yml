@@ -76,13 +76,13 @@ jobs:
                 created_at: new Date(Date.now() - index * 60000).toISOString(),
                 source_page_count: pages, size: 1024 * (index + 1), progress: 64,
                 stage: status === 'running' ? 'Распознавание текста' : '',
-                format: 'html', saved_result_id: status === 'done' ? String(index + 10).padStart(32, '0') : null
+                format: 'html', saved_result_id: status === 'done' && index !== 3 ? String(index + 10).padStart(32, '0') : null
               })).reverse();
-              const update = {current_version:'1.8.6',latest_version:'1.8.7',available:true,checking:false,installing:false,error:'',message:'Доступна версия 1.8.7'};
+              const update = {current_version:'1.8.11',latest_version:'1.8.12',available:true,checking:false,installing:false,error:'',message:'Доступна версия 1.8.12'};
               await page.route('http://ocr.test/**', async route => {
                 const path = new URL(route.request().url()).pathname;
                 if (path.startsWith('/api/')) {
-                  const data = path === '/api/status' ? {version:'1.8.6',jobs,engine_ready:true,output_dir:'D:\\OCR\\ocr_output'} : path.startsWith('/api/updates') ? update : {items:[]};
+                  const data = path === '/api/status' ? {version:'1.8.11',jobs,engine_ready:true,output_dir:'D:\\OCR\\ocr_output'} : path.startsWith('/api/updates') ? update : {items:[]};
                   return route.fulfill({json:data});
                 }
                 const name = path === '/' ? 'index.html' : path.slice(1);
@@ -96,7 +96,9 @@ jobs:
               await page.locator('.job-row').nth(5).waitFor();
               assert.deepEqual(await page.locator('.job-name').allTextContents(), jobs.toReversed().map(job => job.name));
               assert.equal(await page.locator('[data-status="queued"]').count(),2);
-              assert.equal(await page.locator('[data-status="done"] .job-status').first().textContent(),'OCR выполнен');
+              const completed = page.locator('[data-status="done"]');
+              assert.equal(await completed.filter({hasText:'Договор_подряда.pdf'}).locator('.job-status').textContent(),'OCR выполнен');
+              assert.equal(await completed.filter({hasText:'Спецификация.pdf'}).locator('.job-status').textContent(),'Результат готов');
               const aligned = await page.locator('.job-state').evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().left));
               assert.ok(Math.max(...aligned)-Math.min(...aligned)<1,'Status columns must align');
               await page.locator('#update-button').click();

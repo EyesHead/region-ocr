@@ -366,18 +366,189 @@ def reconstruct_fractions(image, args, page, picture_ref, api, *, primary_html='
         layout=layout, literal_stack=ambiguous)
 
 
-def recover_picture_math(doc, records, regions, args, picture_routes, excluded, manifest, api, *, protected=()):
+
+def has_decoder_tokens(value):
+    from html import unescape
+    return re.search(r'<\|(?:\d+|[A-Za-z][A-Za-z0-9_:-]*)\|>', unescape(value or '')) is not None
+
+
+def _ink_touches_formula_edge(regions, page_no, bounds, page_width, page_height):
+    """A scanned mark reaches the page boundary and extends into the formula."""
+    import cv2
+    import numpy as np
+
+    left, top, right, bottom = bounds
+    top, bottom = max(0., top), min(page_height, bottom)
+    if bottom <= top:
+        return False
+    for at_left in (True, False):
+        distance = left if at_left else page_width - right
+        if distance > 1:
+            continue
+        strip = ([0., top, min(8., right, page_width), bottom] if at_left else
+                 [max(0., left, page_width - 8.), top, page_width, bottom])
+        if strip[0] >= strip[2]:
+            continue
+        with regions.crop(page_no, strip, scale=3) as image, image.convert('L') as gray:
+            ink = (np.asarray(gray) < 175).astype('uint8')
+            if not at_left:
+                ink = np.ascontiguousarray(ink[:, ::-1])
+            _, _, components, _ = cv2.connectedComponentsWithStats(ink)
+            for x, y, w, h, area in components[1:]:
+                if x == 0 and w >= 4 and area >= 5 and h < .85 * ink.shape[0]:
+                    return True
+    return False
+
+def source_formula_is_clipped(reader, regions, page_no, bounds):
+    """A connected row of native formula glyphs crosses the physical page edge."""
+    from docling_pdf_cpu_route import _ink
+    from docling_pdf_native_system import _painted_text_objects
+
+    page = reader.load_page(page_no) if reader is not None else None
+    if page is None:
+        pdf_page = regions.pdf[page_no - 1]
+        try:
+            width, height = pdf_page.get_size()
+        finally:
+            pdf_page.close()
+        if bounds[0] > 1 and bounds[2] < width - 1:
+            return False
+        return _ink_touches_formula_edge(regions, page_no, bounds, width, height)
+    if bounds[0] > 1 and bounds[2] < page.width - 1:
+        return False
+    for sign, edge, ocr_edge in ((1, page.width, bounds[2]), (-1, 0., bounds[0])):
+        if abs(ocr_edge - edge) > 1:
+            continue
+        glyphs = [g for g in reader.chars if g['text'].strip() and g.get('upright', True)
+                  and g.get('native_script_eligible', True)
+                  and bounds[1] <= (g['top'] + g['bottom']) / 2 <= bounds[3]]
+        for g in glyphs:
+            if not g['x0'] < edge < g['x1']:
+                continue
+            after = g['x1'] if sign == 1 else -g['x0']
+            for neighbor in glyphs:
+                before = neighbor['x0'] if sign == 1 else -neighbor['x1']
+                if (before >= sign * edge and -.1 * g['size'] <= before - after <= .5 * g['size']
+                        and abs(neighbor['bottom'] - g['bottom']) <= .25 * g['size']
+                        and .8 <= neighbor['size'] / g['size'] <= 1.2):
+                    visible = [max(0., g['x0']), max(bounds[1], g['top']),
+                               min(page.width, g['x1']), min(bounds[3], g['bottom'])]
+                    if not _painted_text_objects(regions, page_no, visible):
+                        continue
+                    with regions.crop(page_no, visible, scale=4) as image:
+                        if _ink(image).any():
+                            return True
+    return _ink_touches_formula_edge(regions, page_no, bounds, page.width, page.height)
+
+
+def _formula_comparison(regions, page_no, box, rendered, warning, args, api):
+    """Attach the original only to the desktop preview handoff."""
+    if not getattr(args, 'desktop_output', False) or box[2] <= box[0] or box[3] <= box[1]:
+        return rendered
+    soup = BeautifulSoup('', 'html.parser')
+    wrapper = soup.new_tag('div', attrs={'data-formula-comparison': 'true', 'data-pdf-page': str(page_no)})
+    if warning:
+        wrapper['data-formula-warning'] = warning
+    if rendered:
+        wrapper.append(BeautifulSoup(rendered, 'html.parser').math)
+    scale = min(3., 1800 / max(box[2] - box[0], box[3] - box[1]))
+    with regions.crop(page_no, box, scale=scale) as image:
+        png = BeautifulSoup(api.image_html(image, box[2] - box[0], 'picture'), 'html.parser').img
+    details = soup.new_tag('details', attrs={'data-preview-only': 'formula-source'})
+    summary = soup.new_tag('summary')
+    summary.string = 'Показать оригинал'
+    png['alt'] = f'Исходная формула, страница {page_no}'
+    details.extend([summary, png])
+    wrapper.append(details)
+    return str(wrapper)
+
+
+def recover_editable_formula(reader, regions, page_no, bounds, args, api, *,
+                             ref, reason, manifest, candidates=(), picture_ref=None):
+    """Recover an identified formula that cannot use its primary transcription."""
+    from docling_pdf_native_matrix import recover_native_matrix
+    from docling_pdf_native_equation import recover_native_equation, recover_visible_prefix
+    from docling_pdf_formula_retry import retry_formula_crop
+
+    page = regions.pdf[page_no - 1]
+    try:
+        width, height = page.get_size()
+    finally:
+        page.close()
+    box = [max(0., bounds[0]), max(0., bounds[1]), min(width, bounds[2]), min(height, bounds[3])]
+    context = dict(ref=ref, page=page_no, bbox=box, reason=reason)
+    if picture_ref:
+        context['picture_ref'] = picture_ref
+    inside = box[0] < box[2] and box[1] < box[3]
+    clipped = reason == 'formula_crosses_physical_page_edge' or (
+        inside and source_formula_is_clipped(reader, regions, page_no, box))
+    result = None
+    if inside:
+        if reader is not None:
+            for recover in (recover_native_matrix, recover_native_equation):
+                result = recover(reader, regions, page_no, box, api)
+                if result:
+                    break
+            if not result and clipped:
+                result = recover_visible_prefix(reader, regions, page_no, box, api)
+        if not result:
+            result = retry_formula_crop(args, regions, page_no, box, api, candidates=candidates, clipped=clipped)
+        if not result and not clipped and reader is not None:
+            result = recover_visible_prefix(reader, regions, page_no, box, api)
+    rendered = ''
+    proof = dict(method='no_readable_formula_symbols', partial=True)
+    if result:
+        rendered, proof = result
+        math = BeautifulSoup(rendered, 'html.parser').math
+        if (not math or not math.get_text(strip=True) or not math.get('data-latex')
+                or has_decoder_tokens(str(math))):
+            raise ValueError(f'Страница PDF {page_no}: некорректная разметка восстановленной формулы {ref}.')
+        manifest.setdefault('formulas', []).append(dict(context, method=proof['method'], latex=math['data-latex']))
+        api.diagnostic_event('EDITABLE_SOURCE_FORMULA_RECOVERED', **context, method=proof['method'])
+    manifest.setdefault('source_formula_recoveries', []).append(dict(context, **proof))
+    if clipped or proof.get('partial'):
+        message = ('Формула обрезана краем исходного листа. Сохранена читаемая часть.' if clipped else
+                   'Формула распознана частично.') if rendered else 'В области формулы нет уверенно читаемых знаков.'
+        if clipped and proof.get('unconfirmed'):
+            message = 'Формула обрезана краем исходного листа. Проверьте распознанные знаки по оригиналу.'
+        manifest.setdefault('formula_source_reviews', []).append(dict(context, method=proof['method'], message=message))
+    if clipped:
+        warning = 'clipped-uncertain' if proof.get('unconfirmed') else 'clipped'
+    else:
+        warning = 'partial' if proof.get('partial') else None
+    return _formula_comparison(regions, page_no, box, rendered, warning, args, api)
+
+
+def _formula_owns_picture(regions, page, bounds, formula_bounds):
+    """Keep a surrounding drawing when the OCR formula omits visible marks outside its bounds."""
+    import numpy as np
+
+    with regions.crop(page, bounds) as image, image.convert('L') as gray:
+        ink = np.asarray(gray) < 235
+        sx = image.width / (bounds[2] - bounds[0])
+        sy = image.height / (bounds[3] - bounds[1])
+        x0 = max(0, math.floor((formula_bounds[0] - bounds[0]) * sx))
+        y0 = max(0, math.floor((formula_bounds[1] - bounds[1]) * sy))
+        x1 = min(image.width, math.ceil((formula_bounds[2] - bounds[0]) * sx))
+        y1 = min(image.height, math.ceil((formula_bounds[3] - bounds[1]) * sy))
+        if x0 >= x1 or y0 >= y1 or not ink[y0:y1, x0:x1].any():
+            return False
+        ink[y0:y1, x0:x1] = False
+        return not ink.any()
+
+
+def recover_picture_math(doc, records, regions, args, picture_routes, excluded, manifest, api, *, protected=(), reader=None):
     templates = {}
     try:
         return _recover_picture_math(doc, records, regions, args, picture_routes, excluded, manifest, api,
-                                     protected=protected, templates=templates)
+                                     protected=protected, templates=templates, reader=reader)
     finally:
         for values in templates.values():
             for image, _ in values:
                 image.close()
 
 
-def _recover_picture_math(doc, records, regions, args, picture_routes, excluded, manifest, api, *, protected, templates):
+def _recover_picture_math(doc, records, regions, args, picture_routes, excluded, manifest, api, *, protected, templates, reader=None):
     """Replace only source-proved equation/picture duplicates with editable math."""
     from docling_core.types.doc import DocItemLabel
     from docling_pdf_table_content import _typed_payload_digest
@@ -481,6 +652,12 @@ def _recover_picture_math(doc, records, regions, args, picture_routes, excluded,
                 continue
         bounds = [min(box[0], record['bbox'][0])-1, min(box[1], record['bbox'][1])-1,
                   max(box[2], record['bbox'][2])+1, max(box[3], record['bbox'][3])+1]
+        if has_decoder_tokens(target.text) or has_decoder_tokens(record.get('html')):
+            picture_routes[picture.self_ref] = recover_editable_formula(reader, regions, page, bounds, args, api,
+                ref=target.self_ref, reason='invalid_decoder_tokens', manifest=manifest,
+                candidates=(target.text, record.get('html', '')), picture_ref=picture.self_ref)
+            excluded.update([target.self_ref, *duplicate_children])
+            continue
         image = None
         try:
             image = regions.crop(page, bounds, scale=4.2)
@@ -494,10 +671,21 @@ def _recover_picture_math(doc, records, regions, args, picture_routes, excluded,
             if image is not None:
                 image.close()
         if result is None:
-            manifest.setdefault('primary_cell_reconciliation_reviews', []).append(dict(
-                page=page, bbox=bounds, reason='unresolved_source_math_picture',
-                message='Дробная запись требует проверки: исходное изображение сохранено рядом с первичным OCR.'))
-            continue  # An unresolved source picture remains visible.
+            primary = BeautifulSoup(record.get('html', ''), 'html.parser')
+            maths = primary.find_all('math')
+            if len(maths) == 1:
+                math_node = maths[0].extract()
+                notation = math_node.get('data-latex') or math_node.get_text()
+                rendered = api.latex_math(notation) if notation.strip() else None
+                if (rendered and not primary.get_text(strip=True)
+                        and _formula_owns_picture(regions, page, box, record['bbox'])):
+                    result = rendered, dict(method='primary_equation_covers_source_picture')
+            if result is None:
+                # A compound drawing can contain both a formula and independent marks.
+                manifest.setdefault('primary_cell_reconciliation_reviews', []).append(dict(
+                    page=page, bbox=bounds, reason='unresolved_source_math_picture',
+                    message='Проверьте границы рисунка и формулы по исходной странице.'))
+                continue
         rendered, proof = result
         if reparent:
             picture.children = [ref for ref in picture.children if ref.cref != target.self_ref]
@@ -512,7 +700,7 @@ def _recover_picture_math(doc, records, regions, args, picture_routes, excluded,
         record = dict(page=page, picture_ref=picture.self_ref, ref=target.self_ref, bbox=bounds,
                       duplicate_children=duplicate_children, **proof)
         manifest.setdefault('source_picture_math_recoveries', []).append(record)
-        if proof['literal_stack']:
+        if proof.get('literal_stack'):
             manifest.setdefault('primary_cell_reconciliation_reviews', []).append(dict(
                 page=page, bbox=bounds, reason='literal_source_fraction_stack',
                 message='Многоэтажная дробная запись сохранена буквально. Алфавит обозначений взят '

@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -38,9 +39,14 @@ class ReleaseRedirects(HTTPRedirectHandler):
         parts = urlsplit(newurl)
         if (parts.scheme != 'https' or parts.hostname not in
                 {'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'}
-                or parts.username or parts.password or parts.port not in (None, 443)):
+                or parts.username or parts.password or parts.port not in (None, 443)
+                or (parts.hostname == 'github.com' and not parts.path.startswith(f'/{REPOSITORY}/releases/'))):
             raise ValueError('Небезопасное перенаправление при загрузке обновления.')
-        return super().redirect_request(request, fp, code, message, headers, newurl)
+        redirected = super().redirect_request(request, fp, code, message, headers, newurl)
+        if redirected is not None and request.get_method() == 'HEAD':
+            # urllib otherwise follows a HEAD redirect with a GET of the installer.
+            redirected.method = 'HEAD'
+        return redirected
 
 
 def fetch_bytes(url, limit):
@@ -70,6 +76,44 @@ def release_info(data, current_version):
             'installer_url': asset_url(installer.get('browser_download_url'), version, name),
             'checksums_url': asset_url(checksums.get('browser_download_url'), version, 'SHA256SUMS'),
             'available': number > version_number(current_version)}
+
+
+def _release_head(url):
+    request = Request(url, method='HEAD', headers={'User-Agent': 'REGION-OCR-Updater', 'Accept-Encoding': 'identity'})
+    with build_opener(ReleaseRedirects()).open(request, timeout=30) as response:
+        return response.geturl(), response.headers.get('Content-Length')
+
+
+def latest_release(fetch, current_version):
+    try:
+        metadata = fetch(API_URL, 1024 * 1024)
+    except HTTPError as error:
+        if error.code != 429 and not (error.code == 403 and error.headers.get('X-RateLimit-Remaining') == '0'):
+            raise
+        error.close()
+    else:
+        return release_info(json.loads(metadata), current_version)
+
+    # The public latest URL resolves to GitHub's stable release even when its
+    # anonymous metadata API has exhausted this network's request allowance.
+    releases = f'https://github.com/{REPOSITORY}/releases'
+    page, _ = _release_head(releases + '/latest')
+    tag_prefix = releases + '/tag/v'
+    if not page.startswith(tag_prefix):
+        raise ValueError('Не удалось определить версию официального релиза.')
+    version = page[len(tag_prefix):]
+    if version != '.'.join(map(str, version_number(version))):
+        raise ValueError('Некорректная версия обновления.')
+    name = f'REGION-OCR-{version}-Setup.exe'
+    assets = []
+    for filename in (name, 'SHA256SUMS'):
+        url = f'{releases}/download/v{version}/{filename}'
+        _, length = _release_head(url)
+        size = int(length) if length is not None else 0
+        if filename == 'SHA256SUMS' and length is not None and not 0 < size <= 64 * 1024:
+            raise ValueError('Некорректный размер файла контрольной суммы.')
+        assets.append({'name': filename, 'size': size, 'browser_download_url': url})
+    return release_info({'tag_name': version, 'assets': assets}, current_version)
 
 
 def verify_installer(data, checksums, name, size):
@@ -115,7 +159,7 @@ class UpdateManager:
 
     def _check(self):
         try:
-            release = release_info(json.loads(self.fetch(API_URL, 1024 * 1024)), self.state['current_version'])
+            release = latest_release(self.fetch, self.state['current_version'])
             with self.lock:
                 self.release = release
                 self.state.update(latest_version=release['version'], available=release['available'], error='',

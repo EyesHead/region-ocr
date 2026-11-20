@@ -273,6 +273,8 @@ class PersistentEngine:
             if self.closed or self.state.get('phase') != 'error':
                 self.state.update(phase='stopped', message='Движок остановлен')
             self.ready.set()
+            if process is not None and self.active is not None:
+                self.active.put((None, None))
         if process is None:
             return
         # llama-server starts its own POSIX session. Walk only our descendants,

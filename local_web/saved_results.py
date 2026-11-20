@@ -18,9 +18,11 @@ import threading
 import uuid
 
 if __package__:
+    from . import formula_preview
     from .file_paths import native_path, normal_path
     from .upload_storage import UploadReservations
 else:
+    import formula_preview
     from file_paths import native_path, normal_path
     from upload_storage import UploadReservations
 
@@ -304,12 +306,18 @@ class SavedResults:
                     raise ValueError('Файл лога не может быть ссылкой')
                 native_path(log_path).write_text(str(log), encoding='utf-8')
                 preview_identity = None
-                if format != 'html' and canonical is not None:
+                comparison_info = None
+                if canonical is not None:
                     canonical = normal_path(canonical).absolute()
                     if _is_link(canonical) or not native_path(canonical).is_file():
                         raise ValueError('Канонический HTML предпросмотра не найден')
+                    comparison_info = formula_preview.preview_info(canonical)
+                if canonical is not None and (format != 'html' or comparison_info):
                     native_path(preview_folder).mkdir(parents=True, exist_ok=False)
-                    shutil.copy2(native_path(canonical), native_path(preview_folder / 'document.html'))
+                    if comparison_info:
+                        formula_preview.copy_preview(canonical, preview_folder, comparison_info)
+                    if format != 'html':
+                        shutil.copy2(native_path(canonical), native_path(preview_folder / 'document.html'))
                     preview_identity = _identity(preview_folder)
                 if target.parent != self.root or native_path(target).exists():
                     raise ValueError('Назначение сохранения изменилось')
@@ -319,6 +327,8 @@ class SavedResults:
                               created_at=datetime.now(timezone.utc).isoformat(), size=size,
                               job_id=str(job_id), package_key=package_key, directory_identity=_identity(target),
                               delivery_schema=10, preview_identity=preview_identity)
+                if comparison_info:
+                    record['formula_preview'] = comparison_info
                 self.records[ident] = record
                 self._persist()
                 return self._public(record)
@@ -473,9 +483,13 @@ class SavedResults:
                 self.delete(ident)
             self.uploads.delete(job_id)
 
-    def open_folder(self, ident):
+    def open_folder(self, ident=None):
         with self.lock:
-            folder = self._folder(self._record(ident))
+            if ident is None:
+                self._check_root()
+                folder = self.root
+            else:
+                folder = self._folder(self._record(ident))
             if not native_path(folder).is_dir():
                 raise FileNotFoundError('Сохранённая папка не найдена')
             if os.name == 'nt':
@@ -483,7 +497,8 @@ class SavedResults:
             else:
                 subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(folder)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self.get(ident)
+            if ident is not None:
+                return self.get(ident)
 
     def target_file(self, ident, target):
         """Resolve a fixed document role inside an owned result; never a caller path."""
@@ -506,6 +521,22 @@ class SavedResults:
             if not native_path(path).is_file():
                 raise FileNotFoundError('Файл результата не найден. Подготовьте экспорт заново.')
             return native_path(path)
+
+    def preview_document(self, ident):
+        with self.lock:
+            record = self._record(ident)
+            info = record.get('formula_preview')
+            if info:
+                return formula_preview.preview_file(self._preview_folder(record), info)
+            return self.target_file(ident, 'html')
+
+    def formula_asset(self, ident, digest):
+        with self.lock:
+            record = self._record(ident)
+            info = record.get('formula_preview')
+            if not info:
+                raise FileNotFoundError('Оригинал формулы не найден')
+            return formula_preview.preview_image(self._preview_folder(record), info, digest)
 
     def asset(self, ident, name):
         with self.lock:

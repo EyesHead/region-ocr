@@ -3,7 +3,7 @@
   const $ = (selector) => document.querySelector(selector);
   const formats = { markdown: 'Markdown', html: 'HTML', json: 'JSON', plaintext: 'Текст' };
   const supported = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'webp', 'gif']);
-  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false };
+  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false, openingOutput: false };
   const lifecycleNames = { uploading: 'Загрузка файла…', ready: 'Готов к обработке', queued: 'В очереди', running: 'Обработка…', error: 'Не удалось обработать', cancelled: 'Обработка остановлена', done: 'Результат готов', export: 'Нужен новый экспорт' };
   const nameCollator = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
   let toastTimer;
@@ -145,6 +145,7 @@
       updateLockedControls.forEach((disabled, control) => { if (control.isConnected) control.disabled = disabled; });
       updateLockedControls.clear();
     }
+    updateOpenFolderButton();
   }
   async function refreshUpdates() {
     clearTimeout(updateTimer);
@@ -624,6 +625,7 @@
     $('#filter-done-count').textContent = completed.length;
     $('#filter-error-count').textContent = failures.length;
     const unsaved = completed.filter(job => !job.saved_result_id);
+    updateOpenFolderButton();
     $('#download-all').hidden = completed.length === 0;
     $('#download-all').disabled = unsaved.length === 0 || state.busy || state.savingAll || state.saving.size > 0 || !state.connected;
     $('#download-all').textContent = state.savingAll ? 'Сохранение…' : unsaved.length ? `Сохранить все · ${unsaved.length}` : 'Все результаты сохранены';
@@ -665,6 +667,21 @@
     $('#output-directory').textContent = value;
     $('#output-directory').title = value;
     $('#installed-root').textContent = value;
+  }
+  function updateOpenFolderButton() {
+    $('#output-open').disabled = !state.connected || !state.outputDir || state.openingOutput || !!updateSnapshot?.installing;
+  }
+  async function openOutputFolder() {
+    const control = $('#output-open');
+    if (control.disabled) return;
+    state.openingOutput = true;
+    updateOpenFolderButton();
+    try { await post('/api/settings/open', {}); }
+    catch (error) { toast(error.message); }
+    finally {
+      state.openingOutput = false;
+      updateOpenFolderButton();
+    }
   }
   async function openOutputSettings() {
     $('#output-error').hidden = true;
@@ -1112,6 +1129,7 @@
   $('#update-dialog').addEventListener('close', () => $('#update-button').focus({ preventScroll: true }));
   $('#download-all').addEventListener('click', saveAllResults);
   $('#installed-button').addEventListener('click', openInstalled);
+  $('#output-open').addEventListener('click', openOutputFolder);
   $('#output-change').addEventListener('click', openOutputSettings);
   $('#output-form').addEventListener('submit', saveOutputSettings);
   $('#output-cancel').addEventListener('click', () => $('#output-dialog').close());

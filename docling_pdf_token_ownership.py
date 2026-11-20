@@ -21,7 +21,11 @@ def pixel_cell_token_owner(record,entry,fragment,api):
     if not box or len(box)!=4 or box[0]>=box[2] or box[1]>=box[3]:return None
     soup=BeautifulSoup(fragment,'html.parser');table=soup.table
     if table is None:return None
-    profile=api.table_profile(str(table));nodes=table.find_all(['td','th'])
+    from docling_pdf_table_layout import _table_cells
+    profile = api.table_profile(str(table))
+    nodes = _table_cells(table)
+    if profile.get('issues') or len(nodes) != len(profile.get('cells', [])):
+        return None
     published={(c['row'],c['column'],c['row_span'],c['column_span']):(c,n)
                for c,n in zip(profile.get('cells',[]),nodes)}
     owners=[]

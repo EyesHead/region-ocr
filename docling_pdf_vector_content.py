@@ -141,24 +141,142 @@ def _confirms(reading, expected):
     return not reading[1] or _script_positions(reading) <= expected_roles
 
 
+def _same_printed_literal(left, right):
+    return _visual(_compact(left).upper()) == _visual(_compact(right).upper())
+
+
+def _native_simple_fraction(primary, source, page, api):
+    """Recover the literal numerator and denominator from either side of a native fraction rule."""
+    parts = primary.find_all('mfrac')
+    if len(parts) != 1 or len(primary.find_all('math')) != 1:
+        return None
+    math_node = primary.math
+    allowed = {'mrow', 'mfrac', 'mi', 'mn', 'mo', 'mtext'}
+    if any(tag.name not in allowed for tag in math_node.find_all(True)):
+        return None
+    terms = parts[0].find_all(True, recursive=False)
+    if len(terms) != 2:
+        return None
+    left, top, right, bottom = source['bbox']
+    glyphs = sorted((g for g in source['glyphs'] if g['text'].strip()), key=lambda g: g['bbox'][0])
+    if not glyphs or any(not re.fullmatch(r'[\w,.+−-]', g['text']) for g in glyphs):
+        return None
+    literal = lambda items: ''.join(g['text'] for g in items)
+    answers = []
+    for bar in page.rects:
+        x0, y0, x1, y1 = (bar[k] for k in ('x0', 'top', 'x1', 'bottom'))
+        if (not bar.get('fill') or api.is_white_pdf_background(bar)
+                or not (left+1 < x0 < x1 < right-1 and top+1 < y0 < y1 < bottom-1)
+                or x1-x0 < 6*(y1-y0)):
+            continue
+        before, above, below, after = [], [], [], []
+        for glyph in glyphs:
+            a, b, c, d = glyph['bbox']
+            if x0-1 <= a and c <= x1+1 and d <= y0+1:
+                above.append(glyph)
+            elif x0-1 <= a and c <= x1+1 and b >= y1-1:
+                below.append(glyph)
+            elif c <= x0+1 and b <= y1 and d >= y0:
+                before.append(glyph)
+            elif a >= x1-1 and b <= y1 and d >= y0:
+                after.append(glyph)
+            else:
+                break
+        else:
+            # Each horizontal run must have one baseline. A stacked expression
+            # on either side needs its own layout proof.
+            if not above or not below or any(
+                    max(g['bbox'][1] for g in run) >= min(g['bbox'][3] for g in run)
+                    for run in (above, below)):
+                continue
+            num, den = literal(above), literal(below)
+            if (not _same_printed_literal(num, terms[0].get_text())
+                    or not _same_printed_literal(den, terms[1].get_text())
+                    or not _same_printed_literal(literal(before)+num+den+literal(after), primary.get_text())):
+                continue
+            tex = literal(before) + r'\frac{' + num + '}{' + den + '}' + literal(after)
+            html = api.latex_math(tex, 'inline')
+            if html and BeautifulSoup(html, 'html.parser').find('mfrac'):
+                answers.append((html, [x0, y0, x1, y1]))
+    return answers[0] if len(answers) == 1 else None
+
+
 def confirm_vector_cell(source_html, primary_html, source, geometry, reader, regions,
                         page, args, manifest, api, *, ref=None):
     """Return a confirmed choice only for a risky, fully owned vector-text cell."""
     from docling_pdf_text_cells import owns_positioned_text
     parsed = BeautifulSoup(source_html, 'html.parser')
     proposed = BeautifulSoup(primary_html, 'html.parser')
-    if parsed.find(['img', 'svg', 'table']) or proposed.find(['img', 'svg', 'table']):
+    if parsed.find(['svg', 'table']) or proposed.find(['img', 'svg', 'table']):
+        return None
+    source_images = parsed.find_all('img')
+    if source_images and (len(source_images) != 1 or source_images[0].get('data-source-cell') != 'true'
+                          or not proposed.find('mfrac')):
         return None
     short_symbols = (max(len(parsed.get_text(strip=True)), len(proposed.get_text(strip=True))) <= 3
                      and any(c.isalpha() for c in parsed.get_text() + proposed.get_text()))
-    if not (short_symbols or parsed.find(['math', 'sup', 'sub']) or proposed.find(['math', 'sup', 'sub'])):
-        return None
+    structured = parsed.select_one('math, sup, sub, .source-latex') or proposed.select_one('math, sup, sub, .source-latex')
     owner = BeautifulSoup('<td>' + source_html + '</td>', 'html.parser').td
     if not owns_positioned_text(owner, source, geometry) or reader is None or regions is None:
         return None
     source_page = reader.load_page(page)
-    if source_page.images:
-        return None  # A scan's hidden OCR layer never supplies source identity.
+    witness = source.get('positioned_source_text') or {}
+    left, top, right, bottom = source['bbox']
+    cell_has_raster = any(im['x0'] < right and left < im['x1'] and im['top'] < bottom and top < im['bottom']
+                          for im in source_page.images)
+    if cell_has_raster:
+        return None
+    fully_visible = (witness.get('ink_coverage') == 1 and witness.get('glyph_ink_support') == 1
+                     and witness.get('positioned_assets', 0) == len(source_images)
+                     and geometry.get('positioned_source_grid_verified'))
+    one_line = len(source.get('lines', [])) == 1
+    method, restored_html, rule = None, None, None
+    if fully_visible and not (short_symbols or structured):
+        if (one_line and parsed.get_text() != proposed.get_text() and not proposed.find('br')
+                and len(proposed.find_all(['p', 'div', 'li'])) <= 1):
+            method = 'complete_visible_native_glyph_line'
+    elif fully_visible and (source_page.images or source_images):
+        fraction = _native_simple_fraction(proposed, source, source_page, api) if proposed.find('mfrac') else None
+        if source_images:
+            # A cropped vector bar may be the one positioned asset in this cell.
+            # It may disappear only if all its ink belongs to the native rule.
+            assets = [a for a in geometry.get('retained_cell_images', [])
+                      if (a['row'], a['column']) == (source['row'], source['column'])]
+            if (not fraction or len(assets) != 1 or not assets[0].get('bbox')
+                    or any(abs(a-b) > 1 for a, b in zip(assets[0]['bbox'], fraction[1]))):
+                return None
+            from io import BytesIO
+            import base64
+            import numpy as np
+            from PIL import Image
+            with Image.open(BytesIO(base64.b64decode(source_images[0]['src'].split(',', 1)[1]))) as bar:
+                dark = np.asarray(bar.convert('L')) < 180
+            ys, xs = np.nonzero(dark)
+            if (not len(xs) or xs.max()-xs.min()+1 < 5*(ys.max()-ys.min()+1)
+                    or not dark[ys.min():ys.max()+1, xs.min():xs.max()+1].all()):
+                return None
+        if fraction:
+            restored_html, rule = fraction
+            method = 'positioned_glyphs_on_both_sides_of_native_fraction_rule'
+        elif (one_line and witness.get('positioned_source_scripts') and not proposed.find('mfrac')
+                and literal_script_markup(source_html, api) is not None
+                and literal_script_markup(primary_html, api) is not None
+                and _same_printed_literal(parsed.get_text(), proposed.get_text())):
+            method = 'complete_visible_native_script_positions'
+    if method:
+        proof = dict(method=method, choice='source', page=page, ref=ref,
+                     bbox=list(source['bbox']), row=source['row'], column=source['column'],
+                     source_html_sha256=sha256(source_html.encode()).hexdigest(),
+                     primary_html_sha256=sha256(primary_html.encode()).hexdigest(),
+                     glyphs=witness['glyphs'], ink_coverage=witness['ink_coverage'],
+                     glyph_ink_support=witness['glyph_ink_support'])
+        if restored_html is not None:
+            proof.update(source_literal_html=restored_html, fraction_rule_bbox=rule)
+        manifest.setdefault('vector_cell_content_confirmations', []).append(proof)
+        api.diagnostic_event('VECTOR_CELL_SOURCE_LITERAL_RETAINED', **proof)
+        return 'source', proof
+    if not (short_symbols or structured) or source_page.images or source_images:
+        return None
     source_signature = content_signature(source_html, api)
     primary_signature = content_signature(primary_html, api)
     if source_signature == primary_signature:

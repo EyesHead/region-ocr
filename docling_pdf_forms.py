@@ -112,6 +112,27 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
     objects = [(item, pos) for item, pos in objects if pos]
     texts = [(item, api.item_region(item, doc)) for item in doc.texts]
     table_refs = {item.self_ref for item in doc.tables}
+    from docling_pdf_captions import caption_prefix
+    labelled_tables = []
+    for table, pos in objects:
+        if table.self_ref not in table_refs:
+            continue
+        for link in getattr(table, 'captions', ()):
+            label = link.resolve(doc)
+            loc = api.item_region(label, doc)
+            if not loc or loc[0] != pos[0] or not caption_prefix(getattr(label, 'text', '')):
+                continue
+            gap = pos[1][1] - loc[1][3]
+            height = max(1., loc[1][3] - loc[1][1])
+            if -.35 * height <= gap <= max(64., 3 * height) and min(pos[1][2], loc[1][2]) > max(pos[1][0], loc[1][0]):
+                labelled_tables.append(pos)
+                break
+
+    def owns_table(page, bounds):
+        # Layout and primary OCR can report the same labelled grid twice.
+        return any(number == page and (same_source_box(bounds, grid)
+                   or api._captioned_figure_contains(bounds, grid)) for number, grid in labelled_tables)
+
     packet_items = {}
     packet_boxes = set()
     for index, record in enumerate(records):
@@ -166,7 +187,7 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
         # headings precede their bodies; stale assembly links cannot reverse it.
         sides = []
         for item, pos in objects:
-            if pos[0] != page:
+            if pos[0] != page or not is_form and owns_table(page, pos[1]):
                 continue
             bounds = pos[1]
             aligned = (x_overlap(bounds, capbox) >= .8 and
@@ -195,7 +216,7 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
         title_anchors = {}
         for item, pos in objects:
             bounds = pos[1]
-            if (pos[0] != page or item.self_ref in registry
+            if (pos[0] != page or item.self_ref in registry or not is_form and owns_table(page, bounds)
                     or any(entry['page'] == page and api._captioned_figure_contains(
                         entry['original_bbox'], bounds) for entry in registry.values())):
                 continue
@@ -315,7 +336,7 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
             if pos[0] != page or item.self_ref == owner.self_ref or item.self_ref in registry:
                 continue
             b = pos[1]
-            if is_form and b[3] > next_form_top:
+            if (is_form and b[3] > next_form_top) or (not is_form and owns_table(page, b)):
                 continue
             if (b[1] < last_caption or b[1] > envelope[3]+em if caption_before
                     else b[3] > capbox[1] or b[3] < envelope[1]-em):
@@ -329,9 +350,12 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
             if boundary:
                 continue
             if x_overlap(envelope, b) >= .8:
-                owned.append((item, b))
-                envelope = [min(envelope[0], b[0]), min(envelope[1], b[1]),
+                expanded = [min(envelope[0], b[0]), min(envelope[1], b[1]),
                             max(envelope[2], b[2]), max(envelope[3], b[3])]
+                if not is_form and owns_table(page, expanded):
+                    continue
+                owned.append((item, b))
+                envelope = expanded
         # OCR packet boxes can retain thin rails or dimension strokes just
         # outside the layout object's bounds. Keep them before adding padding.
         padding = em*.5
@@ -401,6 +425,13 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
         api.diagnostic_event('SOURCE_FORM_CROP_REGISTERED' if caption_before
                              else 'SOURCE_FIGURE_TABLE_CROP_REGISTERED', **entry)
     _capture_split_containers(doc, registry, manifest, regions, api)
+    from docling_pdf_captions import (locate_prose_wrapping_a_figure, recover_detached_raster_captions,
+                                     split_lists_crossing_illustrations,
+                                     split_stacked_source_figures)
+    recover_detached_raster_captions(doc, registry, manifest, reader, regions, api)
+    split_lists_crossing_illustrations(doc, manifest, api)
+    split_stacked_source_figures(doc, registry, manifest, reader, regions, api)
+    locate_prose_wrapping_a_figure(doc, records, manifest, reader, regions, api)
     return registry
 
 

@@ -16,7 +16,9 @@ def merge_open_sparse_row_tail(left, right, left_geometry, right_geometry, *, sa
     if not (same_grid and left_geometry.get('open_bottom') and right_geometry.get('open_top')):
         return None
     columns = len(right_geometry.get('x_grid', [])) - 1
-    last, first = left.find_all('tr'), right.find('tr')
+    from docling_pdf_table_layout import _table_rows
+
+    last, first = _table_rows(left), right.find('tr')
     if not last or first is None or first.find_parent('thead') is not None:
         return None
     last = last[-1]

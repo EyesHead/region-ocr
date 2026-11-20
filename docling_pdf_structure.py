@@ -77,6 +77,72 @@ def numbered_header_width(fragment):
     return next(iter(widths)) if len(widths) == 1 else None
 
 
+def _separate_owned_equation_tails(doc, records, excluded, manifest, api):
+    """A merged paragraph and its live equation siblings can own the same OCR rows."""
+    from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
+
+    by_page = {}
+    for row in records:
+        if row.get('bbox') and row.get('label') in {'Text', 'Equation'}:
+            by_page.setdefault(row['page_no'], []).append(row)
+    live = {item.self_ref for item, _ in doc.iterate_items()} - set(excluded)
+    for item in doc.texts:
+        if (item.self_ref not in live or item.label != DocItemLabel.TEXT or len(item.prov) != 1
+                or not item.parent or item.children or '<math' not in item.text
+                or _key(item.orig) != _key(item.text)):
+            continue
+        siblings = item.parent.resolve(doc).children
+        index = next((i for i, ref in enumerate(siblings) if ref.cref == item.self_ref), None)
+        if index is None or index + 1 >= len(siblings):
+            continue
+        region = api.item_region(item, doc)
+        if not region:
+            continue
+        page, box = region
+        expanded = [box[0]-.5, box[1]-.5, box[2]+.5, box[3]+.5]
+        rows = sorted((r for r in by_page.get(page, []) if _coverage(r['bbox'], expanded) == 1),
+                      key=lambda r: (r['bbox'][1], r['bbox'][0]))
+        split = next((i for i, row in enumerate(rows) if row['label'] == 'Equation'), 0)
+        if (not split or any(row['label'] != 'Equation' for row in rows[split:])
+                or any(_coverage(row['bbox'], prev['bbox']) > .2 for prev, row in zip(rows, rows[1:]))):
+            continue
+        keys = [_key(api.semantic_ocr_text(row['html'])) for row in rows]
+        if any(not key for key in keys) or ''.join(keys) != _key(item.text):
+            continue
+        following = siblings[index + 1:index + 1 + len(rows) - split]
+        if len(following) != len(rows) - split:
+            continue
+        owners = []
+        for ref, row in zip(following, rows[split:]):
+            formula = ref.resolve(doc)
+            if (ref.cref not in live or formula.label != DocItemLabel.FORMULA
+                    or formula.parent != item.parent or len(formula.prov) != 1 or formula.children):
+                break
+            location = api.item_region(formula, doc)
+            marker = BeautifulSoup(row['html'], 'html.parser')
+            nodes = marker.find_all('math')
+            if (not location or location[0] != page
+                    or any(abs(a - b) > .5 for a, b in zip(location[1], row['bbox']))
+                    or len(nodes) != 1 or nodes[0].get('display') != 'block'
+                    or _key(nodes[0].get_text()) != _key(formula.text)):
+                break
+            owners.append(ref.cref)
+        if len(owners) != len(following):
+            continue
+        prefix = ''.join(keys[:split])
+        item.text = _partition_original_text(item.text, [prefix, ''.join(keys[split:])])[0]
+        item.orig = _partition_original_text(item.orig, [prefix, ''.join(keys[split:])])[0]
+        boxes = [row['bbox'] for row in rows[:split]]
+        prov = item.prov[0].model_copy(deep=True)
+        prov.bbox = BoundingBox(l=min(b[0] for b in boxes), t=min(b[1] for b in boxes),
+                                r=max(b[2] for b in boxes), b=max(b[3] for b in boxes),
+                                origin=CoordOrigin.TOPLEFT)
+        prov.charspan = (0, len(item.text))
+        item.prov = [prov]
+        manifest.setdefault('separated_paragraph_equations', []).append(dict(
+            page=page, paragraph=item.self_ref, equations=owners, source_boxes=[r['bbox'] for r in rows[split:]]))
+
+
 def restore_ocr_paragraphs(doc, records, excluded, manifest, api):
     """Undo assembly merges only when all characters and boundaries agree.
 
@@ -88,6 +154,7 @@ def restore_ocr_paragraphs(doc, records, excluded, manifest, api):
     """
     from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel
 
+    _separate_owned_equation_tails(doc, records, excluded, manifest, api)
     by_page = {}
     for record in records:
         if record.get('label') != 'Text' or not record.get('bbox'):

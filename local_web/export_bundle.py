@@ -8,8 +8,10 @@ import shutil
 import uuid
 
 if __package__:
+    from . import formula_preview
     from .file_paths import native_path, normal_path
 else:
+    import formula_preview
     from file_paths import native_path, normal_path
 
 EXPORT_SCHEMA = 14
@@ -131,11 +133,17 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                 raise ValueError('Канонический HTML не содержит body')
             manifest = _legacy_manifest(canonical, canonical_bytes, soup, pages, structured)
         _check_assets(canonical.parent, manifest)
+        comparison_info = manifest.get('formula_preview')
+        if comparison_info:
+            formula_preview.preview_file(canonical.parent, comparison_info)
+            for digest in comparison_info['images']:
+                formula_preview.preview_image(canonical.parent, comparison_info, digest)
         if manifest.get('export_schema') != EXPORT_SCHEMA:
             # Rebuild only the document layer in a new private canonical.
             # Historical packages/source bytes remain available unchanged.
             normalize_semantic_annotations(soup, {}, {})
-            return build_exports(str(soup), source, destination,
+            content = formula_preview.migration_content(canonical, comparison_info, soup)
+            return build_exports(content, source, destination,
                                  pages=manifest['stats'].get('pages', pages),
                                  output_format=output_format, resource_root=canonical.parent,
                                  initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
@@ -147,7 +155,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         if removed_reviews or removed_rasters or joins or star_notes:
             # Historical canonicals remain immutable. Republish only the
             # document layer; the OCR/layout snapshot is not involved.
-            return build_exports(str(soup), source, destination,
+            content = formula_preview.migration_content(canonical, comparison_info, soup)
+            return build_exports(content, source, destination,
                                  pages=manifest['stats'].get('pages', pages),
                                  output_format=output_format, resource_root=canonical.parent,
                                  initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
@@ -156,11 +165,14 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         soup = BeautifulSoup(content, 'html.parser')
         if soup.body is None:
             raise ValueError('Документ не содержит body после нормализации HTML')
+        comparisons = formula_preview.FormulaComparisons(soup) if pdf_engine_output else None
         structured.strip_review_annotations(soup)
         if pdf_engine_output:
             remove_published_table_rasters(soup)
         normalize_semantic_annotations(soup, {}, {})
         warnings = list(initial_warnings) + list(structured.normalize_table_notes(soup))
+        if comparisons:
+            warnings.extend(comparisons.warnings)
         warnings.extend(notice.get_text(' ', strip=True) for notice in soup.select('aside[data-unrecognized-table]'))
         if pdf_engine_output:
             for figure in soup.select('figure[data-source-formula-review="true"][data-pdf-page]'):
@@ -187,6 +199,7 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                 marker = soup.new_tag('meta', attrs={'name': 'document-export-schema'})
                 soup.head.append(marker)
             marker['content'] = str(EXPORT_SCHEMA)
+        comparison_info = comparisons.write(soup, replay) if comparisons else None
         canonical = replay / 'document.html'
         canonical_bytes = str(soup).encode('utf-8')
         native_path(canonical).write_bytes(canonical_bytes)
@@ -194,6 +207,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                         html_sha256=hashlib.sha256(canonical_bytes).hexdigest(), assets=media.get('assets', []),
                         warnings=list(dict.fromkeys(warnings)), stats=_document_stats(soup, pages, structured),
                         table_joins=joins)
+        if comparison_info:
+            manifest['formula_preview'] = comparison_info
         _save_manifest(canonical, manifest)
     replay = canonical.parent
     stats = dict(manifest['stats'])

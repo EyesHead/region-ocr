@@ -25,7 +25,7 @@ def attach_source_scripts(chars, render_math):
     owners={}
     for i in eligible:
         child=chars[i]
-        if not (child['text'].isalnum() or child['text'] in ',+−-'):continue
+        if not (child['text'].isalnum() or child['text'] in '.,+−-'):continue
         choices=[]
         for j in eligible:
             base=chars[j]
@@ -71,7 +71,7 @@ def attach_source_scripts(chars, render_math):
     # Keep separators in an actual i,j index only after a same-baseline atom.
     for i,owner in tuple(owners.items()):
         child=chars[i]
-        if child['text']==',' and not any(other==owner and chars[k]['text'].isalnum()
+        if child['text'] in '.,' and not any(other==owner and chars[k]['text'].isalnum()
             and chars[k]['x1']<=child['x0']+.05*child['size']
             and child['x0']-chars[k]['x1']<.35*child['size']
             and abs(chars[k]['size']-child['size'])<.05*child['size']
@@ -87,7 +87,7 @@ def attach_source_scripts(chars, render_math):
             while True:
                 last=chars[max(values,key=lambda i:chars[i]['x1'])]
                 tail=[i for i in eligible if i not in owners and i!=base
-                    and (chars[i]['text'].isalnum() or chars[i]['text'] in ',+−-')
+                    and (chars[i]['text'].isalnum() or chars[i]['text'] in '.,+−-')
                     and chars[i]['x0']>=last['x1']-.05*last['size']
                     and chars[i]['x0']-last['x1']<.35*last['size']
                     and abs(chars[i]['size']-last['size'])<.05*last['size']

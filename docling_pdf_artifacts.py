@@ -259,3 +259,141 @@ def suppress_repeated_margin_artifacts(doc, reader, picture_routes, excluded, ma
     manifest['margin_artifact_analysis'] = dict(candidates=len(candidates), removed=len(removed), kept_reasons=reasons)
     api.diagnostic_event('MARGIN_ARTIFACT_ANALYSIS', **manifest['margin_artifact_analysis'])
     return removed
+
+
+def complete_picture_bounds(reader, regions, page_no, box, neighbours):
+    """Expand a layout crop only over missing ink belonging to native PDF images."""
+    from math import ceil, floor
+    import numpy as np
+
+    def intersection(a, b):
+        return max(0., min(a[2], b[2]) - max(a[0], b[0])) * max(0., min(a[3], b[3]) - max(a[1], b[1]))
+
+    if reader is None:
+        return None
+    page = reader.load_page(page_no)
+    source_boxes = []
+    for image in page.images:
+        rect = [image[k] for k in ('x0', 'top', 'x1', 'bottom')]
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        if area <= 0 or reader.is_page_scan(image, box) or min(rect) < 0 or rect[2] > page.width or rect[3] > page.height:
+            continue
+        overlap = intersection(box, rect)
+        # A clipped, standalone figure can cover less of its source bitmap.
+        # Accept it only when the bitmap also covers most of the layout box.
+        if overlap >= .95 * area or (overlap >= .8 * area and overlap >= .8 * intersection(box, box)):
+            source_boxes.append(rect)
+    if not source_boxes:
+        return None
+    rects = [box, *source_boxes]
+    full = [op(r[i] for r in rects) for i, op in enumerate((min, min, max, max))]
+    # Docling rounds bitmap crops to its render grid. A nominal margin of
+    # less than one point can still drop the final row or column of pixels.
+    touches_edge = any(min(abs(rect[i] - box[i]) for i in range(4)) < 1.0 for rect in source_boxes)
+    if full == list(box) and not touches_edge:
+        return None
+
+    for glyph in reader.chars:
+        if not glyph['text'].strip():
+            continue
+        bounds = [glyph[k] for k in ('x0', 'top', 'x1', 'bottom')]
+        if intersection(full, bounds) > intersection(box, bounds) + .01:
+            return None
+    with regions.crop(page_no, full) as bitmap, bitmap.convert('L') as gray:
+        ink = np.asarray(gray) < 210
+        # PdfRegions also renders very large pages via a bounded window.
+        sx, sy = bitmap.width / (full[2] - full[0]), bitmap.height / (full[3] - full[1])
+        def window(rect, start, end):
+            x0 = max(0, start((rect[0] - full[0]) * sx))
+            y0 = max(0, start((rect[1] - full[1]) * sy))
+            x1 = min(bitmap.width, end((rect[2] - full[0]) * sx))
+            y1 = min(bitmap.height, end((rect[3] - full[1]) * sy))
+            return np.s_[y0:y1, x0:x1]
+        ink[window(box, ceil, floor)] = False
+        # A predicted neighbouring paragraph may overlap blank padding.
+        # Preserve the boundary wherever the added strip actually contains its ink.
+        for other in neighbours:
+            if intersection(full, other) > intersection(box, other) + .01 and ink[window(other, floor, ceil)].any():
+                return None
+        for rect in source_boxes:
+            ink[window(rect, floor, ceil)] = False
+        if ink.any():
+            return None
+    return full
+
+
+def picture_caption_band(item, doc, reader, regions, page_no, box, api, *, detached_caption=None):
+    """Recover printed captions owned as children when Docling omits their caption links."""
+    from docling_pdf_native_system import _painted_text_objects, _strict_ink_coverage
+    import numpy as np
+    import re
+
+    if reader is None:
+        return None
+    if detached_caption is not None:
+        if item.children or item.captions or item.parent != doc.body.get_ref() or detached_caption.parent != item.parent:
+            return None
+        children = [detached_caption]
+        expected_parent = item.parent
+    else:
+        if not item.children:
+            return None
+        children = [link.resolve(doc) for link in item.children]
+        expected_parent = item.get_ref()
+    # Layout sometimes links the following numbered paragraph as a caption.
+    # Require a separate source region below the entire crop before detaching it.
+    following_paragraph = bool(item.captions)
+    if following_paragraph:
+        if len(item.captions) != 1:
+            return None
+        linked = item.captions[0].resolve(doc)
+        position = api.item_region(linked, doc)
+        if (linked not in children or len(linked.prov) != 1 or not position or position[0] != page_no
+                or position[1][1] <= box[3] or not re.match(r'^\s*\d+[.)]\s+\S', linked.text)
+                or api._captioned_figure_title(linked.text)):
+            return None
+        children = [child for child in children if child.self_ref != linked.self_ref]
+        if not children:
+            return None
+    if any(str(child.label) not in {'caption', 'text'} or len(child.prov) != 1
+           or child.parent != expected_parent for child in children):
+        return None
+    page = reader.load_page(page_no)
+    rasters = [im for im in page.images if im['x1'] > box[0] and im['x0'] < box[2]
+               and im['bottom'] > box[1] and im['top'] < box[3]]
+    if not rasters or any(reader.is_page_scan(im, box) for im in rasters):
+        return None
+    labels, glyphs = [], []
+    for child in children:
+        pos = api.item_region(child, doc)
+        if not pos or pos[0] != page_no or not api._captioned_figure_title(child.text):
+            return None
+        x0, top, x1, bottom = pos[1]
+        letters = [g for g in reader.chars if g['text'].strip() and g.get('native_script_eligible', True)
+                   and x0 <= (g['x0'] + g['x1']) / 2 <= x1 and top <= (g['top'] + g['bottom']) / 2 <= bottom]
+        if (not letters or any(not g.get('upright', True) for g in letters)
+                or ''.join(''.join(g['text'] for g in sorted(letters, key=lambda c: c['x0'])).split())
+                != ''.join(child.text.split())):
+            return None
+        labels.append((top, x0, child.text))
+        glyphs.extend(letters)
+
+    end_of_image = max(im['bottom'] for im in rasters)
+    start_of_text = min(g['top'] for g in glyphs)
+    if start_of_text <= end_of_image or min(g['bottom'] for g in glyphs) <= box[1]:
+        return None
+    cut = (end_of_image + start_of_text) / 2
+    band = [max(0., min(box[0], min(g['x0'] for g in glyphs)) - .4), cut,
+            min(page.width, max(box[2], max(g['x1'] for g in glyphs)) + .4),
+            min(page.height, max(box[3], max(g['bottom'] for g in glyphs)) + .4)]
+    if not box[1] < cut < box[3] or not _painted_text_objects(regions, page_no, band):
+        return None
+    with regions.crop(page_no, band) as crop, crop.convert('L') as gray:
+        ink = (np.asarray(gray) < 225).astype('uint8') * 255
+        if (ink[0].any() or not _strict_ink_coverage(ink, glyphs, band,
+                crop.width / (band[2] - band[0]), crop.height / (band[3] - band[1]))):
+            return None
+    # Separate labels on the same baseline in physical left-to-right order.
+    if max(top for top, _, _ in labels) - min(top for top, _, _ in labels) > min(g['size'] for g in glyphs) / 2:
+        return None
+    return [box[0], box[1], box[2], cut], [label for _, _, label in sorted(labels, key=lambda row: row[1])], following_paragraph

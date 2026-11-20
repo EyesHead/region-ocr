@@ -566,11 +566,7 @@ def _worker(source: Path, destination: Path, pages: str):
     output = Path(record['output'])
     if not output.is_file():
         raise RuntimeError('Опубликованный HTML отсутствует')
-    page_count = image_pages
-    inputs = list((destination / 'diagnostics').glob('*/input.json'))
-    if inputs:
-        metadata = json.loads(inputs[0].read_text(encoding='utf-8'))
-        page_count = len(metadata.get('orientation') or []) or page_count
+    page_count = record.get('pages', image_pages)
     print(RESULT_MARKER + json.dumps(dict(html=str(output.resolve()), pages=page_count,
                                          technical_status=record.get('status', 'OK')), ensure_ascii=False), flush=True)
 

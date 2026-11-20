@@ -14,6 +14,10 @@ class TableContentError(RuntimeError):
     """A local assembly needs the primary-reading/source-preserving fallback."""
 
 
+class IncompleteCellCoverage(TableContentError):
+    """The proposed cell content leaves visible source pixels unaccounted for."""
+
+
 def primary_table_fallback(records, page, region, api, *, current=None, geometry=None):
     """Return an existing complete primary reading after a local assembly failure."""
     if current and geometry and not geometry.get('page_scan_transcription_required'):
@@ -579,7 +583,7 @@ def _require_ink_coverage(image, boxes, *, physical_cell=False):
     missing = cv2.bitwise_and(ink, cv2.bitwise_not(covered))
     _, _, components, _ = cv2.connectedComponentsWithStats(missing, 8)
     if any(area >= 3 for _, _, _, _, area in components[1:]):
-        raise TableContentError('Typed table OCR omitted visible source content')
+        raise IncompleteCellCoverage('Typed table OCR omitted visible source content')
 
 
 def _source_crop(source_image, region, box):
@@ -1103,6 +1107,33 @@ def _incomplete_plain_cell(image, rendered):
     return _reading_is_short(parsed, image)
 
 
+def _verified_native_cell(physical, geometry, node, image):
+    """Recover the original editable payload only if its recorded pixel proof still matches."""
+    from docling_pdf_text_cells import owns_positioned_text
+
+    witness = physical.get('positioned_source_text') or {}
+    if not witness or witness.get('positioned_assets') or node.select_one(
+            'img[data-table-content="picture"], img[data-cell-content="source-diagram"]'):
+        return None
+    content = '<br/>'.join(line['html'] for line in physical.get('lines', []) if line.get('html'))
+    parsed = BeautifulSoup(content, 'html.parser')
+    if not content or parsed.find(['img', 'svg', 'table']) or not owns_positioned_text(parsed, physical, geometry):
+        return None
+    # Recheck the uncovered pixels against all source glyphs in this exact crop.
+    x0, y0, x1, y1 = physical['bbox']
+    boxes = [glyph.get('bbox') for glyph in physical.get('glyphs', []) if glyph.get('text', '').strip()]
+    if not boxes or any(not bounds or len(bounds) != 4 for bounds in boxes):
+        return None
+    scale_x, scale_y = 1000 / (x1-x0), 1000 / (y1-y0)
+    glyph_boxes = [[(left-x0)*scale_x, (top-y0)*scale_y, (right-x0)*scale_x, (bottom-y0)*scale_y]
+                   for left, top, right, bottom in boxes]
+    try:
+        _require_ink_coverage(image, glyph_boxes, physical_cell=True)
+    except IncompleteCellCoverage:
+        return None
+    return content, dict(method='verified_native_cell_after_incomplete_ocr', **witness)
+
+
 def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, manifest, api, *, image=None):
     from docling_pdf_table_audit import register_protected_source_graphic_cell
 
@@ -1118,7 +1149,8 @@ def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, 
     for element in node.find_all(['svg','math']):
         if element.name == 'svg' or (not element.get_text(strip=True) and not element.get('data-latex')):
             element.decompose()
-    if image is not None and not node.find('img'):
+    incomplete_coverage = isinstance(error, IncompleteCellCoverage)
+    if image is not None and (incomplete_coverage or not node.find('img')):
         from docling_pdf_typed_lines import measured_cell_interior
         interior = measured_cell_interior(image)
         bounds = interior[0] if interior else (0, 0, image.width, image.height)
@@ -1129,7 +1161,18 @@ def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, 
                 preview['alt'] = 'Фрагмент исходной ячейки для сверки'
                 preview['data-table-content'] = 'picture'
                 preview['data-ocr-source-preview'] = 'true'
-                node.append(preview)
+                if incomplete_coverage and (node.get_text(strip=True) or node.find(['img', 'math'])):
+                    details = BeautifulSoup('', 'html.parser').new_tag('details',
+                        attrs={'data-ocr-cell-transcription': 'true'})
+                    summary = BeautifulSoup('', 'html.parser').new_tag('summary')
+                    summary.string = 'Частичное распознавание ячейки'
+                    details.append(summary)
+                    for child in list(node.contents):
+                        details.append(child.extract())
+                    node.append(details)
+                    node.insert(0, preview)
+                else:
+                    node.append(preview)
                 manifest.setdefault('typed_table_picture_assets', []).append(dict(
                     page=page, source_ref=ref, label='Picture',
                     cell={key: position[key] for key in ('row', 'column', 'row_span', 'column_span')},
@@ -1359,7 +1402,7 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                 proof = {}
                 rendered = _render_typed(image, blocks, box[2]-box[0], page, position, proof, api,
                                          source_reader=text_reader, source_bbox=box, physical_cell=physical_cell,
-                                         require_coverage=bool(native_fragments),
+                                         require_coverage=bool(verified_cell or native_fragments),
                                          allow_nested_table=bool(node.find('table')))
                 if text_column and _incomplete_plain_cell(image, rendered):
                     raise TableContentError('Physical text-cell OCR omitted source lines')
@@ -1411,17 +1454,21 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
             api.diagnostic_event('TYPED_TABLE_CONTENT_FAILED', **error.context, reason=str(error))
             if not verified_cell:
                 raise
-            recovered = None
-            if text_column and image is not None and not any(
+            recovered = (_verified_native_cell(physical, geometry, node, image)
+                         if isinstance(error, IncompleteCellCoverage) else None)
+            if recovered is None and text_column and image is not None and not any(
                     payload.select_one('math, sup, sub, table, .source-latex') for payload in existing):
                 from docling_pdf_typed_lines import recover_typed_text_lines
                 recovered = recover_typed_text_lines(image, args, page, position, api)
-                if recovered:
-                    try:
-                        _require_preserved_cell_text(original, physical.get('pending_primary_html') or '',
-                                                     recovered[0], api)
-                    except TableContentError:
-                        recovered = None
+                if (recovered and isinstance(error, IncompleteCellCoverage)
+                        and recovered[1].get('unconfirmed_line_count')):
+                    recovered = None
+            if recovered:
+                try:
+                    _require_preserved_cell_text(original, physical.get('pending_primary_html') or '',
+                                                 recovered[0], api)
+                except TableContentError:
+                    recovered = None
             if recovered is None:
                 _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, manifest, api,
                                       image=image)
@@ -1466,6 +1513,9 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
         from docling_pdf_list_markers import repair_table_list_markers
         repair_table_list_markers(soup, geometry, source_image, region, page, source_reader,
                                   api, manifest, ref=ref)
+        from docling_pdf_scan_recovery import verify_scan_cell_literals
+        verify_scan_cell_literals(soup.table, after, geometry, source_image, region, page,
+                                  source_reader, args, manifest, api, ref)
     return str(soup)
 
 

@@ -1,9 +1,4 @@
-"""Suppress known whole-table layout rasters independently of restoration.
-
-Source table identity and matching provenance establish what the picture is.
-Restoration quality determines OK versus DIAG, never permission to retain a
-raster duplicate of a known table in the published document.
-"""
+"""Suppress table raster duplicates only when another publication owns their content."""
 import base64
 import hashlib
 import re
@@ -18,6 +13,64 @@ def _coverage(inner,outer):
 def _same_table_footprint(bounds,source):
     return (len(bounds)==len(source)==4 and all(abs(a-b)<=2 for a,b in zip(bounds,source))
         and min(_coverage(bounds,source),_coverage(source,bounds))>=.98)
+
+
+def table_crop_has_only_frame_padding(picture, bounds, source):
+    """Require four measured frame rules and account for all ink outside the grid."""
+    import io
+    import math
+
+    margins = (source[0]-bounds[0], source[1]-bounds[1],
+               bounds[2]-source[2], bounds[3]-source[3])
+    if not all(0 <= value <= 6 for value in margins) or _coverage(bounds, source) < .90:
+        return False
+    uri = str(getattr(getattr(picture, 'image', None), 'uri', ''))
+    if not uri.startswith('data:image/png;base64,'):
+        return False
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(uri.split(',', 1)[1], validate=True))) as image:
+            if image.mode != 'RGB':
+                return False
+            darkest = np.asarray(image).min(axis=2)
+    except (ValueError, OSError):
+        return False
+    height, width = darkest.shape
+    scale_x = width / (bounds[2]-bounds[0])
+    scale_y = height / (bounds[3]-bounds[1])
+    left, top = math.floor(margins[0]*scale_x), math.floor(margins[1]*scale_y)
+    right, bottom = width-math.floor(margins[2]*scale_x), height-math.floor(margins[3]*scale_y)
+    if min(right-left, bottom-top) < 16:
+        return False
+    # A gray scan margin must not hide an additional dark mark. Test ink
+    # against the frame at multiple intensities, including the light fringe.
+    for threshold in (128, 224, 255):
+        mask = (darkest < threshold).astype('uint8')
+        outside = mask.copy()
+        outside[top:bottom, left:right] = 0
+        # Long runs at the four measured edges can be the scan's thick rules.
+        # Restrict the mask to those edges so that interior rulings cannot
+        # explain extra text, an arrow or other marks in the outer margin.
+        horizontal = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+            np.ones((1, round(.8*(right-left))), np.uint8))
+        vertical = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+            np.ones((round(.8*(bottom-top)), 1), np.uint8))
+        for lines, start, stop in ((horizontal, top, bottom), (vertical.T, left, right)):
+            length, span = lines.shape
+            for edge in (start, stop-1):
+                band = lines[max(0,edge-3):min(length,edge+4)]
+                if not np.any(band.sum(axis=1) > .8*span):
+                    return False
+            lines[:max(0,start-3)] = 0
+            lines[start+4:stop-4] = 0
+            lines[min(length,stop+3):] = 0
+        frame = cv2.dilate(horizontal | vertical, np.ones((3,3), np.uint8))
+        if np.any(outside & (1-frame)):
+            return False
+    return True
 
 
 def aligned_table_layout_crop(bounds, source, *, table_caption=False):
@@ -37,8 +90,8 @@ def _image_digest(picture):
     except (ValueError,IndexError):return None
 
 
-def _complete_source_cells(entry, api):
-    """Stricter evidence for the caption-extended footprint, never a guess."""
+def _complete_source_cells(entry, api, preview_assets=()):
+    """Require a published payload for every cell of the verified physical grid."""
     from bs4 import BeautifulSoup
     fragment = entry.get('html', '')
     # A source-image fallback is a registered table candidate, not a
@@ -48,26 +101,57 @@ def _complete_source_cells(entry, api):
         return False
     profile = api.table_profile(fragment)
     geometry = entry.get('pdf_geometry') or entry.get('join_geometry') or {}
+    if (entry.get('fallback_reason') or entry.get('method') in {'editable_table_review', 'unrecognized_table'}
+            or not (geometry.get('source_grid_verified') or geometry.get('positioned_source_grid_verified')
+                    or geometry.get('glyph_coverage') == 1.0)):
+        return False
     position = lambda c: tuple(c[k] for k in ('row','column','row_span','column_span'))
     physical = geometry.get('cells') or []
     try:
         same_cells = {position(c) for c in physical} == {position(c) for c in profile.get('cells', [])}
     except (KeyError, TypeError):
         return False
-    if profile.get('issues') or not physical or not profile.get('cells') or not same_cells:
+    if (profile.get('issues') or not physical or len(physical) != len(profile.get('cells', [])) or not same_cells):
         return False
     soup = BeautifulSoup(fragment, 'html.parser')
-    return bool(soup.table and all(n.get_text(strip=True) or n.find(['img','math'])
-        for n in soup.table.find_all(['td','th']) if n.find_parent('table') is soup.table))
+    if (not soup.table or soup.table.select_one('[data-unrecognized-table]')
+            or '[Фрагмент ячейки не распознан]' in soup.table.get_text()):
+        return False
+    nodes = [n for n in soup.table.find_all(['td','th']) if n.find_parent('table') is soup.table]
+    if len(nodes) != len(physical) or any(not (n.get_text(strip=True) or n.find(['img','math'])) for n in nodes):
+        return False
+    reviews = soup.table.select('[data-ocr-review]')
+    if not reviews:
+        return True
+    # A disputed transcription is complete visually only when the exact
+    # registered source preview is still present inside its own grid cell.
+    by_position = {position(cell): cell for cell in physical}
+    for warning in reviews:
+        owner = warning.find_parent(['td', 'th'])
+        index = next((i for i, node in enumerate(nodes) if node is owner), None)
+        if index is None:
+            return False
+        cell = by_position[position(profile['cells'][index])]
+        images = owner.select('img[data-ocr-source-preview="true"][data-table-content="picture"][src]')
+        if len(images) != 1 or not images[0]['src'].startswith('data:image/png;base64,'):
+            return False
+        digest = hashlib.sha256(images[0]['src'].encode()).hexdigest()
+        if not any(asset.get('method') == 'source_preview_for_unresolved_physical_cell'
+                   and asset.get('page') == entry.get('page') and asset.get('source_ref') == entry.get('ref')
+                   and asset.get('cell') == {key: cell[key] for key in ('row','column','row_span','column_span')}
+                   and asset.get('source_cell_bbox') == cell.get('bbox') and cell.get('bbox')
+                   and asset.get('source_sha256') == digest for asset in preview_assets):
+            return False
+    return True
 
 
-def _caption_extended_footprint(bounds, source, table, entry, page, doc, excluded, api):
+def _caption_extended_footprint(bounds, source, table, entry, page, doc, excluded, api, preview_assets=()):
     """Prove a full table raster whose only extra band is its own caption."""
     if (bounds[1] >= source[1]
             or any(abs(bounds[i]-source[i]) > 2 for i in (0,2,3))
             or _coverage(source, bounds) < .98):
         return None
-    if not _complete_source_cells(entry, api):
+    if not _complete_source_cells(entry, api, preview_assets):
         return None
     captions = []
     for reference in table.captions:
@@ -176,7 +260,8 @@ def suppress_layout_table_rasters(doc,manifest,excluded,api):
         for basis,box in boxes:
             if not box or len(box)!=4 or tuple(box) in seen:continue
             seen.add(tuple(box));by_page.setdefault(entry['page'],[]).append((ref,box,basis))
-    removed=[];issues=[]
+    removed=[];issues=[];complete={}
+    preview_assets = manifest.get('typed_table_picture_assets', [])
     figure_prefix=re.compile(r'^\s*(?:[а-яёa-z]\)\s*)?(?:(?:Рисунок|Рис\.|Схема|Черт[её]ж|Узел|Разрез|План|Вид)(?:\s|$)'
         r'|(?:Figure|Fig\.?)(?=\s|\d|[.:—–-]|$))',re.I)
     for picture in doc.pictures:
@@ -194,7 +279,7 @@ def suppress_layout_table_rasters(doc,manifest,excluded,api):
             if not candidates:
                 for ref, source, basis in by_page.get(prov.page_no, []):
                     caption_proof = _caption_extended_footprint(bounds, source, owners[ref], entries[ref],
-                        prov.page_no, doc, excluded, api)
+                        prov.page_no, doc, excluded, api, preview_assets)
                     if caption_proof:
                         candidates = [(ref,source,'complete_table_and_owned_caption')]
                         break
@@ -203,21 +288,28 @@ def suppress_layout_table_rasters(doc,manifest,excluded,api):
             matches.append(dict(page=prov.page_no,table_ref=ref,picture_bbox=bounds,
                 source_table_bbox=list(source),source_identity_basis=basis,**(caption_proof or {})))
         if len(matches)!=len(picture.prov):continue
+        refs = {match['table_ref'] for match in matches}
+        for ref in refs - complete.keys():
+            complete[ref] = ref not in excluded and _complete_source_cells(entries[ref], api, preview_assets)
+        if not all(complete[ref] for ref in refs):
+            if picture.self_ref not in excluded:
+                for ref in sorted(refs):
+                    if not complete[ref]:
+                        issue = dict(ref=ref, page=entries[ref]['page'], bbox=entries[ref].get('bbox'),
+                                     picture=picture.self_ref,
+                                     reason='source_table_crop_retained_without_complete_structured_table')
+                        issues.append(issue)
+                        api.diagnostic_event('TABLE_SOURCE_RASTER_RETAINED', **issue)
+            continue
+        # The following ownership pass reparents independent children and captions.
+        if picture.children or picture.captions:
+            continue
         already_excluded=picture.self_ref in excluded
         excluded.add(picture.self_ref)
         proof=dict(picture=picture.self_ref,source_image_sha256=_image_digest(picture),
             source_parts=matches,already_excluded=already_excluded,
-            method='known_table_raster_removed_policy')
+            method='complete_structured_table_owns_source_raster')
         removed.append(proof);api.diagnostic_event('KNOWN_TABLE_RASTER_REMOVED',**proof)
-        for ref in {match['table_ref'] for match in matches}:
-            entry=entries[ref];selected=entry.get('selected') or {}
-            usable=('<table' in str(entry.get('html','')).lower() and not selected.get('issues')
-                and selected.get('rows',0)>0 and selected.get('columns',0)>0)
-            if not usable:
-                issue=dict(ref=ref,page=entry['page'],bbox=entry.get('bbox'),picture=picture.self_ref,
-                    reason='known_table_raster_removed_without_usable_structured_publication',
-                    method='known_table_raster_removed_policy')
-                if issue not in issues:issues.append(issue)
     manifest['known_table_rasters_removed']=removed
     manifest['known_table_raster_policy_issues']=issues
     return removed
@@ -241,7 +333,7 @@ def table_review_notice(soup, *, page=None, ref=None, caption=None):
 
 
 def remove_published_table_rasters(soup, *, captioned_layout=True):
-    """Replace legacy table screenshots before copying any referenced media."""
+    """Keep legacy crops unless the same published table still contains their pixels."""
     from docling_pdf_forms import FIGURE_CAPTION, FORM_HEADING
 
     table_caption = re.compile(r'^\s*(?:(?:Продолжение|Окончание)\s+)?(?:Таблиц[аы]|Табл\.)\s*'
@@ -258,12 +350,32 @@ def remove_published_table_rasters(soup, *, captioned_layout=True):
         if FIGURE_CAPTION.fullmatch(title) or FORM_HEADING.fullmatch(title):
             classes = [value for value in figure.get('class', []) if value != 'source-table']
             figure['class'] = list(dict.fromkeys([*classes, 'source-picture']))
-        else:
-            label = caption.extract() if caption else None
-            if label:
-                label.name = 'p'
-            figure.replace_with(table_review_notice(soup, caption=label,
-                page=figure.get('data-pdf-page'), ref=figure.get('data-pdf-table-ref')))
+            changed += 1
+            continue
+        ref = figure.get('data-pdf-table-ref')
+        if not ref or figure.find(['figure', 'table']):
+            continue
+        owners = soup.find_all('table', attrs={'data-pdf-table-ref': ref})
+        if len(owners) != 1:
+            continue
+        owner = owners[0]
+        page = figure.get('data-pdf-page')
+        if not page or owner.get('data-pdf-page') != page:
+            continue
+        published = {img['src'] for img in owner.find_all('img', src=True)
+                     if img.find_parent('table') is owner and img['src']}
+        images = figure.find_all('img')
+        if not images or any(img.get('src') not in published for img in images):
+            continue
+        for img in images:
+            img.decompose()
+        if caption:
+            owner_caption = owner.find('caption', recursive=False)
+            if owner_caption and caption.decode_contents() == owner_caption.decode_contents():
+                caption.decompose()
+            else:
+                caption.name = 'p'
+        figure.unwrap()
         changed += 1
     return changed
 

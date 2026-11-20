@@ -6,8 +6,11 @@ asset extraction. They never infer missing values or repair a particular source.
 from __future__ import annotations
 
 import html
+import math
 import re
+from copy import copy
 from decimal import Decimal, InvalidOperation
+from itertools import groupby
 from pathlib import Path
 
 from bs4 import BeautifulSoup, Comment, NavigableString
@@ -22,6 +25,10 @@ NOTE_WORD = r'(?:п\s*р\s*и\s*м\s*е\s*ч\s*а\s*н\s*и\s*[ея]|n\s*o\s*t\s
 NOTE_LABEL = re.compile(r'^' + NOTE_WORD + r'(?:\s*\d+)?\b', re.I)
 NOTE_ANYWHERE = re.compile(r'\b' + NOTE_WORD + r'\b', re.I)
 BLOCK_TAGS = {'p', 'div', 'section', 'article', 'main', 'header', 'footer', 'aside', 'body'}
+INLINE_TAGS = {'a', 'abbr', 'b', 'bdi', 'bdo', 'br', 'cite', 'code', 'del', 'em', 'i', 'img',
+               'ins', 'kbd', 'mark', 'math', 'q', 's', 'samp', 'small', 'span', 'strong', 'sub',
+               'sup', 'time', 'u', 'var'}
+INDENT_STYLE = re.compile(r'(?:^|;)\s*(text-indent|margin-left|padding-left)\s*:\s*([^;]+)', re.I)
 MATH_CONTAINERS = {'math', 'mrow', 'mstyle', 'semantics', 'mpadded', 'merror'}
 LATEX_CHARS = {'α': r'\alpha', 'β': r'\beta', 'γ': r'\gamma', 'δ': r'\delta', 'ε': r'\varepsilon',
                'ζ': r'\zeta', 'η': r'\eta', 'θ': r'\theta', 'ϑ': r'\vartheta', 'ι': r'\iota',
@@ -169,10 +176,12 @@ def _span(cell, name, default=1):
 
 def _grid(table):
     rows, entries, occupied, width = _rows(table), [], set(), 0
+    group_end = 0
     for row_index, row in enumerate(rows):
-        group = row.parent
-        group_rows = [candidate for candidate in rows if candidate.parent is group]
-        remaining = len(group_rows) - group_rows.index(row)
+        if group_end == row_index:
+            while group_end < len(rows) and rows[group_end].parent is row.parent:
+                group_end += 1
+        remaining = group_end - row_index
         column = 0
         for cell in row.find_all(['td', 'th'], recursive=False):
             while (row_index, column) in occupied:
@@ -344,6 +353,31 @@ def _list_json(node, render_item):
     return result
 
 
+def _block_children(container):
+    """Keep consecutive inline children in one paragraph, in source order."""
+    children = (child for child in container.children if not isinstance(child, Comment))
+    def is_inline(child):
+        if isinstance(child, NavigableString):
+            return True
+        return (child.name in INLINE_TAGS and child.get('display') != 'block'
+                and child.get('data-formula') != 'display' and child.get('role') != 'note'
+                and not child.has_attr('data-source-annotation'))
+
+    for inline, group in groupby(children, is_inline):
+        if not inline:
+            yield from group
+            continue
+        nodes = list(group)
+        meaningful = [child for child in nodes if getattr(child, 'name', None) or str(child).strip()]
+        if len(meaningful) == 1 or all(getattr(node, 'name', None) in {'img', 'math'} for node in meaningful):
+            yield from meaningful
+        elif meaningful:
+            paragraph = BeautifulSoup('', 'html.parser').new_tag('p')
+            for child in nodes:
+                paragraph.append(copy(child))
+            yield paragraph
+
+
 def _plain(node, *, image_paths=False):
     if isinstance(node, Comment):
         return ''
@@ -364,6 +398,10 @@ def _plain(node, *, image_paths=False):
     if node.name in {'ol', 'ul'}:
         return '\n'.join((marker + ' ' if node.name == 'ol' else '') + ''.join(_plain(child, image_paths=image_paths)
                            for child in item.children).strip() for item, _, marker in _list_entries(node))
+    if node.name in {'td', 'th'} or node.name in BLOCK_TAGS - {'p'}:
+        return '\n\n'.join(_plain(child, image_paths=image_paths) for child in _block_children(node))
+    if node.name == 'table':
+        return _plain_table(node, image_paths=image_paths)
     return ''.join(_plain(child, image_paths=image_paths) for child in node.children)
 
 
@@ -420,7 +458,9 @@ def _table_md(table):
     caption = table.find('caption', recursive=False)
     prefix = _inline_md(caption).strip() + '\n\n' if caption else ''
     # Nested tables have their own layout; a pipe cell cannot represent it.
-    complex_table = table_is_complex(table) or any(entry['node'].find('table') for entry in entries)
+    complex_table = (table_is_complex(table) or table.find('table') is not None
+                     or table.find('details', attrs={'data-ocr-cell-transcription': True}) is not None
+                     or any(INDENT_STYLE.search(node['style']) for node in table.find_all(style=True)))
     if complex_table:
         clone = BeautifulSoup(str(table), 'html.parser').find('table')
         for math in list(clone.find_all('math')):
@@ -448,7 +488,7 @@ def _table_md(table):
 
 def _markdown_blocks(container, indent=''):
     output = []
-    for node in container.children:
+    for node in _block_children(container):
         if isinstance(node, Comment):
             continue
         if isinstance(node, NavigableString):
@@ -457,7 +497,11 @@ def _markdown_blocks(container, indent=''):
             continue
         if node.name in {'style', 'title', 'meta', 'head', 'script'}:
             continue
-        if node.name == 'table':
+        if node.name == 'details' and node.has_attr('data-pdf-formula-transcript'):
+            output.append(str(node))
+        elif node.name in BLOCK_TAGS and INDENT_STYLE.search(node.get('style', '')):
+            output.append(str(node))
+        elif node.name == 'table':
             output.append(_table_md(node))
         elif re.fullmatch('h[1-6]', node.name):
             output.append('#' * int(node.name[1]) + ' ' + _inline_md(node).strip())
@@ -485,7 +529,7 @@ def _markdown_blocks(container, indent=''):
         elif node.name == 'hr':
             output.append('---')
         elif node.name == 'p':
-            output.append(_inline_md(node).removesuffix('<br>').strip())
+            output.append(_inline_md(node).removesuffix('<br>').strip(' \t\r\n'))
         else:
             output.append(_inline_md(node).strip())
     return '\n\n'.join(item for item in output if item).strip('\n')
@@ -610,6 +654,19 @@ def _table_json(table):
 
 
 def _source_metadata(node, item):
+    if node.name in BLOCK_TAGS:
+        for prop, value in INDENT_STYLE.findall(node.get('style', '')):
+            item[prop.lower().replace('-', '_')] = value.strip()
+    if node.get('data-page-furniture') == 'true':
+        item['page_furniture'] = True
+        try:
+            page = int(node.get('data-source-page', ''))
+            bounds = [float(value) for value in node.get('data-source-bbox', '').split(',')]
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if page > 0 and len(bounds) == 4 and all(math.isfinite(value) for value in bounds):
+                item.update(source_page=page, source_bbox=bounds)
     for attribute, field in (('id', 'id'), ('data-source-ref', 'source_ref'),
                              ('data-source-clause', 'source_clause'),
                              ('data-annotation-kind', 'annotation'),
@@ -622,7 +679,7 @@ def _source_metadata(node, item):
 
 def _json_blocks(container):
     output = []
-    for node in container.children:
+    for node in _block_children(container):
         if isinstance(node, Comment):
             continue
         if isinstance(node, NavigableString):
@@ -652,7 +709,8 @@ def _json_blocks(container):
                 output.extend(children)
         else:
             kind = 'heading' if re.fullmatch('h[1-6]', node.name) else 'code' if node.name == 'pre' else 'caption' if node.name == 'figcaption' else 'paragraph'
-            item = {'type': kind, 'value': _plain(node).strip()}
+            value = _plain(node)
+            item = {'type': kind, 'value': value if node.name == 'pre' else value.strip(' \t\r\n')}
             if kind == 'heading':
                 item['level'] = int(node.name[1])
             rich = [_rich(child) for child in node.children]
@@ -671,9 +729,21 @@ def to_json_document(soup, source: Path, stats: dict):
             'blocks': _json_blocks(soup.body or soup), 'stats': dict(stats)}
 
 
+def _plain_table(node, *, image_paths):
+    rows, entries, width = _grid(node)
+    matrix = [[''] * width for _ in rows]
+    for entry in entries:
+        matrix[entry['row']][entry['col']] = _plain(entry['node'], image_paths=image_paths).strip()
+    body = '\n'.join('\t'.join(row) for row in matrix)
+    caption = node.find('caption', recursive=False)
+    if caption:
+        return _plain(caption, image_paths=image_paths).strip() + '\n\n' + body
+    return body
+
+
 def _plain_blocks(container):
     output = []
-    for node in container.children:
+    for node in _block_children(container):
         if isinstance(node, Comment):
             continue
         if isinstance(node, NavigableString):
@@ -683,21 +753,15 @@ def _plain_blocks(container):
         if node.name in {'head', 'style', 'title', 'meta', 'script'}:
             continue
         if node.name == 'table':
-            rows, entries, width = _grid(node)
-            caption = node.find('caption', recursive=False)
-            if caption:
-                output.append(_plain(caption, image_paths=True).strip())
-            matrix = [[''] * width for _ in rows]
-            for entry in entries:
-                matrix[entry['row']][entry['col']] = _plain(entry['node'], image_paths=True).strip()
-            output.append('\n'.join('\t'.join(row) for row in matrix))
+            output.append(_plain_table(node, image_paths=True))
         elif node.name in {'ul', 'ol'}:
             output.append('\n'.join((marker + ' ' if node.name == 'ol' else '') + _plain_blocks(item)
                                     for item, _, marker in _list_entries(node)))
         elif node.name in BLOCK_TAGS - {'p'} or node.name in {'figure', 'blockquote'}:
             output.append(_plain_blocks(node))
         else:
-            output.append(_plain(node, image_paths=True).strip())
+            value = _plain(node, image_paths=True)
+            output.append(value if node.name == 'pre' else value.strip(' \t\r\n'))
     return '\n\n'.join(item for item in output if item)
 
 

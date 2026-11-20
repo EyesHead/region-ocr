@@ -28,16 +28,18 @@ import zipfile
 import tempfile
 
 if __package__:
+    from . import formula_preview
     from .file_paths import native_path, normal_path
     from .result_storage import ResultStorage
     from .conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 else:
+    import formula_preview
     from file_paths import native_path, normal_path
     from result_storage import ResultStorage
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -597,6 +599,23 @@ class JobStore:
                 raise APIError('Исходный HTML для предпросмотра не найден.', 404)
             return native_path(path)
 
+    def preview_document(self, ident):
+        canonical = self.canonical(ident)
+        try:
+            info = formula_preview.preview_info(canonical)
+            return formula_preview.preview_file(normal_path(canonical).parent, info) if info else canonical
+        except (ValueError, OSError) as error:
+            raise APIError(str(error), 409) from None
+
+    def formula_asset(self, ident, digest):
+        canonical = self.canonical(ident)
+        try:
+            return formula_preview.preview_image(normal_path(canonical).parent, formula_preview.preview_info(canonical), digest)
+        except FileNotFoundError as error:
+            raise APIError(str(error), 404) from None
+        except (ValueError, OSError) as error:
+            raise APIError(str(error), 409) from None
+
     def save_result(self, ident):
         if not isinstance(ident, str) or not re.fullmatch(r'[0-9a-f]{32}', ident):
             raise APIError('Не выбран документ для сохранения.')
@@ -963,13 +982,18 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r'/api/installed/([0-9a-f]{32})/log', path)
             if match:
                 return self._json({'content': store.saved_call('read_log', match[1])})
-            match = re.fullmatch(r'/api/(?:view/([0-9a-f]{32})|installed/([0-9a-f]{32})/view)/(document\.html|src/[^/]+)', path)
+            match = re.fullmatch(r'/api/(?:view/([0-9a-f]{32})|installed/([0-9a-f]{32})/view)/(document\.html|src/[^/]+|formula-src/[a-f0-9]{64}\.png)', path)
             if match:
                 job_id, saved_id, resource = match.groups()
                 if resource == 'document.html':
-                    file = (store.saved_document(saved_id, 'html') if saved_id
-                            else store.canonical(job_id))
+                    file = (store.saved_call('preview_document', saved_id) if saved_id
+                            else store.preview_document(job_id))
                     return self._file(file, 'text/html; charset=utf-8')
+                if resource.startswith('formula-src/'):
+                    digest = resource.removeprefix('formula-src/').removesuffix('.png')
+                    file = (store.saved_call('formula_asset', saved_id, digest) if saved_id
+                            else store.formula_asset(job_id, digest))
+                    return self._file(file, 'image/png')
                 name = unquote(resource[4:])
                 if saved_id:
                     file = store.saved_call('asset', saved_id, name)
@@ -982,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
                 if match[1] == "download":
                     return self._archive(fmt, [match[2]])
                 if match[1] == 'preview' and query.get('view', [''])[0] == 'html':
-                    file = store.canonical(match[2])
+                    file = store.preview_document(match[2])
                     selected_format, name = 'html', file.name
                 else:
                     file, name = store.artifact(match[2], fmt)
@@ -991,9 +1015,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._file(file, FORMATS[selected_format][1], name)
                 with file.open("rb") as stream:
                     data = stream.read(MAX_PREVIEW + 1)
-                return self._json({"content": data[:MAX_PREVIEW].decode("utf-8", errors="replace"),
-                                   "format": selected_format, "assets_base_url": f"/api/assets/{match[2]}/",
-                                   "truncated": len(data) > MAX_PREVIEW})
+                preview = {"content": data[:MAX_PREVIEW].decode("utf-8", errors="replace"),
+                           "format": selected_format, "assets_base_url": f"/api/assets/{match[2]}/",
+                           "truncated": len(data) > MAX_PREVIEW}
+                if query.get('view', [''])[0] == 'html':
+                    base = f'/api/view/{match[2]}/'
+                    preview.update(document_url=base + 'document.html', document_base_url=base)
+                return self._json(preview)
             match = re.fullmatch(r"/api/assets/([0-9a-f]{32})/([^/]+)", path)
             if match:
                 file, kind = store.asset(match[1], unquote(match[2]))
@@ -1023,6 +1051,11 @@ class Handler(BaseHTTPRequestHandler):
                     except (ValueError, OSError, json.JSONDecodeError) as error:
                         raise APIError(str(error), 409) from None
                 return self._json(result)
+            if path == '/api/settings/open':
+                self._body()
+                with store.lock:
+                    store.saved_call('open_root')
+                return self._json({'ok': True})
             if path == '/api/settings':
                 return self._json(store.change_output_dir(self._body().get('output_dir')))
             if path == '/api/upload-check':

@@ -39,7 +39,7 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
 .output-location-text{grid-template-columns:minmax(0,1fr);gap:3px;min-width:0}
 .output-caption{font-size:12px;font-weight:600}
 #output-directory{font-size:12px;color:var(--muted)}
-.output-location-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-shrink:0}
+.output-location-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px 12px;flex-wrap:wrap;max-width:100%}
 .output-location-actions .button{min-height:36px;font-size:12px;padding:7px 11px}
 .output-location-actions #download-all{background:var(--white);border-color:var(--control);color:var(--ink)}
 .output-location-actions #download-all:hover:not(:disabled){background:var(--white);border-color:var(--blue);color:var(--navy)}

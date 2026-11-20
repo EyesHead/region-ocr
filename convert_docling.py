@@ -2501,7 +2501,7 @@ def mathematical_cell_label(cell):
 
 
 def latex_math(latex, display="block"):
-    """Return executable-free MathML, or None so the caller preserves the source image."""
+    """Return executable-free MathML, or None if the notation cannot be parsed."""
     from bs4 import BeautifulSoup
     from latex2mathml.converter import convert
 
@@ -5148,9 +5148,11 @@ def align_table_spans_to_rules(fragment, geometry):
 
 def normalize_joined_table_body(table):
     """With an explicit column header, continuation cells belong to the body."""
-    if table.find("thead") is not None:
-        for cell in table.find_all("th"):
-            if cell.find_parent("thead") is None:
+    from docling_pdf_table_layout import _table_cells
+
+    if table.find("thead", recursive=False) is not None:
+        for cell in _table_cells(table):
+            if cell.name == "th" and cell.find_parent("thead") is None:
                 cell.name = "td"
 
 
@@ -5162,7 +5164,7 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
     a small, unretained drawing in a table does not establish duplication.
     """
     from docling_core.types.doc import ContentLayer, DocItemLabel
-    from docling_pdf_table_rasters import aligned_table_layout_crop
+    from docling_pdf_table_rasters import aligned_table_layout_crop, _complete_source_cells
 
     table_items = {item.self_ref:item for item in doc.tables}
     table_entries = {entry['ref']: entry for entry in manifest['tables']}
@@ -5208,6 +5210,7 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
     diagnostic_event("PICTURE_DUPLICATE_SCAN", pictures=len(doc.pictures), tables=len(manifest["tables"]),
                      candidate_pages=sorted(by_page)[:32], candidate_page_count=len(by_page),
                      candidates=sum(len(values) for values in by_page.values()))
+    complete_tables = {}
     duplicates = []
     for picture in doc.pictures:
         caption_refs={ref.cref for ref in picture.captions}
@@ -5253,6 +5256,10 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
                     matched=aligned_table_layout_crop(box, source,
                         table_caption=bool(captions and caption_compatible(captions,table_ref)))
                     policy='confirmed_table_layout_crop'
+                    if not matched and source == (table_entries[table_ref].get('pdf_geometry') or {}).get('bbox'):
+                        from docling_pdf_table_rasters import table_crop_has_only_frame_padding
+                        matched = table_crop_has_only_frame_padding(picture, box, source)
+                        policy = 'measured_table_frame_owns_crop_padding'
                 else:
                     matched=coverage>=.85
                     policy='retained_cell_object'
@@ -5265,6 +5272,12 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
                 captions_ok=not captions or ((coincident or basis=='verified_layout_table')
                     and caption_compatible(captions,table_ref))
                 matched=matched and captions_ok and (whole or not independent)
+                if matched and whole:
+                    if table_ref not in complete_tables:
+                        complete_tables[table_ref] = (table_ref not in excluded and
+                            _complete_source_cells(table_entries[table_ref], sys.modules[__name__],
+                                                   manifest.get('typed_table_picture_assets', [])))
+                    matched = complete_tables[table_ref]
                 diagnostic_event("PICTURE_DUPLICATE_PAIR", picture=picture.self_ref, table=table_ref,
                                  page=prov.page_no, bbox=box, source_bbox=source, basis=basis,
                                  picture_area=area, source_area=source_area, intersection=intersection,
@@ -5410,12 +5423,14 @@ def source_parenthesis_continuations(doc, reader):
 
 def join_description_tail(left, right):
     """Join an edge description only when all continuation value cells are empty."""
-    a = left.find_all('tr')[-1].find_all(['td','th'], recursive=False)
+    from docling_pdf_table_layout import _table_rows
+
+    a = _table_rows(left)[-1].find_all(['td','th'], recursive=False)
     first = right.find('tr')
     b = first.find_all(['td','th'], recursive=False) if first else []
     if (len(a) != len(b) or len(a) < 3
             or any(int(c.get('colspan',1)) != 1 or int(c.get('rowspan',1)) != 1 for c in a+b)
-            or any(c.find(['img','math']) for c in a+b)
+            or any(c.find(['img','math','table']) for c in a+b)
             or any(c.get_text(strip=True) for c in b[1:])
             or not all(re.fullmatch(r'[\d.,/\s]+', c.get_text(strip=True)) for c in a[1:])):
         return False
@@ -5435,6 +5450,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
     """Join neighboring HTML fragments by source grids, regardless of OCR route."""
     from bs4 import BeautifulSoup
     from docling_core.types.doc import ContentLayer, DocItemLabel, TableCell, TableData
+    from docling_pdf_table_layout import _table_rows, _table_cells
 
     entries = {entry["ref"]: entry for entry in manifest["tables"]}
     def caption_text(text):
@@ -5464,8 +5480,9 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
         return [tuple((furniture_key(cell.get_text(" ", strip=True)), cell.get("rowspan", "1"), cell.get("colspan", "1"),
                        repr(sorted(script_terms(str(cell)).items())),
                        tuple(repr(math_signature(str(m))) for m in cell.find_all('math')),
-                       tuple(hashlib.sha256(i.get('src','').encode()).hexdigest() for i in cell.find_all('img')))
-                      for cell in row.find_all(["td", "th"], recursive=False)) for row in table.find_all("tr")[:count]]
+                       tuple(hashlib.sha256(i.get('src','').encode()).hexdigest() for i in cell.find_all('img')),
+                       tuple(str(nested) for nested in cell.find_all('table')))
+                      for cell in row.find_all(["td", "th"], recursive=False)) for row in _table_rows(table)[:count]]
 
     # Layout order can place next-section headings before the preceding table
     # fragment. Pair tables by physical source position; inspect the actual
@@ -5547,8 +5564,8 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
         nodes = first.find_all(["td", "th"], recursive=False) if first else []
         if (len(nodes) < 3
                 or any(int(node.get(attr, 1)) != 1 for node in nodes for attr in ("colspan", "rowspan"))
-                or any(node.get_text(strip=True) or node.find(["img", "math"]) for node in nodes[:2])
-                or any(node.find(["img", "math"]) or re.search(r"\d", node.get_text()) for node in nodes)):
+                or any(node.get_text(strip=True) or node.find(["img", "math", "table"]) for node in nodes[:2])
+                or any(node.find(["img", "math", "table"]) or re.search(r"\d", node.get_text()) for node in nodes)):
             return False
         populated = [i for i, node in enumerate(nodes) if node.get_text(strip=True)]
         if not populated:
@@ -5556,9 +5573,9 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
         a = table_profile(str(left))
         if len(nodes) != a["columns"]:
             return False
-        targets = {cell["column"]: node for cell, node in zip(a["cells"], left.find_all(["td", "th"]))
+        targets = {cell["column"]: node for cell, node in zip(a["cells"], _table_cells(left))
                    if cell["column_span"] == 1 and cell["row"] + cell["row_span"] == a["rows"]}
-        if any(i not in targets or not targets[i].get_text(strip=True) or targets[i].find(["img", "math"])
+        if any(i not in targets or not targets[i].get_text(strip=True) or targets[i].find(["img", "math", "table"])
                for i in populated):
             return False
         for i in populated:
@@ -5614,9 +5631,9 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
             old_soup = BeautifulSoup(routes[old_item.self_ref], "html.parser")
             soup = BeautifulSoup(routes[item.self_ref], "html.parser")
             # Source-gap checks below protect intervening prose and figures.
-            head = old_soup.table.find("thead") if old_soup.table else None
-            header_count = len(head.find_all("tr")) if head else 0
-            new_head = soup.table.find("thead") if soup.table else None
+            head = old_soup.table.find("thead", recursive=False) if old_soup.table else None
+            header_count = len(_table_rows(head)) if head else 0
+            new_head = soup.table.find("thead", recursive=False) if soup.table else None
             repeated = (header_count and soup.table is not None
                         and header_signature(old_soup.table, header_count) == header_signature(soup.table, header_count))
             numeric_head = bool(new_head and all(
@@ -5624,7 +5641,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                 and all(int(cell.get("colspan", 1)) == 1 and int(cell.get("rowspan", 1)) == 1
                         and re.fullmatch(r"[\d\s.,+−–—\-/%<>≤≥=]+", cell.get_text(" ", strip=True)) for cell in cells)
                 and sum(bool(re.search(r"\d", cell.get_text())) for cell in cells) >= len(cells) / 2
-                for row in new_head.find_all("tr")))
+                for row in _table_rows(new_head)))
             old_identity, identity = identities.get(old_item.self_ref), identities.get(item.self_ref)
             caption = captions.get(item.self_ref, "")
             labelled_continuation = bool(re.match(r"^(?:Продолжение|Окончание)\b",caption,re.I))
@@ -5633,7 +5650,8 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
             header_proof=None
             review_header=(explicit_continuation or (not caption and not identity) or
                            (identity and identity==old_identity))
-            if repair_boundaries and review_header and not repeated and head and new_head:
+            if (repair_boundaries and review_header and not repeated and head and new_head
+                    and not head.find('table') and not new_head.find('table')):
                 from docling_pdf_table_layout import repeated_source_header
                 try:
                     replacement,header_proof=repeated_source_header(old,current,old_soup.table,soup.table,regions,sys.modules[__name__])
@@ -5645,7 +5663,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                     diagnostic_event('TABLE_REPEATED_HEADER_REVIEW_FAILED',**issue)
                 if replacement is not None:
                     head.replace_with(replacement);head=replacement
-                    header_count=len(head.find_all('tr'));repeated=True
+                    header_count=len(_table_rows(head));repeated=True
                     record=dict(left=old_item.self_ref,right=item.self_ref,**header_proof)
                     manifest.setdefault('verified_repeated_headers',[]).append(record)
                     diagnostic_event('TABLE_REPEATED_HEADER_SOURCE_VERIFIED',**record)
@@ -5673,18 +5691,18 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
             # the physical gap must contain no independent content.
             header_only = bool(head and old_soup.table and not row_keys(old["selected"])
                                and all(row.find_parent("thead") is head
-                                       for row in old_soup.table.find_all("tr"))
+                                       for row in _table_rows(old_soup.table))
                                and old_geo["bbox"][1] > .5 * old_size.height
                                and old_geo["bbox"][3] > .65 * old_size.height)
             # A full-width source section title starts the body, rather than
             # replacing the column header stranded on the preceding page.
             first_band = [c for c in geo.get('cells', []) if c['row'] == 0]
-            subsection_head = bool(header_only and new_head and len(new_head.find_all('tr')) == 1
-                and len(new_head.find_all(['td', 'th'])) == 1 and len(first_band) == 1
+            subsection_head = bool(header_only and new_head and len(_table_rows(new_head)) == 1
+                and len(_table_cells(new_head)) == 1 and len(first_band) == 1
                 and first_band[0]['column'] == 0 and first_band[0]['row_span'] == 1
                 and first_band[0]['column_span'] == current['selected']['columns']
                 and int(new_head.find(['td', 'th']).get('colspan', 1)) == current['selected']['columns'])
-            catalogue_head = bool(new_head and len(new_head.find_all("tr")) == 1 and key_continuity
+            catalogue_head = bool(new_head and len(_table_rows(new_head)) == 1 and key_continuity
                                   and catalogue_row_key(new_head.find(["td", "th"]).get_text()))
             blockers = (intervening_blocks(old, current, old_page, page_no, old_geo, geo,
                                           allow_page_notes=explicit_continuation and bool(repeated))
@@ -5722,7 +5740,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                           and caption_ok
                           and (same_grid or translated_grid)
                           and old_soup.table is not None and soup.table is not None
-                          and (old_soup.table.find("tfoot") is None or (explicit_continuation and repeated)) and not blockers)
+                          and (old_soup.table.find("tfoot", recursive=False) is None or (explicit_continuation and repeated)) and not blockers)
             diagnostic_event('TABLE_JOIN_BOUNDARY',left=old_item.self_ref,right=item.self_ref,left_page=old_page,right_page=page_no,
                              compatible=bool(compatible),adjacent_pages=page_no==old_page+1,
                              old_bbox=old_geo['bbox'],new_bbox=geo['bbox'],same_grid=same_grid,translated_grid=translated_grid,
@@ -5732,7 +5750,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                              source_fullwidth_subheading=subsection_head,
                              key_continuity=key_continuity,explicit_continuation=explicit_continuation,
                              left_has_table=old_soup.table is not None,right_has_table=soup.table is not None,
-                             left_has_tfoot=bool(old_soup.table and old_soup.table.find('tfoot')),blockers=blockers)
+                             left_has_tfoot=bool(old_soup.table and old_soup.table.find('tfoot', recursive=False)),blockers=blockers)
             if page_no == old_page + 1:
                 decisions.append({"left": old_item.self_ref, "right": item.self_ref,
                                   "compatible_boundary": bool(compatible), "basis": geo.get("basis", "pdf_rules"),
@@ -5743,23 +5761,24 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                                   "explicit_continuation": explicit_continuation,
                                   "row_key_continuity": key_continuity, "intervening_blocks": blockers})
             if compatible:
-                if explicit_continuation and repeated and old_soup.table.find('tfoot'):
-                    for footer in old_soup.table.find_all('tfoot'):
+                if explicit_continuation and repeated and old_soup.table.find('tfoot', recursive=False):
+                    for footer in old_soup.table.find_all('tfoot', recursive=False):
                         footer.name='tbody';footer['data-source-role']='continued-footer'
                 if subsection_head:
-                    for cell in new_head.find_all(['td', 'th']):
+                    for cell in _table_cells(new_head):
                         cell.name = 'td'
                 if (numeric_head or catalogue_head or continued_data_head or subsection_head) and not repeated:
                     new_head.name = "tbody"
-                    for cell in new_head.find_all("th"):
+                    for cell in _table_cells(new_head):
                         cell.name = "td"
                 if repeated:
-                    for row in list(soup.table.find_all("tr")[:header_count]):
+                    for row in _table_rows(soup.table)[:header_count]:
                         row.decompose()
                     if new_head:
                         if new_head.find('tr'):
                             new_head.name='tbody'
-                            for th in new_head.find_all('th'):th.name='td'
+                            for cell in _table_cells(new_head):
+                                cell.name = 'td'
                         else:new_head.decompose()
                 merged_tail = merge_text_row_tail(old_soup.table, soup.table) if continued_data_head else False
                 if (not merged_tail and same_grid
@@ -5777,14 +5796,14 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                         diagnostic_event('TABLE_OPEN_SOURCE_ROW_TAIL_MERGED', **proof)
                 if merged_tail and decisions:
                     decisions[-1]["merged_text_row_tail"] = True
-                boundary_left=old_soup.table.find_all('tr')[-1].find_all(['td','th'],recursive=False)
+                boundary_left=_table_rows(old_soup.table)[-1].find_all(['td','th'],recursive=False)
                 boundary_right=soup.table.find('tr').find_all(['td','th'],recursive=False) if soup.table.find('tr') else []
                 blank_stub = (len(boundary_left)==len(boundary_right) and len(boundary_right)>=3
                     and all(not c.get_text(strip=True) and not c.find(['img','math']) for c in boundary_right[:2])
                     and all(c.get_text(strip=True) for c in boundary_left[:2])
                     and re.match(r'^[а-яё]',boundary_right[2].get_text(' ',strip=True)))
                 if not merged_tail and ((old_geo.get("open_bottom") and geo.get("open_top")) or blank_stub):
-                    last_row, first_row = old_soup.table.find_all("tr")[-1], soup.table.find("tr")
+                    last_row, first_row = _table_rows(old_soup.table)[-1], soup.table.find("tr")
                     left_cells = last_row.find_all(["td", "th"], recursive=False)
                     right_cells = first_row.find_all(["td", "th"], recursive=False) if first_row else []
                     # An unfinished physical row continues across the page;
@@ -5808,23 +5827,24 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                             diagnostic_event('PRIMARY_ROW_BOUNDARY_PRESERVED', **proof)
                         else:
                             for left, right in zip(left_cells, right_cells):
-                                if right.get_text(strip=True) or right.find(["img", "math"]):
+                                if right.get_text(strip=True) or right.find(["img", "math", "table"]):
                                     if left.contents:
                                         left.append(old_soup.new_tag("br"))
                                     for child in list(right.contents):
                                         left.append(child.extract())
                             first_row.decompose()
-                if repair_boundaries and same_grid:
+                if (repair_boundaries and same_grid and not old_soup.table.find('table')
+                        and not soup.table.find('table')):
                     from docling_pdf_repairs import merge_source_word_tail
                     if merge_source_word_tail(old_soup.table, soup.table, sys.modules[__name__]):
                         diagnostic_event('TABLE_SOURCE_WORD_TAIL', left=old_item.self_ref, right=item.self_ref, page=page_no)
                 old_profile, new_profile = table_profile(str(old_soup.table)), table_profile(str(soup.table))
-                old_nodes = old_soup.table.find_all(["td", "th"])
-                new_nodes = soup.table.find_all(["td", "th"])
+                old_nodes = _table_cells(old_soup.table)
+                new_nodes = _table_cells(soup.table)
                 if header_grid_refinement:
                     # Measured blank header stubs can continue for several
                     # header levels, rather than becoming empty body cells.
-                    continued_rows = list(new_head.find_all('tr')) if new_head else []
+                    continued_rows = _table_rows(new_head) if new_head else []
                     source_header_rows = (current.get('pdf_geometry') or {}).get('header_rows', 0)
                     stub_pairs = []
                     if continued_rows and source_header_rows == len(continued_rows):
@@ -5848,8 +5868,8 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                         header_grid_refinement['continued_source_header_rows'] = source_header_rows
                         old_profile = table_profile(str(old_soup.table))
                         new_profile = table_profile(str(soup.table))
-                        old_nodes = old_soup.table.find_all(['td', 'th'])
-                        new_nodes = soup.table.find_all(['td', 'th'])
+                        old_nodes = _table_cells(old_soup.table)
+                        new_nodes = _table_cells(soup.table)
                     # A numeric second header level can start on the next
                     # page. Keep the inherited stub's rowspan inside THEAD.
                     stub = next((c for c in old_profile['cells'] if c['column'] == 0
@@ -5870,8 +5890,8 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                         header_grid_refinement['continued_numeric_header_rows'] = 1
                         old_profile = table_profile(str(old_soup.table))
                         new_profile = table_profile(str(soup.table))
-                        old_nodes = old_soup.table.find_all(['td', 'th'])
-                        new_nodes = soup.table.find_all(['td', 'th'])
+                        old_nodes = _table_cells(old_soup.table)
+                        new_nodes = _table_cells(soup.table)
                 # The first empty cell of a continued group inherits the existing
                 # vertical merge. A new nonempty cell is always kept unchanged.
                 first = next((c for c in new_profile["cells"] if c["row"] == 0 and c["column"] == 0), None)
@@ -5880,14 +5900,14 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                 if (first and last and not first["text"] and last["text"]
                         and first["column_span"] == last["column_span"] == 1
                         and old_nodes[old_profile['cells'].index(last)].find_parent('thead') is None
-                        and not new_nodes[new_profile["cells"].index(first)].find(["img", "math"])):
+                        and not new_nodes[new_profile["cells"].index(first)].find(["img", "math", "table"])):
                     prefix, empty_cells = 0, []
                     for cell in new_profile["cells"]:
                         if cell["column"] != 0:
                             continue
                         if cell["row"] != prefix or cell["text"] or cell["column_span"] != 1:
                             break
-                        if new_nodes[new_profile["cells"].index(cell)].find(["img", "math"]):
+                        if new_nodes[new_profile["cells"].index(cell)].find(["img", "math", "table"]):
                             break
                         prefix += cell["row_span"]
                         empty_cells.append(cell)
@@ -5899,7 +5919,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                         node.name = "td"
                 bodies = old_soup.table.find_all("tbody", recursive=False)
                 target = bodies[-1] if bodies else old_soup.table
-                for row in list(soup.table.find_all("tr")):
+                for row in _table_rows(soup.table):
                     if row.find_parent("thead") is None:
                         target.append(row.extract())
                 if soup.table.get('data-source-logical-rows') == 'true':
@@ -5919,7 +5939,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                                      **header_grid_refinement)
                         manifest.setdefault('source_header_grid_refinements', []).append(proof)
                         diagnostic_event('TABLE_HEADER_SOURCE_GRID_REFINED', **proof)
-                    if old_soup.table.find("colgroup") is None:
+                    if old_soup.table.find("colgroup", recursive=False) is None:
                         xs = old_geo["x_grid"]
                         group = old_soup.new_tag("colgroup")
                         for a, b in zip(xs, xs[1:]):
@@ -8412,21 +8432,21 @@ def retain_split_formula_sources(doc, regions, orientation, excluded, other_rout
         box = split_formula_source_crop(regions, page, left_region[1], right_region[1], notation)
         if box is None:
             continue
-        with regions.crop(page, box, scale=4.2) as image:
-            fragment = BeautifulSoup(image_html(image, box[2]-box[0], 'formula'), 'html.parser')
-        fragment.figure['data-source-ref'] = refs[0]
-        fragment.figure['data-source-formula-review'] = 'true'
-        fragment.figure['data-pdf-page'] = str(page)
-        fragment.img['alt'] = f'Формула из исходного PDF, страница {page}'
+        if '<math' in notation:
+            math_node = BeautifulSoup(notation, 'html.parser').math
+            notation = math_node.get('data-latex') or math_node.get_text()
+        rendered = latex_math(notation, 'block')
+        if not rendered:
+            continue
+        fragment = BeautifulSoup(rendered, 'html.parser').math
+        fragment['data-source-ref'] = refs[0]
         routes[refs[0]] = str(fragment)
         excluded.add(refs[1])
         proof = dict(ref=refs[0], source_refs=refs, page=page, bbox=box,
-                     source_bbox=source_bbox(box, orientation[page]), method='source_image')
+                     source_bbox=source_bbox(box, orientation[page]), latex=notation,
+                     method='split_formula_verified_native_mathml')
         manifest['formulas'].append(proof)
-        review = dict(proof, reason='split_formula_source_image',
-                      message='Формула сохранена изображением исходника. Требуется сверка записи.')
-        manifest.setdefault('formula_source_reviews', []).append(review)
-        diagnostic_event('FORMULA_SOURCE_CROP_RETAINED', **review)
+        diagnostic_event('SPLIT_FORMULA_MATHML_RETAINED', **proof)
     return routes
 
 
@@ -8516,6 +8536,28 @@ def export_local_html(args, result, normalized, orientation, source):
         captioned_figures.update(capture_form_figures(doc, records, manifest, sys.modules[__name__],
                                                     reader=native_reader, regions=regions))
         if captioned_figures:
+            from docling_pdf_captions import restore_prose_beside_figures
+            from docling_pdf_artifacts import complete_picture_bounds
+            locations = [(obj.self_ref, item_region(obj, doc)) for obj in (*doc.pictures, *doc.tables, *doc.texts)]
+            for entry in captioned_figures.values():
+                method = entry.get('method')
+                if method != 'explicit_source_figure_caption' and not (
+                        method == 'explicit_figure_table_heading' and not entry.get('source_table_refs')
+                        and entry['ref'].startswith('#/pictures/')):
+                    continue
+                page, bounds = entry['page'], entry['bbox']
+                owned = {entry['ref'], entry['caption_ref'], *entry.get('caption_refs', ())}
+                others = (loc[1] for ref, loc in locations if loc and loc[0] == page and ref not in owned)
+                try:
+                    full = complete_picture_bounds(native_reader, regions, page, bounds, others)
+                except (OSError, RuntimeError, ValueError) as error:
+                    diagnostic_event('NATIVE_PICTURE_BOUNDS_UNAVAILABLE', ref=entry['ref'], error=str(error))
+                    continue
+                if full:
+                    entry['bbox'] = full
+                    manifest.setdefault('completed_picture_crops', []).append(dict(
+                        ref=entry['ref'], page=page, layout_bbox=bounds, bbox=full))
+            restore_prose_beside_figures(doc, captioned_figures, records, excluded, manifest, sys.modules[__name__])
             # Form source crops own their children before recovery can interpret
             # the drawing as an editable table or recreate its OCR packets.
             reconcile_captioned_figures(doc, captioned_figures, captioned_figure_routes, routes, picture_routes,
@@ -8555,7 +8597,7 @@ def export_local_html(args, result, normalized, orientation, source):
         if args.primary_ocr_only and pdf_repair_enabled(args, 'math', format_only=True):
             from docling_pdf_picture_math import recover_picture_math
             recover_picture_math(doc, records, regions, args, picture_routes, excluded,
-                manifest, sys.modules[__name__], protected=captioned_figures)
+                manifest, sys.modules[__name__], protected=captioned_figures, reader=native_reader)
 
         populated_pages = {prov.page_no for item, _ in doc.iterate_items() if hasattr(item, "prov")
                            and getattr(item, "label", None) not in {DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER}
@@ -9437,6 +9479,7 @@ def export_local_html(args, result, normalized, orientation, source):
                 return create_ser_result(text=fragment, span_source=item)
 
         from docling_pdf_annotations import annotation_context, mark_source_text, normalize_semantic_annotations
+        from docling_pdf_flow import restore_native_paragraph
         split_formula_routes = retain_split_formula_sources(doc, regions, orientation, excluded,
             (recovered_page_routes, note_routes), manifest)
         semantic_context = annotation_context(doc, excluded, manifest)
@@ -9444,7 +9487,11 @@ def export_local_html(args, result, normalized, orientation, source):
         class SourceFormulas(HTMLTextSerializer):
             def serialize(self, *, item, doc_serializer, doc, **kwargs):
                 result = self._serialize_source(item=item, doc_serializer=doc_serializer, doc=doc, **kwargs)
-                return create_ser_result(text=mark_source_text(result.text, item.self_ref, semantic_context),
+                fragment = result.text
+                if item.label in {DocItemLabel.TEXT, DocItemLabel.LIST_ITEM} and item.prov:
+                    fragment = restore_native_paragraph(fragment, native_reader, item_region(item, doc),
+                                                        regions, manifest, continues=len(item.prov) > 1)
+                return create_ser_result(text=mark_source_text(fragment, item.self_ref, semantic_context),
                                          span_source=item)
 
             def _serialize_source(self, *, item, doc_serializer, doc, **kwargs):
@@ -9485,6 +9532,20 @@ def export_local_html(args, result, normalized, orientation, source):
 
             def _process_formula(self, *, item, text, orig, doc, image_mode, formula_to_mathml, is_inline_scope):
                 formula = text or orig
+                from docling_pdf_picture_math import has_decoder_tokens, recover_editable_formula, source_formula_is_clipped
+                location = item_region(item, doc)
+                reason = None
+                if not formula or not formula.strip():
+                    reason = 'empty_formula'
+                elif has_decoder_tokens(formula):
+                    reason = 'invalid_decoder_tokens'
+                elif location and len(item.prov) == 1 and source_formula_is_clipped(native_reader, regions, *location):
+                    reason = 'formula_crosses_physical_page_edge'
+                if reason:
+                    if location is None:
+                        raise RuntimeError(f'Invalid formula transcription without a source region: {item.self_ref}')
+                    return recover_editable_formula(native_reader, regions, *location, args, sys.modules[__name__],
+                        ref=item.self_ref, reason=reason, manifest=manifest, candidates=(text, orig))
                 rendered = None
                 if "<math" in formula:
                     from docling_pdf_table_content import _safe_markup
@@ -9502,6 +9563,18 @@ def export_local_html(args, result, normalized, orientation, source):
                     literal['display'] = 'inline' if is_inline_scope else 'block'
                     literal.string = formula
                     rendered = _safe_markup(str(literal), sys.modules[__name__])
+                if region and rendered and len(item.prov) == 1:
+                    from docling_pdf_native_system import recover_formula_identifier
+                    try:
+                        recovered = recover_formula_identifier(native_reader, regions, *region, rendered,
+                                                               sys.modules[__name__])
+                    except (OSError, RuntimeError, ValueError) as error:
+                        diagnostic_event('NATIVE_FORMULA_CHECK_UNAVAILABLE', ref=item.self_ref, error=str(error))
+                        recovered = None
+                    if recovered:
+                        formula, rendered = recovered
+                        manifest.setdefault('native_formula_identifiers', []).append(dict(
+                            ref=item.self_ref, page=region[0], bbox=region[1]))
                 diagnostic_event('FORMULA_RESULT',ref=item.self_ref,page=region[0] if region else None,
                                  bbox=region[1] if region else None,method='mathml' if '<math' in rendered else 'latex',
                                  reason='renderable_latex' if '<math' in rendered else 'source_notation_preserved',latex=diagnostic_summary(formula))
@@ -9538,12 +9611,59 @@ def export_local_html(args, result, normalized, orientation, source):
                                  caption_refs=[str(getattr(caption, "cref", ""))[:160] for caption in (item.captions or [])][:16],
                                  caption_count=len(item.captions or []))
                 result = super().serialize(item=item, doc_serializer=doc_serializer, doc=doc, **kwargs)
+                reg = item_region(item, doc) if len(item.prov) == 1 else None
+                if reg and '<img' in result.text:
+                    from docling_pdf_artifacts import complete_picture_bounds, picture_caption_band
+                    neighbours = (loc[1] for other in (*doc.pictures, *doc.tables, *doc.texts)
+                                  if other.self_ref != item.self_ref and other.self_ref not in excluded
+                                  and (loc := item_region(other, doc)) and loc[0] == reg[0])
+                    try:
+                        full = complete_picture_bounds(native_reader, regions, *reg, neighbours)
+                        band = picture_caption_band(item, doc, native_reader, regions, reg[0],
+                                                    full or reg[1], sys.modules[__name__])
+                    except (OSError, RuntimeError, ValueError) as error:
+                        diagnostic_event('NATIVE_PICTURE_BOUNDS_UNAVAILABLE', ref=item.self_ref, error=str(error))
+                        full = band = None
+                    if full or band:
+                        parsed = BeautifulSoup(result.text, 'html.parser')
+                        images = parsed.find_all('img')
+                        if band:
+                            linked = parsed.find_all('figcaption')
+                            if parsed.figure is None or len(linked) != int(band[2]):
+                                band = None
+                        bounds = band[0] if band else full
+                        if bounds and len(images) == 1:
+                            with regions.crop(reg[0], bounds) as crop:
+                                source_image = BeautifulSoup(image_html(crop, bounds[2] - bounds[0], 'picture'),
+                                                             'html.parser').img
+                            images[0]['src'] = source_image['src']
+                            images[0]['width'] = source_image['width']
+                            images[0].attrs.pop('height', None)
+                            if band:
+                                caption = parsed.new_tag('figcaption')
+                                caption.string = ' '.join(band[1])
+                                if band[2]:
+                                    following = linked[0].extract()
+                                    following.name = 'div'
+                                    parsed.figure.insert_after(following)
+                                parsed.figure.append(caption)
+                            result = create_ser_result(text=str(parsed), span_source=item)
+                            manifest.setdefault('completed_picture_crops', []).append(dict(
+                                ref=item.self_ref, page=reg[0], layout_bbox=reg[1], bbox=bounds,
+                                captions=band[1] if band else []))
                 diagnostic_html(getattr(result, "text", ""), "picture_serializer", ref=item.self_ref, route="default")
                 fragment = append_owned_footnotes(result.text,item,doc,doc_serializer,
                     excluded,manifest,sys.modules[__name__],kwargs)
                 return create_ser_result(text=fragment,span_source=item)
 
-        serializer = HTMLDocSerializer(doc=doc, table_serializer=RoutedTables(), text_serializer=SourceFormulas(),
+        class SourceDocument(HTMLDocSerializer):
+            def serialize_doc(self, parts, **kwargs):
+                from docling_pdf_flow import page_furniture_parts
+                ordered = page_furniture_parts(parts, doc, native_reader, regions, orientation,
+                                               manifest, sys.modules[__name__], create_ser_result)
+                return super().serialize_doc(parts=ordered, **kwargs)
+
+        serializer = SourceDocument(doc=doc, table_serializer=RoutedTables(), text_serializer=SourceFormulas(),
                                        picture_serializer=SourcePictures(),
                                        params=HTMLParams(image_mode=ImageRefMode.EMBEDDED, formula_to_mathml=True))
         content = render_surya_math(serializer.serialize().text)
@@ -9592,8 +9712,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 container["class"] = "table-scroll wide"
             table.wrap(container)
         remove_published_table_rasters(soup)
-        for bad in soup.select(".formula-not-decoded"):
-            raise RuntimeError("Formula placeholder blocked before HTML publication")
+        if soup.select_one('.formula-not-decoded, figure.source-formula img, figure[data-source-formula-review] img'):
+            raise RuntimeError('Формулу не удалось представить в редактируемом виде.')
         from docling_pdf_table_content import validate_published_table_images
         validate_published_table_images(soup, manifest)
         from docling_pdf_table_audit import register_final_graphic_assets
@@ -9705,8 +9825,14 @@ def finalize_published_html(path, content):
     star_notes = normalize_table_star_notes(soup)
     if star_notes:
         diagnostic_event('HTML_TABLE_STAR_NOTES_INLINED', replacements=star_notes)
+    # Only the desktop packager receives comparison crops. They stay embedded
+    # until it separates the private viewer resources from downloadable files.
+    comparisons = [(details.parent, details.extract()) for details in soup.select(
+        'div[data-formula-comparison="true"] > details[data-preview-only="formula-source"]')]
     expected_images = [image for image in soup.find_all('img') if image.get('src')]
     assets = externalize_images(soup, path, path.parent / 'src', resource_root=path.parent)
+    for owner, details in comparisons:
+        owner.append(details)
     failed = [image for image in expected_images if image.get('data-image-unavailable') == 'true']
     if failed:
         diagnostic_event('HTML_IMAGE_PUBLICATION_FAILED', path=path, images=len(failed),
@@ -10502,12 +10628,14 @@ def convert_document(args, converter, source):
                              regional_requests=quality.get('regional_requests'))
             print(f"Status: {publication['status']}; table fragments: {len(quality['tables'])}; formulas: {len(quality['formulas'])}")
             if quality.get('formula_source_reviews'):
-                print("WARNING: Требуется визуальная проверка формул, сохранённых изображениями")
+                for issue in quality['formula_source_reviews']:
+                    print(f"WARNING: Страница PDF {issue['page']}. {issue['message']}")
             if quality.get('table_quality_warnings'):
                 print("WARNING: Требуется визуальная проверка таблиц", flush=True)
             if publication['status'] == 'REVIEW' and 'report' in publication:
                 print(f"Отчёт о проверке: {publication['report']}", flush=True)
             print(f"Saved: {base}.html", flush=True)
+        publication['pages'] = len(orientation)
         return publication
     if is_pdf:
         with normalized_pdf(source, args) as (normalized, orientation):
@@ -10599,8 +10727,8 @@ def run_conversion(args, report_router, report_lock):
                                  f"before document: {source}; {memory_snapshot(args.device)}")
                     outcome = convert_document(args, converter, source)
                     converter = getattr(args, '_shared_converter', converter)
-                    if isinstance(outcome,dict) and outcome.get('status')=='REVIEW':
-                        record(source,'REVIEW',**{k:v for k,v in outcome.items() if k!='status'})
+                    if isinstance(outcome, dict) and outcome.get('status') in {'OK', 'REVIEW'}:
+                        record(source, outcome['status'], **{k: v for k, v in outcome.items() if k != 'status'})
                     else:
                         record(source, 'OK')
                     report_event(report, report_lock, "memory",

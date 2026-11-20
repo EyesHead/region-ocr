@@ -452,7 +452,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
         proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
                      method='primary_ocr_payload_on_source_grid', **reading)
         if vector_confirmation:
-            proof['method'] = 'vector_source_counterread_' + vector_confirmation[0]
+            proof['method'] = (vector_confirmation[1]['method']
+                               if 'readings' not in vector_confirmation[1]
+                               else 'vector_source_counterread_' + vector_confirmation[0])
             proof['vector_confirmation'] = vector_confirmation[1]
         source.update(html=node.decode_contents(), text=node.get_text(' ', strip=True), primary_ocr=proof)
         source.pop('raster_cell_ocr', None)

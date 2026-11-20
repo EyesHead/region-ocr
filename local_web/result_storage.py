@@ -17,7 +17,7 @@ else:
 class ResultStorage:
     """Route saved IDs to their original root; new saves use the selected root."""
     _record_methods = {'get', 'read_log', 'open_folder', 'open_target', 'target_file',
-                       'asset', 'backfill_html', 'delete'}
+                       'asset', 'preview_document', 'formula_asset', 'backfill_html', 'delete'}
 
     def __init__(self, data_root, default_root, *, application_root):
         self.data_root = normal_path(data_root).resolve()
@@ -147,6 +147,13 @@ class ResultStorage:
             self.unavailable_roots.pop(key, None)
             if manager.root == self.selected_root:
                 self.active = manager
+
+    def open_root(self):
+        if self.active is None:
+            self._reconnect()
+        if self.active is None:
+            raise ValueError(self.storage_error)
+        self.active.open_folder()
 
     def settings(self):
         return {'output_dir': str(self.root), 'storage_error': self.storage_error}

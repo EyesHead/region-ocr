@@ -12,6 +12,353 @@ def _key(text):
     return re.sub(r"[\s\u00ad]+", "", text).casefold()
 
 
+_PROSE_WORD = re.compile(r'[А-Яа-яЁёA-Za-z]+')
+_LITERAL_MATH = re.compile(r'<math(?:\s+[^<>]*)?>.*?</math\s*>', re.S)
+
+
+def _only_prose(value):
+    # Inline equations can still be escaped text at this serializer stage.
+    # Keep offsets so any source-proved word can be replaced in its own node.
+    return _LITERAL_MATH.sub(lambda m: ' ' * len(m[0]), value)
+
+
+def _visible_source_word(regions, page_no, word):
+    """Confirm the candidate with PDFium and the rendered ink in its own box."""
+    import numpy as np
+    from docling.utils.locks import pypdfium2_lock
+    from docling_pdf_native_system import _painted_text_objects, _strict_ink_coverage
+
+    box = [word[k] for k in ('x0', 'top', 'x1', 'bottom')]
+    try:
+        if not _painted_text_objects(regions, page_no, box):
+            return False
+        with pypdfium2_lock:
+            page = regions.pdf[page_no - 1]
+            try:
+                height = page.get_height()
+                text = page.get_textpage()
+                try:
+                    source_word = text.get_text_bounded(box[0], height - box[3], box[2], height - box[1])
+                finally:
+                    text.close()
+            finally:
+                page.close()
+        if ''.join(source_word.split()) != ''.join(word['text'].split()):
+            return False
+        with regions.crop(page_no, box) as image:
+            with image.convert('L') as gray:
+                mask = (np.asarray(gray) < 180).astype('uint8') * 255
+            return _strict_ink_coverage(mask, word['chars'], box,
+                                        image.width / (box[2] - box[0]), image.height / (box[3] - box[1]))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest):
+    """Recover a misread word when its visible source and neighboring words agree."""
+    from collections import Counter
+    from pdfplumber.utils import extract_words
+
+    if any('doctop' not in g or len(g['text']) != 1 for g in glyphs):
+        return False
+    spans = [(node, list(_PROSE_WORD.finditer(_only_prose(str(node))))) for node in paragraph.find_all(string=True)
+             if not node.find_parent(['math', 'sub', 'sup', 'code', 'pre', 'a', 'svg'])]
+    if not any(len(matches) >= 5 for _, matches in spans):
+        return False
+    source = [word for word in extract_words(glyphs, return_chars=True, split_at_punctuation=True)
+              if _PROSE_WORD.fullmatch(word['text'])]
+    def neighbors(a, b):
+        em = max(a['bottom'] - a['top'], b['bottom'] - b['top'])
+        dy = b['top'] - a['top']
+        if abs(dy) <= .25 * em:
+            return -.1 * em <= b['x0'] - a['x1'] <= 2 * em
+        return (.5 * em <= dy <= 1.8 * em and box[2] - a['x1'] <= 2 * em
+                and b['x0'] - box[0] <= 2 * em)
+
+    balanced = (-2, -1, 1, 2)
+    edge = (-1, 1, 2)
+    contexts = {}
+    output_contexts = Counter()
+    for offsets in (balanced, edge):
+        for i in range(-min(offsets), len(source) - max(offsets)):
+            if not all(neighbors(source[j], source[j + 1]) for j in range(i + min(offsets), i + max(offsets))):
+                continue
+            if offsets == edge and abs(source[i - 1]['top'] - source[i + 2]['top']) > .25 * source[i]['chars'][0]['size']:
+                continue
+            key = offsets, tuple(source[i + j]['text'] for j in offsets)
+            contexts.setdefault(key, []).append(source[i])
+        for _, matches in spans:
+            output_contexts.update((offsets, tuple(matches[i + j][0] for j in offsets))
+                                   for i in range(-min(offsets), len(matches) - max(offsets)))
+    changed = False
+    for node, matches in spans:
+        value = str(node)
+        for i in reversed(range(1, len(matches) - 2)):
+            match = matches[i]
+            before = match[0]
+            if len(before) < 4:
+                continue
+            # Unrelated scripts can be OCR language substitutions. Match the
+            # surrounding prose on this line even if inline math precedes it.
+            cross_script = before.isascii() and all(re.fullmatch(r'[А-Яа-яЁё]+', matches[i + j][0])
+                                                     for j in edge)
+            offsets = edge if cross_script else balanced
+            if i + min(offsets) < 0:
+                continue
+            key = offsets, tuple(matches[i + j][0] for j in offsets)
+            candidates = contexts.get(key, [])
+            if len(candidates) != 1 or output_contexts[key] != 1:
+                continue
+            word = candidates[0]
+            after = word['text']
+            if cross_script:
+                if not re.fullmatch(r'[А-Яа-яЁё]{4,}', after):
+                    continue
+            elif len(before) != len(after) or sum(a != b for a, b in zip(before, after)) != 1:
+                continue
+            if not _visible_source_word(regions, page_no, word):
+                continue
+            value = value[:match.start()] + after + value[match.end():]
+            manifest.setdefault('source_prose_corrections', []).append(dict(
+                page=page_no, bbox=[word[k] for k in ('x0', 'top', 'x1', 'bottom')],
+                before=before, after=after, method='painted_word_two_pdf_readers_and_crop_ink'))
+        if value != str(node):
+            node.replace_with(value)
+            changed = True
+    return changed
+
+
+def _restore_inline_source_letter(paragraph, glyphs, page, regions, manifest):
+    """Restore an inline mathematical letter fused into otherwise identical prose."""
+    import unicodedata
+    from statistics import median
+
+    if len(paragraph.contents) != 1 or paragraph.string is None or paragraph.find(True):
+        return False
+    ink = sorted((g for g in glyphs if g['text'].strip()), key=lambda g: g['x0'])
+    if (len(ink) < 8 or any(len(g['text']) != 1 for g in ink)
+            or max(g['top'] for g in ink) - min(g['top'] for g in ink) > .25 * median(g['size'] for g in ink)):
+        return False
+    plain = str(paragraph.string)
+    positions = [(i, ch) for i, ch in enumerate(plain) if not ch.isspace()]
+    if len(positions) != len(ink):
+        return False
+    edits = [(i, observed, g) for (i, observed), g in zip(positions, ink) if observed != g['text']]
+    if len(edits) != 1:
+        return False
+    i, before, glyph = edits[0]
+    value = unicodedata.normalize('NFKC', glyph['text'])
+    if (not before.isalpha() or len(value) != 1 or not value.isalpha()
+            or not unicodedata.name(glyph['text'], '').startswith('MATHEMATICAL ')
+            or not _visible_source_word(regions, page, dict(glyph, chars=[glyph]))):
+        return False
+    math = BeautifulSoup(f'<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" '
+                         f'data-latex="{value}"><mi>{value}</mi></math>', 'html.parser').math
+    paragraph.string.replace_with(plain[:i], math, plain[i+1:])
+    manifest.setdefault('source_prose_corrections', []).append(dict(
+        page=page, bbox=[glyph[k] for k in ('x0', 'top', 'x1', 'bottom')],
+        before=before, after=value, method='painted_mathematical_letter_in_matching_source_line'))
+    return True
+
+
+def _matches_column_edges(glyphs, box, left, right, tolerance):
+    """Disambiguate two fully justified lines with independent rows of this column."""
+    from pdfplumber.utils import cluster_objects
+    others = [g for g in glyphs if g['text'].strip() and g.get('upright', True)
+              and (g['bottom'] < box[1] or g['top'] > box[3])]
+    return any(abs(min(g['x0'] for g in row) - left) <= tolerance
+               and abs(max(g['x1'] for g in row) - right) <= tolerance
+               for row in cluster_objects(others, 'bottom', tolerance))
+
+
+def _aligned_prose_lines(paragraph, glyphs, line_tolerance, continues):
+    """Match ordinary words in native line order, leaving all inline math intact."""
+    from difflib import SequenceMatcher
+    from pdfplumber.utils import cluster_objects, extract_words
+
+    if any('doctop' not in g for g in glyphs):
+        return []
+    plain = ' '.join(_only_prose(str(node)) for node in paragraph.find_all(string=True)
+                     if not node.find_parent(['math', 'sup', 'sub', 'code']))
+    def words(text):
+        return [match[0].casefold() for match in _PROSE_WORD.finditer(text) if len(match[0]) >= 3]
+    observed = words(plain)
+    if len(observed) < 5:
+        return []
+    physical = cluster_objects(extract_words(glyphs, return_chars=True), 'bottom', line_tolerance)
+    lines, anchors, owners = [], [], []
+    for line in physical:
+        line.sort(key=lambda w: w['x0'])
+        terms = [token for word in line for token in words(word['text'])]
+        if len(terms) < 2:
+            continue
+        owners.extend([len(lines)] * len(terms))
+        anchors.extend(terms)
+        lines.append([g for word in line for g in word['chars'] if g['text'].strip()])
+    if len(lines) < 2:
+        return []
+    if continues:
+        # Only this physical page supplies geometry for a joined paragraph.
+        observed = observed[:len(anchors)]
+    matches = SequenceMatcher(None, anchors, observed, autojunk=False).get_matching_blocks()
+    aligned = {i for a, b, length in matches for i in range(a, a + length)}
+    if (len(aligned) < .85 * max(len(observed), len(anchors))
+            or not {0, 1}.issubset(aligned)
+            or any(sum(i in aligned for i, n in enumerate(owners) if n == row) <
+                   min(2, owners.count(row)) for row in range(len(lines)))):
+        return []
+    return lines
+
+
+def restore_native_paragraph(fragment, reader, region, regions, manifest, *, continues=False):
+    """Retain source-supported prose and its measured first-line indent."""
+    from statistics import median
+    from pdfplumber.utils import cluster_objects
+
+    if reader is None or region is None or not fragment.lstrip().startswith(('<p', '<li')):
+        return fragment
+    soup = BeautifulSoup(fragment, 'html.parser')
+    paragraph = soup.find(['p', 'li'])
+    if (paragraph is None or soup.find_all(recursive=False) != [paragraph]
+            or paragraph.find(['img', 'table', 'svg', 'ol', 'ul', 'li'])):
+        return fragment
+
+    page, box = region
+    reader.load_page(page)
+    glyphs = [g for g in reader.chars if g['text']
+              and box[0] - 1 <= (g['x0'] + g['x1']) / 2 <= box[2] + 1
+              and box[1] - 1 <= (g['top'] + g['bottom']) / 2 <= box[3] + 1]
+    if not glyphs or any(not g.get('native_script_eligible', True)
+                         or not g.get('upright', True) for g in glyphs):
+        return fragment
+    changed = _restore_prose_words(paragraph, glyphs, page, box, regions, manifest)
+    if _restore_inline_source_letter(paragraph, glyphs, page, regions, manifest) or changed:
+        fragment = str(soup)
+    if paragraph.name == 'li':
+        return fragment
+    if (paragraph.find('br')
+            or re.search(r'(?:^|;)\s*(?:text-indent|text-align)\s*:', paragraph.get('style', ''), re.I)):
+        return fragment
+    ink = [g for g in glyphs if g['text'].strip()]
+    if not ink:
+        return fragment
+    size = median(g['size'] for g in ink)
+    line_tolerance = max(0.5, size * .15)
+    lines = cluster_objects(ink, 'bottom', line_tolerance)
+    if len(lines) < 2:
+        return fragment
+    lines = [sorted(line, key=lambda g: g['x0']) for line in lines]
+    # Printable hyphens at source line breaks and Latin/Cyrillic homoglyphs
+    # may differ in OCR. They do not change the coordinates of the paragraph.
+    geometry_letters = str.maketrans('асеорух', 'aceopyx')
+    source_lines = [''.join(g['text'] for g in line) for line in lines]
+    printed = ''.join(source_lines)
+    joined = ''.join(line.removesuffix('-') if after and after[0].isalpha() else line
+                     for line, after in zip(source_lines, source_lines[1:] + ['']))
+    observed = _key(paragraph.get_text()).translate(geometry_letters)
+    if (continues or paragraph.find(['math', 'sub', 'sup'])
+            or all(_key(value).translate(geometry_letters) != observed for value in (printed, joined))):
+        lines = _aligned_prose_lines(paragraph, glyphs, line_tolerance, continues)
+        if len(lines) < 2:
+            return fragment
+
+    lefts = [line[0]['x0'] for line in lines]
+    rights = [max(g['x1'] for g in line) for line in lines]
+    centers = [(l + r) / 2 for l, r in zip(lefts, rights)]
+    tolerance = max(1, size * .15)
+    indent = lefts[0] - median(lefts[1:])
+    if (indent < size * .5 or max(lefts[1:]) - min(lefts[1:]) > tolerance
+            or (len(lines) == 2 and max(rights) - min(rights) <= tolerance
+                and not _matches_column_edges(reader.chars, box, lefts[1], rights[1], line_tolerance))
+            or max(centers) - min(centers) <= tolerance):
+        return fragment
+    style = paragraph.get('style', '').strip().rstrip(';')
+    paragraph['style'] = (style + ';' if style else '') + f'text-indent:{indent:.2f}pt'
+    return str(soup)
+
+
+def page_furniture_parts(parts, doc, reader, regions, pages, manifest, api, make_part):
+    """Place printed margin text between its actual source-page blocks."""
+    from collections import defaultdict
+    from html import escape
+    from pdfplumber.utils import cluster_objects
+
+    anchors = defaultdict(list)
+    for index, part in enumerate(parts):
+        for item in part.get_unique_doc_items():
+            for prov in item.prov:
+                box = prov.bbox.to_top_left_origin(doc.pages[prov.page_no].size.height)
+                anchors[prov.page_no].append((index, [box.l, box.t, box.r, box.b], item))
+
+    removed = defaultdict(list)
+    for entry in manifest.get('removed_page_furniture', []):
+        removed[entry['page']].append(entry)
+    inserts = defaultdict(list)
+    published = []
+    for page in sorted(pages):
+        source_glyphs = []
+        if reader is not None:
+            reader.load_page(page)
+            source_glyphs = [g for g in reader.chars if g['text'].strip() and g.get('upright', True)
+                             and g.get('native_script_eligible', True)]
+        candidates = list(removed[page])
+        # Layout can miss a printed page number entirely. Read a standalone
+        # line in the physical bottom margin, even when its number differs.
+        if source_glyphs:
+            margin = [g for g in source_glyphs if g['top'] >= .90 * reader.page.height]
+            for line in cluster_objects(margin, 'bottom', 2):
+                line.sort(key=lambda g: g['x0'])
+                value = ''.join(g['text'] for g in line)
+                if re.fullmatch(r'[0-9]{1,5}', value):
+                    candidates.append(dict(text=value, bbox=[line[0]['x0'], min(g['top'] for g in line),
+                        max(g['x1'] for g in line), max(g['bottom'] for g in line)]))
+        placed = []
+        for entry in sorted(candidates, key=lambda e: (e['bbox'][1], e['bbox'][0])):
+            box, value = entry['bbox'], entry['text'].strip()
+            if not value or any(api.overlap_ratio(box, old_box) > .75 and _key(value) == _key(old)
+                                for old_box, old in placed):
+                continue
+            if any(api.overlap_ratio(box, other_box) > .75 and (
+                    not hasattr(item, 'text') or _key(value) == _key(item.text))
+                   for _, other_box, item in anchors[page]):
+                continue
+            glyphs = [g for g in source_glyphs if box[0] - 1 <= (g['x0'] + g['x1']) / 2 <= box[2] + 1
+                      and box[1] - 1 <= (g['top'] + g['bottom']) / 2 <= box[3] + 1]
+            if glyphs:
+                source_box = [min(g['x0'] for g in glyphs), min(g['top'] for g in glyphs),
+                              max(g['x1'] for g in glyphs), max(g['bottom'] for g in glyphs)]
+                word = dict(zip(('x0', 'top', 'x1', 'bottom'), source_box), text=value, chars=glyphs)
+                if not _visible_source_word(regions, page, word):
+                    continue
+                box = source_box
+            elif not any(record.get('page_no') == page and record.get('label') in {'PageHeader', 'PageFooter'}
+                         and _key(record.get('text', '')) == _key(value)
+                         and api.overlap_ratio(record['bbox'], box) > .75 for record in manifest.get('ocr_blocks', [])):
+                continue
+            placed.append((box, value))
+            # A joined table/list stays intact. Put its physical margin on
+            # the nearest outer boundary, retaining the exact page and box.
+            below = [index for index, bounds, _ in anchors[page] if bounds[1] >= box[3]]
+            if below:
+                slot = min(below)
+            elif anchors[page]:
+                slot = max(index for index, _, _ in anchors[page]) + 1
+            else:
+                slot = min((index for later, items in anchors.items() if later > page
+                            for index, _, _ in items), default=len(parts))
+            coords = ','.join(f'{v:.3f}' for v in box)
+            fragment = (f'<p data-page-furniture="true" data-source-page="{page}" '
+                        f'data-source-bbox="{coords}">{escape(value)}</p>')
+            inserts[slot].append(make_part(text=fragment))
+            published.append(dict(page=page, bbox=box, text=value))
+    manifest['published_page_furniture'] = published
+    result = []
+    for index, part in enumerate(parts):
+        result.extend(inserts[index])
+        result.append(part)
+    return result + inserts[len(parts)]
+
+
 def _source_text(reader, page_no, box, api):
     if reader is None:
         return None
@@ -217,6 +564,7 @@ def join_same_page_sections(doc, routes, excluded, note_routes, manifest, api):
     neighboring tables cannot satisfy these conditions merely by width.
     """
     from docling_core.types.doc import TableCell, TableData
+    from docling_pdf_table_layout import _table_rows
 
     entries = {e["ref"]: e for e in manifest.get("tables", [])}
     joins = manifest.setdefault("joined_tables", [])
@@ -265,8 +613,8 @@ def join_same_page_sections(doc, routes, excluded, note_routes, manifest, api):
         for node in list(content.contents):
             cell.append(node.extract())
         row.append(cell); body.append(row)
-        for row in list(right.table.find_all("tr")):
-            for cell in row.find_all("th"):
+        for row in _table_rows(right.table):
+            for cell in row.find_all("th", recursive=False):
                 cell.name = "td"
             body.append(row.extract())
         api.normalize_joined_table_body(left.table)

@@ -113,9 +113,9 @@ def write_quality_report(output, source, quality, api):
                          f'{warning.get("ref", warning.get("element", "?"))}: '
                          f'{warning.get("message") or warning.get("reason", "table_quality_warning")}')
     if formula_warnings:
-        lines += ['', '## Формулы в виде изображений', '']
+        lines += ['', '## Формулы для сверки', '']
         for warning in formula_warnings:
-            message = warning.get('message') or 'Формула сохранена изображением исходника.'
+            message = warning.get('message') or 'Проверьте запись по исходной странице.'
             lines.append(f'- Страница PDF {warning["page"]}. {message}')
     if not review_required:
         lines += ['Предупреждений таблиц не найдено. Это не посимвольная проверка точности первичного OCR.']

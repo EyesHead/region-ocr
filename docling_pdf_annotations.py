@@ -54,7 +54,11 @@ def annotation_context(doc, excluded, manifest):
         for ref in [*(getattr(table, 'footnotes', None) or []),
                     *(getattr(table, 'children', None) or [])]:
             explicit[ref.cref] = table_owner(table.self_ref)
-    context = {}
+    context = {ref: {'list_value': number} for repair in manifest.get('split_illustrated_lists', ())
+               for ref, number in repair['numeric_markers'].items()}
+    for repair in manifest.get('split_illustrated_lists', ()):
+        for ref, number in repair.get('clauses', {}).items():
+            context.setdefault(ref, {})['clause'] = number
     section = clause = previous = None
     for item, _ in doc.iterate_items():
         ref = item.self_ref
@@ -105,6 +109,8 @@ def mark_source_text(fragment, ref, context):
         return fragment
     node['id'] = source_id(ref)
     node['data-source-ref'] = ref
+    if node.name == 'li' and 'list_value' in info:
+        node['value'] = str(info['list_value'])
     if info.get('clause'):
         node['data-source-clause'] = info['clause']
     if info.get('kind'):
@@ -153,6 +159,9 @@ def normalize_semantic_annotations(soup, context, manifest):
     # Clause identifiers are source text, not an HTML list counter ("1.").
     for listing in list(soup.find_all(['ol', 'ul'])):
         items = listing.find_all('li', recursive=False)
+        if (listing.name == 'ol' and items and 'start' not in listing.attrs and items[0].get('data-source-ref')
+                and items[0].has_attr('value') and items[0]['value'] != '1'):
+            listing['start'] = items[0]['value']
         if (not items or any(not item.has_attr('data-source-clause') or item.find(['ol', 'ul'])
                              for item in items)):
             continue

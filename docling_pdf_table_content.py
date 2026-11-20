@@ -1134,6 +1134,16 @@ def _verified_native_cell(physical, geometry, node, image):
     return content, dict(method='verified_native_cell_after_incomplete_ocr', **witness)
 
 
+def _partial_transcription(fragment):
+    details = BeautifulSoup('', 'html.parser').new_tag('details', attrs={'data-ocr-cell-transcription': 'true'})
+    summary = BeautifulSoup('', 'html.parser').new_tag('summary')
+    summary.string = 'Частичное распознавание ячейки'
+    details.append(summary)
+    for child in list(fragment.contents):
+        details.append(child.extract())
+    return details
+
+
 def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, manifest, api, *, image=None):
     from docling_pdf_table_audit import register_protected_source_graphic_cell
 
@@ -1149,6 +1159,8 @@ def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, 
     for element in node.find_all(['svg','math']):
         if element.name == 'svg' or (not element.get_text(strip=True) and not element.get('data-latex')):
             element.decompose()
+    pending = physical.get('pending_primary_html')
+    keep_pending = pending and not node.get_text(strip=True) and not node.select_one('math, input, table, .source-latex')
     incomplete_coverage = isinstance(error, IncompleteCellCoverage)
     if image is not None and (incomplete_coverage or not node.find('img')):
         from docling_pdf_typed_lines import measured_cell_interior
@@ -1161,15 +1173,8 @@ def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, 
                 preview['alt'] = 'Фрагмент исходной ячейки для сверки'
                 preview['data-table-content'] = 'picture'
                 preview['data-ocr-source-preview'] = 'true'
-                if incomplete_coverage and (node.get_text(strip=True) or node.find(['img', 'math'])):
-                    details = BeautifulSoup('', 'html.parser').new_tag('details',
-                        attrs={'data-ocr-cell-transcription': 'true'})
-                    summary = BeautifulSoup('', 'html.parser').new_tag('summary')
-                    summary.string = 'Частичное распознавание ячейки'
-                    details.append(summary)
-                    for child in list(node.contents):
-                        details.append(child.extract())
-                    node.append(details)
+                if incomplete_coverage and not keep_pending and (node.get_text(strip=True) or node.find(['img', 'math'])):
+                    node.append(_partial_transcription(node))
                     node.insert(0, preview)
                 else:
                     node.append(preview)
@@ -1180,6 +1185,12 @@ def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, 
                     source_sha256=sha256(preview['src'].encode()).hexdigest(),
                     source_image_sha256=sha256(base64.b64decode(preview['src'].split(',', 1)[1])).hexdigest(),
                     method='source_preview_for_unresolved_physical_cell'))
+    # The primary grid already located this reading in the physical cell.
+    # Its order relative to the drawing remains unknown, so keep it in a transcript.
+    if keep_pending:
+        reading = BeautifulSoup(pending, 'html.parser')
+        if reading.get_text(strip=True) or reading.find('math'):
+            node.append(_partial_transcription(reading))
     note = BeautifulSoup('', 'html.parser').new_tag('span', attrs={
         'class': 'table-cell-review', 'data-ocr-review': 'true'})
     note.string = '[Ячейка распознана не полностью]'

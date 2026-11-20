@@ -6245,10 +6245,12 @@ def capture_captioned_figures(doc, reader, records, manifest, api, *, regions=No
                  and _captioned_figure_contains(expanded, r['bbox'])]
         envelope = [box, *[r['bbox'] for r in owned]]
         size = doc.pages[page].size
+        # For a caption printed inside the original picture, box ends at a
+        # measured white gutter. Its position is more precise than the OCR box.
+        caption_cut = box[3] if selected['caption_separation'] else capbox[1]-font*CAPTION_FIGURE_CAPTION_CLEARANCE_EM
         crop = [max(0., min(b[0] for b in envelope)-padding), max(0., min(b[1] for b in envelope)-padding),
                 min(size.width, max(b[2] for b in envelope)+padding),
-                min(size.height, capbox[1]-font*CAPTION_FIGURE_CAPTION_CLEARANCE_EM,
-                    max(b[3] for b in envelope)+padding)]
+                min(size.height, caption_cut, max(b[3] for b in envelope)+padding)]
         # Padding may not absorb an unrelated paragraph outside the source object.
         for text, pos in texts:
             if (not pos or pos[0] != page or text.self_ref == caption.self_ref
@@ -7962,7 +7964,7 @@ def _primary_note_table_match(bounds, entry, source_font=None):
             and bounds[3] >= box[3]-margin)
 
 def _primary_note_source_font(entry, reader):
-    if reader is None or entry.get('pdf_geometry', {}).get('hidden_ocr_direction_conflict'):
+    if reader is None or (entry.get('pdf_geometry') or {}).get('hidden_ocr_direction_conflict'):
         return None
     from statistics import median
     reader.load_page(entry['page'])

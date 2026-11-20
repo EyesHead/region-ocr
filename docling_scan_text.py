@@ -587,7 +587,8 @@ def audit(soup,manifest,api):
     entries={e['ref']:e for e in manifest.get('tables',[])}
     issues=[];tables=[]
     diagrams={p['source_image_sha256'] for p in manifest.get('source_cell_diagrams',[])}
-    diagrams.update(p['source_image_sha256'] for p in manifest.get('typed_table_picture_assets',[]))
+    diagrams.update(p['source_image_sha256'] for p in manifest.get('typed_table_picture_assets',[])
+                    if p.get('method') != 'positioned_scan_word_source_preview' and p.get('source_image_sha256'))
     for ordinal,table in enumerate(soup.find_all('table')):
         ref=table.get('data-pdf-table-ref');entry=entries.get(ref,{})
         profile=api.table_profile(str(table))
@@ -601,7 +602,7 @@ def audit(soup,manifest,api):
             if cell is None:continue
             data=image.get('src','')
             digest=hashlib.sha256(base64.b64decode(data.split(',',1)[1])).hexdigest() if data.startswith('data:image/') else hashlib.sha256(data.encode()).hexdigest()
-            if digest in diagrams:continue
+            if digest in diagrams and image.get('data-ocr-literal-review') != 'true':continue
             position=positions.get(id(cell),{})
             raster.append(dict(source_image_sha256=digest,row=position.get('row'),column=position.get('column'),
                 reason='unresolved_raster_cell_content'))

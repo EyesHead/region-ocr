@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -19,13 +20,13 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("REGION OCR — установка")]
 [assembly: AssemblyProduct("REGION OCR")]
-[assembly: AssemblyVersion("1.9.2.0")]
-[assembly: AssemblyFileVersion("1.9.2.0")]
+[assembly: AssemblyVersion("1.9.3.0")]
+[assembly: AssemblyFileVersion("1.9.3.0")]
 
 internal static class Setup
 {
     internal const string Product = "REGION OCR";
-    internal const string Version = "1.9.2";
+    internal const string Version = "1.9.3";
     internal const string Marker = ".region-ocr-install.json";
     internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\RegionOCR";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
@@ -132,14 +133,25 @@ internal static class Setup
         var plan = Plan();
         if ((string)plan["version"] != Version) throw new InvalidDataException("Версия плана не совпадает");
         int files = 0;
+        bool hasLauncher = false;
         using (var memory = new MemoryStream(Resource("app.zip")))
         using (var zip = new ZipArchive(memory, ZipArchiveMode.Read))
             foreach (var entry in zip.Entries)
             {
                 SafePath(DefaultFolder, entry.FullName);
-                using (var source = entry.Open()) { byte[] buffer = new byte[8192]; while (source.Read(buffer, 0, buffer.Length) > 0) { } }
+                using (var source = entry.Open())
+                {
+                    if (String.Equals(entry.FullName, "DocumentConverter.exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (hasLauncher || source.ReadByte() != 'M' || source.ReadByte() != 'Z')
+                            throw new InvalidDataException("Повреждён DocumentConverter.exe в пакете обновления.");
+                        hasLauncher = true;
+                    }
+                    source.CopyTo(Stream.Null);
+                }
                 files++;
             }
+        if (!hasLauncher) throw new InvalidDataException("В пакете обновления отсутствует DocumentConverter.exe.");
         return Json.Serialize(new { verified = true, version = Version, payload_files = files, packages = ((ICollection)plan["packages"]).Count });
     }
 
@@ -256,9 +268,23 @@ internal static class Setup
             }
     }
 
-    internal static void UpdateInstallation(string folder, int parent, Action<string> status, string restartArguments = "")
+    internal static string UpdateInstallation(string folder, int parent, Action<string> status, string restartArguments = "")
     {
         folder = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
+        string name;
+        using (var sha = SHA256.Create())
+            name = @"Global\RegionOCR-Update-" + BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(folder.ToUpperInvariant())));
+        bool created;
+        // Keeping the first named handle open excludes other installers until rollback or commit finishes.
+        using (var gate = new Mutex(false, name, out created))
+        {
+            if (!created) throw new IOException("Другой установщик уже обновляет эту папку: " + folder);
+            return ApplyUpdate(folder, parent, status, restartArguments);
+        }
+    }
+
+    static string ApplyUpdate(string folder, int parent, Action<string> status, string restartArguments)
+    {
         ValidateInstalledFolder(folder);
         ValidatePayload();
         var marker = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, Marker)));
@@ -298,27 +324,20 @@ internal static class Setup
                 using (var input = entry.Open()) using (var data = new MemoryStream())
                 { input.CopyTo(data); changes.Add(target, data.ToArray()); }
             }
-        changes[Path.Combine(folder, "Uninstall.exe")] = File.ReadAllBytes(Assembly.GetExecutingAssembly().Location);
+        string launcher = Path.Combine(folder, "DocumentConverter.exe"), uninstall = Path.Combine(folder, "Uninstall.exe");
+        changes[uninstall] = File.ReadAllBytes(Assembly.GetExecutingAssembly().Location);
         marker["version"] = Version;
-        changes[Path.Combine(folder, Marker)] = new UTF8Encoding(false).GetBytes(Json.Serialize(marker));
-        // The source payload is small enough to roll back in memory.
-        var before = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        var written = new List<string>();
+        string markerPath = Path.Combine(folder, Marker);
+        byte[] markerBytes = new UTF8Encoding(false).GetBytes(Json.Serialize(marker));
+        var payloadRollback = new List<Action>();
         var componentRollback = new List<Action>();
-        foreach (string file in changes.Keys)
-        {
-            ValidateUpdatePath(folder, file);
-            before.Add(file, File.Exists(file) ? File.ReadAllBytes(file) : null);
-        }
-        string staging = null;
-        bool cleanupStaging = true;
+        string staging = SafePath(folder, ".region-ocr-update-" + Guid.NewGuid().ToString("N"));
+        ValidateUpdatePath(folder, staging);
+        Directory.CreateDirectory(staging);
         try
         {
             if (updateSurya)
             {
-                staging = SafePath(folder, ".region-ocr-update-" + Guid.NewGuid().ToString("N"));
-                ValidateUpdatePath(folder, staging);
-                Directory.CreateDirectory(staging);
                 var componentPaths = new List<string>(SuryaUpdatePaths(newPlan));
                 PrepareSuryaUpdate(folder, staging, profile, changes, componentPaths, status);
                 EnsureApplicationClosed(folder);
@@ -327,40 +346,85 @@ internal static class Setup
             }
             status("Обновление файлов приложения…");
             foreach (var change in changes)
-            {
-                ValidateUpdatePath(folder, change.Key);
-                Directory.CreateDirectory(Path.GetDirectoryName(change.Key));
-                written.Add(change.Key);
-                File.WriteAllBytes(change.Key, change.Value);
-            }
+                PublishUpdateFile(folder, staging, change.Key, change.Value, payloadRollback);
+            foreach (string executable in new[] { launcher, uninstall })
+                if (!File.Exists(executable) || !File.ReadAllBytes(executable).SequenceEqual(changes[executable]))
+                    throw new IOException("Не удалось проверить установленный файл: " + executable);
+            PublishUpdateFile(folder, staging, markerPath, markerBytes, payloadRollback);
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath, true))
-                if (key != null && String.Equals(Convert.ToString(key.GetValue("InstallLocation")), folder, StringComparison.OrdinalIgnoreCase))
+            {
+                bool registered = key != null && String.Equals(Convert.ToString(key.GetValue("InstallLocation")), folder, StringComparison.OrdinalIgnoreCase);
+                object oldDisplay = registered ? key.GetValue("DisplayVersion") : null;
+                if (registered)
                     key.SetValue("DisplayVersion", Version);
+                try
+                {
+                    status("Запуск обновлённого конвертера…");
+                    Process.Start(new ProcessStartInfo(launcher, restartArguments) { WorkingDirectory = folder, UseShellExecute = false, CreateNoWindow = true });
+                }
+                catch
+                {
+                    if (registered)
+                    {
+                        if (oldDisplay == null) key.DeleteValue("DisplayVersion", false);
+                        else key.SetValue("DisplayVersion", oldDisplay);
+                    }
+                    throw;
+                }
+            }
         }
-        catch
+        catch (Exception failure)
         {
-            try
+            var errors = new List<Exception> { failure };
+            foreach (var undoList in new[] { payloadRollback, componentRollback })
             {
-                written.Reverse();
-                foreach (string file in written)
-                    if (before[file] == null) File.Delete(file); else File.WriteAllBytes(file, before[file]);
+                for (int i = undoList.Count - 1; i >= 0; i--)
+                    try { undoList[i](); } catch (Exception undoFailure) { errors.Add(undoFailure); }
             }
-            finally
-            {
-                // Keep the component backups if rollback itself fails.
-                cleanupStaging = false;
-                componentRollback.Reverse();
-                foreach (Action undo in componentRollback) undo();
-                cleanupStaging = true;
-            }
+            if (errors.Count > 1)
+                throw new AggregateException("Не удалось полностью отменить обновление. Предыдущие файлы сохранены в " + staging, errors);
+            Exception cleanup = CleanupUpdateFiles(staging);
+            if (cleanup != null)
+                throw new AggregateException("Обновление отменено. Не удалось очистить папку " + staging, failure, cleanup);
             throw;
         }
-        finally
+        Exception remaining = CleanupUpdateFiles(staging);
+        return remaining == null ? null : "Конвертер обновлён и запущен. Не удалось очистить папку " + staging + "\n" + remaining.Message;
+    }
+
+    static Exception CleanupUpdateFiles(string staging)
+    {
+        try
         {
-            if (cleanupStaging && staging != null && Directory.Exists(staging)) DeleteTree(staging);
+            if (Directory.Exists(staging)) DeleteTree(staging);
+            return null;
         }
-        status("Обновление установлено. Запуск конвертера…");
-        Process.Start(new ProcessStartInfo(Path.Combine(folder, "DocumentConverter.exe"), restartArguments) { WorkingDirectory = folder, UseShellExecute = false, CreateNoWindow = true });
+        catch (IOException error) { return error; }
+        catch (UnauthorizedAccessException error) { return error; }
+    }
+
+    static void PublishUpdateFile(string folder, string staging, string target, byte[] bytes, List<Action> rollback)
+    {
+        ValidateUpdatePath(folder, target);
+        Directory.CreateDirectory(Path.GetDirectoryName(target));
+        string prepared = Path.Combine(staging, "payload.pending");
+        File.WriteAllBytes(prepared, bytes);
+        if (File.Exists(target))
+        {
+            string backup = SafePath(staging, "previous-app/" + target.Substring(folder.Length + 1));
+            Directory.CreateDirectory(Path.GetDirectoryName(backup));
+            rollback.Add(() => {
+                if (!File.Exists(backup)) return;
+                if (File.Exists(target)) File.Replace(backup, target, null);
+                else File.Move(backup, target);
+            });
+            File.Replace(prepared, target, backup);
+        }
+        else
+        {
+            File.Move(prepared, target);
+            rollback.Add(() => File.Delete(target));
+        }
     }
 
     const string OldSuryaCache = "models/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/";
@@ -586,7 +650,11 @@ internal sealed class UpdateWindow : Form
         FormClosing += delegate(object sender, FormClosingEventArgs e) { if (working) e.Cancel = true; };
         Shown += async delegate
         {
-            try { await Task.Run(() => Setup.UpdateInstallation(folder, parent, text => BeginInvoke(new Action(() => status.Text = text)), restartArguments)); }
+            try
+            {
+                string warning = await Task.Run(() => Setup.UpdateInstallation(folder, parent, text => BeginInvoke(new Action(() => status.Text = text)), restartArguments));
+                if (warning != null) MessageBox.Show(this, warning, "Обновление установлено", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             catch (Exception error) { MessageBox.Show(this, error.Message, "Обновление не завершено", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             finally { working = false; Setup.CleanupUpdateDownload(); Close(); }
         };

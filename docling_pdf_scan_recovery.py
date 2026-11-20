@@ -291,6 +291,7 @@ def _read_scan_word_context(image, region, box, page, args, api, page_no):
 
 def verify_scan_cell_literals(table, profile, geometry, image, region, page_no, reader, args, manifest, api, ref):
     """Correct a disputed table token only when the source pixels confirm the other reading."""
+    from base64 import b64decode
     import re
     from PIL import Image, ImageOps
     from bs4 import BeautifulSoup
@@ -400,6 +401,7 @@ def verify_scan_cell_literals(table, profile, geometry, image, region, page_no, 
             manifest.setdefault('typed_table_picture_assets',[]).append(dict(
                 page=page_no,source_ref=ref,cell={k:position[k] for k in ('row','column','row_span','column_span')},
                 source_bbox=bounds,source_sha256=sha256(preview['src'].encode()).hexdigest(),
+                source_image_sha256=sha256(b64decode(preview['src'].split(',', 1)[1])).hexdigest(),
                 method='positioned_scan_word_source_preview'))
             record['reason'] = 'scan_literal_disagreement_unconfirmed'
             record['message'] = 'Сохранено изображение спорного слова или числа из исходной таблицы.'

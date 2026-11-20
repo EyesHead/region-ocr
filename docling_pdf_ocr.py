@@ -5,6 +5,10 @@ import json
 import math
 
 
+class InvalidLayoutOutput(RuntimeError):
+    """The backend responded but the layout could not be decoded reliably."""
+
+
 def _layout_error(item, output):
     if output is None:
         return 'inference_failed_or_empty'
@@ -40,7 +44,8 @@ def _layout_error(item, output):
 def _complete_region_output(item, output, request, diagnostic):
     """Retry a truncated region once within the installed output budget."""
     reason = _layout_error(item, output)
-    if reason != 'output_token_limit' or item.prompt_type == 'high_accuracy_bbox' or not item.max_tokens:
+    if (reason != 'output_token_limit' or item.prompt_type == 'high_accuracy_bbox' or not item.max_tokens
+            or item.metadata.get('purpose') == 'physical_cell_layout'):
         return item, output, reason
     from surya.settings import settings
     previous = item.max_tokens
@@ -101,6 +106,8 @@ def recovering_generate(batch, request, diagnostic):
     No document/page/element count budget is imposed. A persistent error is
     raised with context instead of returning an apparently successful blank OCR.
     """
+    from surya.inference.prompts import LAYOUT_JSON_SCHEMA
+
     outputs = request(batch)
     if len(outputs) != len(batch):
         raise RuntimeError('Local inference result count mismatch')
@@ -116,12 +123,15 @@ def recovering_generate(batch, request, diagnostic):
             continue
         # Repeating the same greedy loop or a known exhausted budget cannot
         # complete its transcription. Keep those failures explicit.
-        if (retry.max_tokens == item.max_tokens
+        # Local layout inference defaults to greedy decoding. Repeating the
+        # same prompt and schema on the same crop produces the same bad JSON.
+        same_layout = (item.prompt_type == 'layout' and reason.startswith('invalid_layout:')
+                       and item.guided_json == LAYOUT_JSON_SCHEMA and item.temperature in (None, 0.0))
+        if (retry.max_tokens == item.max_tokens and not same_layout
                 and reason not in {'output_token_limit', 'repeating_output'}):
             diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
                        image_size=list(item.image.size), metadata=item.metadata)
             if item.prompt_type == 'layout':
-                from surya.inference.prompts import LAYOUT_JSON_SCHEMA
                 retry = replace(retry, guided_json=LAYOUT_JSON_SCHEMA, temperature=0.0)
             repeated = request([retry])
             output = repeated[0] if len(repeated) == 1 else None
@@ -131,7 +141,12 @@ def recovering_generate(batch, request, diagnostic):
                        image_size=list(item.image.size), method='single_request_retry')
             recovered.append(output)
             continue
-        parts = _layout_parts(item.image) if item.prompt_type in {'layout','high_accuracy_bbox'} else []
+        # Only the type of content is unknown for an already located cell.
+        # Re-segmenting that same cell cannot establish which source tokens
+        # it owns. Its caller checks positioned readings and retains its pixels.
+        split_page = (item.prompt_type in {'layout', 'high_accuracy_bbox'}
+                      and item.metadata.get('purpose') != 'physical_cell_layout')
+        parts = _layout_parts(item.image) if split_page else []
         if parts:
             from surya.inference.parsers import parse_layout, parse_full_page_html
             blocks = []
@@ -173,7 +188,13 @@ def recovering_generate(batch, request, diagnostic):
             diagnostic('OCR_FULL_PAGE_LAYOUT_FALLBACK', reason=reason, image_size=list(item.image.size))
             recovered.append(output)
             continue
-        error = RuntimeError(f'Local {item.prompt_type} request failed after retry: {reason}')
+        invalid_layout = (item.prompt_type == 'layout' and output is not None and bool(output.raw)
+                          and (reason.startswith('invalid_layout:') or reason in {
+                              'output_token_limit', 'repeating_output'}))
+        if invalid_layout:
+            error = InvalidLayoutOutput(f'Local layout output could not be recovered: {reason}')
+        else:
+            error = RuntimeError(f'Local {item.prompt_type} request failed after retry: {reason}')
         error.context = dict(stage='ocr/layout', element=item.metadata.get('element'),
                              page=item.metadata.get('page'), reason=reason)
         diagnostic('OCR_REQUEST_FAILED', **error.context, image_size=list(item.image.size))

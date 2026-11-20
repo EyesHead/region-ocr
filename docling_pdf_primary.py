@@ -92,6 +92,32 @@ def _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)
     return profile
 
 
+def _trim_empty_right_columns(fragment, primary, width):
+    """Project a padded OCR table onto the measured width without changing any payload."""
+    parsed = BeautifulSoup(fragment, 'html.parser')
+    if len(parsed.find_all('table')) != 1 or parsed.table.find('colgroup'):
+        return None
+    nodes = parsed.table.find_all(['td', 'th'])
+    if len(nodes) != len(primary['cells']):
+        return None
+    empty_columns = set()
+    for node, cell in zip(nodes, primary['cells']):
+        column, span = cell['column'], cell['column_span']
+        if column >= width:
+            if node.decode_contents().strip() or set(node.attrs) - {'rowspan', 'colspan'}:
+                return None
+            empty_columns.update(range(column, column + span))
+            node.decompose()
+        elif column + span > width:
+            if width - column == 1:
+                node.attrs.pop('colspan', None)
+            else:
+                node['colspan'] = str(width - column)
+    if empty_columns == set(range(width, primary['columns'])):
+        return str(parsed.table)
+    return None
+
+
 def _aligned_profile(fragment, geometry, target, source_image, region, api, *, bounds=None, page=None, reader=None):
     primary = api.table_profile(fragment)
     normalization = None
@@ -124,6 +150,14 @@ def _aligned_profile(fragment, geometry, target, source_image, region, api, *, b
         return proven(primary, 'exact_source_cell_positions')
     from docling_pdf_primary_rows import align_atomic_primary_rows
     atomic = align_atomic_primary_rows(fragment, geometry, target, api)
+    if (atomic is None and not primary['issues'] and primary['columns'] > target['columns']
+            and geometry.get('source_grid_verified') and geometry.get('page_scan_transcription_required')):
+        trimmed = _trim_empty_right_columns(fragment, primary, target['columns'])
+        if trimmed is not None:
+            candidate = align_atomic_primary_rows(trimmed, geometry, target, api)
+            if candidate and candidate['source_partition_proof']['exact_primary_literal_geometry_anchors']:
+                candidate['source_partition_proof']['empty_trailing_ocr_columns'] = primary['columns'] - target['columns']
+                atomic = candidate
     if atomic is not None:
         return proven(atomic, 'unique_monotone_atomic_primary_rows_on_measured_source_grid')
     external = _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)

@@ -72,14 +72,14 @@ def read_source_scan_grid(reader, regions, page, bounds, reference_fragments=(),
     image = regions.crop(page, roi)
     try:
         detailed = reader.read_raster_table(page, roi, image, reference_fragments,
-                                            _short_rules=True)
+                                            _short_rules=True, source_bounds=bounds)
         native = None
         if detailed and detailed[1].get('source_grid_verified'):
             profile = api.table_profile(detailed[0]) if api is not None else None
             if profile is None or not profile.get('issues'):
                 native = detailed
         if native is None:
-            native = reader.read_raster_table(page, roi, image, reference_fragments)
+            native = reader.read_raster_table(page, roi, image, reference_fragments, source_bounds=bounds)
         if native is None:
             image.close()
             return None

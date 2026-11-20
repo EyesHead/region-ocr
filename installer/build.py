@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VERSION = '1.9.3'
+VERSION = '1.9.4'
 
 
 def build(output):

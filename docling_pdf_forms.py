@@ -22,6 +22,69 @@ def form_owns_region(manifest, page, box):
         and box[3] <= entry['bbox'][3]+2 for entry in entries)
 
 
+def attach_form_dimensions(soup, doc, records, manifest, reader, regions, api):
+    """Expose exterior dimensions of a captioned drawing that also has a measured table."""
+    from bs4 import BeautifulSoup
+    from docling_pdf_logical_rows import _same_region
+    from docling_pdf_table_content import _source_text_coverage
+
+    if reader is None or regions is None:
+        return
+    recovered = manifest.get('recovered_scan_tables', [])
+    if not recovered:
+        return
+    for picture in doc.pictures:
+        loc = api.item_region(picture, doc)
+        if not loc or len(picture.captions) != 1:
+            continue
+        page, box = loc
+        title = getattr(picture.captions[0].resolve(doc), 'text', '')
+        if not FORM_HEADING.fullmatch(re.sub(r'^\s*Ф\s*о\s*р\s*м\s*а\b', 'Форма', title, flags=re.I)):
+            continue
+        grids = [r for r in recovered if r['page'] == page and api._captioned_figure_contains(box, r['bbox'])]
+        packets = [r for r in records if r.get('page_no') == page and r.get('label') == 'Table'
+                   and _same_region(r.get('bbox'), box)]
+        figures = [cap.parent for cap in soup.find_all('figcaption') if cap.parent.name == 'figure'
+                   and api.furniture_key(cap.get_text(' ', strip=True)) == api.furniture_key(title)]
+        if len(grids) != 1 or len(packets) != 1 or len(figures) != 1:
+            continue
+        grid, figure = grids[0], figures[0]
+        pictures = figure.find_all('img')
+        if len(pictures) != 1 or figure.has_attr('data-form-grid'):
+            continue
+        primary = BeautifulSoup(packets[0]['html'], 'html.parser')
+        rows = primary.find_all('tr')
+        if len(primary.find_all('table')) != 1 or len(rows) < 3:
+            continue
+        words = reader.load_page(page).extract_words(return_chars=True)
+        for side, row, top, bottom in (('above', rows[0], box[1], grid['bbox'][1]),
+                                       ('below', rows[-1], grid['bbox'][3], box[3])):
+            values = row.get_text(' ', strip=True).split()
+            if not values or not all(v.isdecimal() for v in values):
+                continue
+            band = sorted((w for w in words if box[0] <= w['x0'] and w['x1'] <= box[2]
+                           and top <= (w['top']+w['bottom'])/2 <= bottom), key=lambda w: w['x0'])
+            if ([w['text'] for w in band] != values or max(w['top'] for w in band) >= min(w['bottom'] for w in band)
+                    or any(w['top'] < top or w['bottom'] > bottom for w in band)):
+                continue
+            proofs = []
+            for w in band:
+                bounds = [w[k] for k in ('x0', 'top', 'x1', 'bottom')]
+                with regions.crop(page, bounds) as crop:
+                    support = _source_text_coverage(crop, [{'label': 'Text'}], reader, bounds, page, api, w['text'])
+                if support is None:
+                    break
+                proofs.append(support[1])
+            if len(proofs) != len(values):
+                continue
+            label = soup.new_tag('p', attrs={'data-form-dimensions': side})
+            label.string = ('Размеры сверху — ' if side == 'above' else 'Размеры снизу — ') + ', '.join(values)
+            (pictures[0].insert_before if side == 'above' else pictures[0].insert_after)(label)
+            figure['data-form-grid'] = grid['ref']
+            manifest.setdefault('source_form_dimensions', []).append(dict(page=page, ref=grid['ref'],
+                picture_ref=picture.self_ref, side=side, values=values, source_glyphs=proofs))
+
+
 def _reparent_form(doc, owner, captions):
     """Keep each form reachable when its old floating container is suppressed."""
     from docling_core.types.doc import ContentLayer, DocItemLabel, FloatingItem

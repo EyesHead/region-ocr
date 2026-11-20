@@ -4247,7 +4247,8 @@ class NativeTableReader:
         return any(entry['page']==page_no and overlap_ratio(entry['bbox'],region)>.6
                    for entry in getattr(self,'raster_text_direction_conflicts',()))
 
-    def read_raster_table(self, page_no, region, source_image, reference_fragments=(), *, _header_rules=False, _short_rules=False):
+    def read_raster_table(self, page_no, region, source_image, reference_fragments=(), *, _header_rules=False,
+                          _short_rules=False, source_bounds=None):
         """Recover scan cells and illustrations without depending on headings."""
         import cv2
         import numpy as np
@@ -4298,7 +4299,21 @@ class NativeTableReader:
         vertical_edges=persistent
         if vertical_edges:
             left,right=min(e['x0'] for e in vertical_edges),max(e['x0'] for e in vertical_edges)
-            for position in (min(e['top'] for e in vertical_edges),max(e['bottom'] for e in vertical_edges)):
+            for side, position in ((1, min(e['top'] for e in vertical_edges)),
+                                   (3, max(e['bottom'] for e in vertical_edges))):
+                # The padded scan ROI preserves rail thickness and tick marks.
+                # A clipped vertical tick outside the measured rail is not a row.
+                if source_bounds is not None:
+                    padding = abs(region[side] - source_bounds[side])
+                    outer = position <= source_bounds[1] if side == 1 else position >= source_bounds[3]
+                    rails = [e['top'] for e in edges if e['orientation'] == 'h'
+                             and e['x0'] <= left+sx and e['x1'] >= right-sx
+                             and abs(e['top']-source_bounds[side]) <= padding+sy]
+                    if outer and rails:
+                        low, high = sorted((position, min(rails, key=lambda y: abs(y-position))))
+                        if not any(g['text'].strip() and left <= (g['x0']+g['x1'])/2 <= right
+                                   and low < (g['top']+g['bottom'])/2 < high for g in self.chars):
+                            continue
                 if (min(abs(position-region[1]),abs(position-region[3]))<3
                         and not any(e['orientation']=='h' and abs(e['top']-position)<2
                                     and e['width'] >= .98*(right-left) for e in edges)):
@@ -4338,14 +4353,17 @@ class NativeTableReader:
                     source_slots[yy,xx]=True
         complete_source_grid=(not source_overlap and len(source_slots)==(len(xs)-1)*(len(ys)-1))
         first=[c for c in cells if c['row']==0]
-        header_rows=(max((c['row_span'] for c in first),default=1)
-                     if sum(bool(re.search(r'[A-Za-zА-Яа-яЁё]{3}',BeautifulSoup(c['html'],'html.parser').get_text())) for c in first)>=2 else 0)
+        # An all-height side label spans body records as well as any headings.
+        # The other first-row cells still establish ordinary and grouped headers.
+        head_band = [c for c in first if c['row_span'] < len(ys)-1]
+        header_rows=(max(c['row_span'] for c in head_band)
+                     if sum(bool(re.search(r'[A-Za-zА-Яа-яЁё]{3}',BeautifulSoup(c['html'],'html.parser').get_text())) for c in head_band)>=2 else 0)
         # A long left header and an enclosing group above most leaf columns
         # establish a multi-level head even when a rotated hidden OCR layer
         # cannot supply readable heading words.
-        if (any(c['column']==0 and c['row_span']>=3 for c in first)
+        if (any(c['column']==0 and c['row_span']>=3 for c in head_band)
                 and any(c['column']>0 and c['column_span']>=max(2,(len(xs)-1)/2) for c in first)):
-            header_rows=max(header_rows,max(c['row_span'] for c in first))
+            header_rows=max(header_rows,max(c['row_span'] for c in head_band))
         def quarter_turned(glyph):
             matrix=glyph.get('matrix')
             if matrix is None or len(matrix)<4:return False
@@ -9702,6 +9720,8 @@ def export_local_html(args, result, normalized, orientation, source):
             join_primary_note_table_continuations(soup,manifest,records,sys.modules[__name__])
         from docling_pdf_logical_rows import style_primary_logical_rows
         style_primary_logical_rows(soup, manifest, sys.modules[__name__])
+        from docling_pdf_forms import attach_form_dimensions
+        attach_form_dimensions(soup, doc, records, manifest, native_reader, regions, sys.modules[__name__])
         for style in soup.find_all("style"):
             style.decompose()
         style = soup.new_tag("style")

@@ -158,6 +158,60 @@ def _read_line(image, args, page, position, api, max_characters):
     return (html, replies[0]), None
 
 
+def recover_vertical_cell_text(image, args, page, position, box, api):
+    """Confirm a rotated printed line against the independent primary table reading."""
+    if image.height < image.width * 2 or not getattr(args, 'surya_ocr_model', None):
+        return None
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    interior = measured_cell_interior(image)
+    if not interior:
+        return None
+    pixels, _ = interior
+    with image.crop(pixels) as source:
+        ink = _threshold(source)
+        x, y, width, height = cv2.boundingRect(ink)
+        if width < 3 or height < width * 4:
+            return None
+        stats = cv2.connectedComponentsWithStats(ink, 8)[2][1:]
+        letters = stats[stats[:, cv2.CC_STAT_AREA] >= 3]
+        if len(letters) < 4 or np.median(letters[:, cv2.CC_STAT_WIDTH]) < width / 3:
+            return None
+        candidates = {}
+        for record in getattr(args, 'surya_records', ()):
+            rect = record.get('bbox')
+            if (record.get('page_no') != page or record.get('label', '').lower() != 'table' or not rect
+                    or not (rect[0] <= box[0] < box[2] <= rect[2] and rect[1] <= box[1] < box[3] <= rect[3])):
+                continue
+            for cell in BeautifulSoup(record.get('html', ''), 'html.parser').find_all(['td', 'th']):
+                if (cell.select_one('[data-latex], .source-latex')
+                        or any(tag.name not in {'p', 'span', 'b', 'strong', 'i', 'em'}
+                               for tag in cell.find_all(True))):
+                    continue
+                text = ' '.join(cell.get_text(' ', strip=True).split())
+                if text:
+                    candidates.setdefault(text, set()).add(cell.decode_contents())
+        if not candidates:
+            return None
+        bounds = (max(0, x-4), max(0, y-4), min(source.width, x+width+4), min(source.height, y+height+4))
+        with source.crop(bounds) as strip:
+            for turn, angle in ((Image.Transpose.ROTATE_270, 90), (Image.Transpose.ROTATE_90, 270)):
+                with strip.transpose(turn) as line:
+                    reading, _ = _read_line(line, args, page, position, api, ceil(len(letters) * 1.24) + 1)
+                if reading:
+                    value = ' '.join(BeautifulSoup(reading[0], 'html.parser').get_text(' ', strip=True).split())
+                    variants = candidates.get(value, set())
+                    if len(variants) == 1:
+                        from docling_pdf_table_content import _safe_markup
+                        content = _safe_markup(next(iter(variants)), api)
+                        return content, dict(method='rotated_line_and_primary_table_agree', page=page,
+                            clockwise=angle, source_bbox=list(box), source_pixel_bbox=list(pixels),
+                            response_sha256=reading[1])
+    return None
+
+
 def recover_typed_text_lines(image, args, page, position, api):
     """Read verified prose bands independently and disclose any unconfirmed lines."""
     if image.height < 60:

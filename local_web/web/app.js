@@ -186,7 +186,7 @@
   function jobFormat(job) { return Object.hasOwn(formats, job.format) ? job.format : 'markdown'; }
   function isJobRecord(record) { return record.kind === 'job'; }
   function recordPath(record) { return isJobRecord(record) ? `/api/jobs/${encodeURIComponent(record.job_id)}` : `/api/installed/${encodeURIComponent(record.id)}`; }
-  function deletionKey(record) { return isJobRecord(record) ? `job:${record.job_id}` : `saved:${record.id}`; }
+  function deletionKey(record) { return record.job_id ? `job:${record.job_id}` : `saved:${record.id}`; }
   function savedActions(record, disabled = false, original = false) {
     const first = original
       ? button('Открыть оригинал', 'button button-outline', () => openSavedResult(record.id, 'source'))
@@ -200,10 +200,22 @@
     actions.forEach(action => { action.disabled = disabled; });
     return actions;
   }
-  function deleteButton(record) {
-    const remove = button(state.deleting.has(deletionKey(record)) ? 'Удаление…' : 'Удалить', 'button button-danger', () => deleteDocument(record));
-    remove.disabled = state.deleting.has(deletionKey(record)) || record.status === 'running';
-    remove.setAttribute('aria-label', isJobRecord(record) ? `Удалить файл и все результаты конвертации: ${record.name}` : `Удалить результат в формате ${formats[record.format] || record.format}: ${record.name}`);
+  function deleteButton(record, iconOnly = false) {
+    const deleting = state.deleting.has(deletionKey(record));
+    const job = state.jobs.find(job => job.id === record.job_id) || record;
+    const remove = button(iconOnly ? '' : 'Удалить файл',
+      iconOnly ? 'button button-outline job-trash' : 'button button-danger', () => deleteDocument(record));
+    remove.disabled = !state.connected || deleting || ['uploading', 'queued', 'running'].includes(jobLifecycle(job));
+    remove.setAttribute('aria-label', `Удалить файл и все результаты: ${record.name}`);
+    remove.title = deleting ? 'Удаление…' : 'Удалить файл и все результаты';
+    if (deleting) remove.setAttribute('aria-busy', 'true');
+    if (iconOnly) {
+      const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      icon.setAttribute('viewBox', '0 0 24 24');
+      icon.setAttribute('aria-hidden', 'true');
+      icon.innerHTML = '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/>';
+      remove.append(icon);
+    }
     return remove;
   }
   function additionalActions(job, record) {
@@ -254,7 +266,7 @@
     }
     group('Документ', documentActions);
     if (!['queued', 'running', 'uploading'].includes(lifecycle)) {
-      group('Управление', [dismissControl(job, true), deleteButton(record || {...job, kind: 'job', job_id: job.id})]);
+      group('Управление', [dismissControl(job, true)]);
     }
     details.append(summary, menu);
     details.addEventListener('toggle', () => {
@@ -510,16 +522,17 @@
     statusLabel.prepend(statusIcon(['ready', 'export'].includes(lifecycle) ? 'queued' : status));
     statusRegion.prepend(statusLabel);
     if (job.saved_result_id && lifecycle === 'done') statusRegion.append(element('span', 'job-saved-note', 'Сохранён в папку'));
+    let savedRecord;
     if (lifecycle === 'done') {
       if (job.saved_result_id) {
         const record = { id: job.saved_result_id, job_id: job.id, name: job.name, format: convertedFormat };
         const disabled = state.opening.has(record.id) || state.deleting.has(deletionKey(record));
         const open = button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/installed/${encodeURIComponent(record.id)}/view/document.html`));
         open.disabled = disabled;
-        actions.append(open, additionalActions(job, record));
+        actions.append(open);
+        savedRecord = record;
       } else {
         actions.append(button('Открыть результат', 'button button-primary html-preview-button', () => openHtml(`/api/view/${encodeURIComponent(job.id)}/document.html`)));
-        actions.append(additionalActions(job));
       }
     } else if (lifecycle === 'running') {
       actions.append(button('Остановить', 'button button-outline', () => cancelJobs([job.id])));
@@ -537,8 +550,10 @@
     } else if (lifecycle === 'cancelled') {
       actions.append(button('Запустить заново', 'button button-primary', () => startJobs([job.id])));
     }
-    if (!['uploading', 'done'].includes(lifecycle)) {
-      actions.append(additionalActions(job));
+    if (lifecycle !== 'uploading') {
+      const tools = element('div', 'job-tools');
+      tools.append(deleteButton({...job, kind: 'job', job_id: job.id}, true), additionalActions(job, savedRecord));
+      actions.append(tools);
     }
     if (state.busy || !state.connected || state.deleting.has(`job:${job.id}`)) actions.querySelectorAll('button').forEach(control => { control.disabled = true; });
     row.append(actions);
@@ -579,7 +594,7 @@
     const list = $('#job-list');
     const existingRows = new Map([...list.children].map(row => [row.dataset.id, row]));
     const nextRows = visibleJobs.map(job => {
-      const key = JSON.stringify([state.format, state.busy, state.connected, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), state.deleting.has(`saved:${job.saved_result_id}`), job]);
+      const key = JSON.stringify([state.format, state.busy, state.connected, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), job]);
       const previous = existingRows.get(job.id);
       if (previous?.dataset.renderKey === key) return previous;
       const row = createJobRow(job);
@@ -955,14 +970,7 @@
     closePageMenu();
     if ($('#delete-dialog').open) return Promise.resolve(false);
     closeDismissHint();
-    const wholeDocument = isJobRecord(record);
-    $('#delete-title').textContent = wholeDocument ? 'Удаление файла' : 'Удаление результата';
-    $('#delete-message').textContent = wholeDocument
-      ? `Удалить файл «${record.name}» и все результаты конвертации?`
-      : `Удалить результат в формате ${formats[record.format] || record.format} для файла «${record.name}»?`;
-    $('#delete-details').textContent = wholeDocument
-      ? 'Будут удалены загруженная копия, все сохранённые результаты, логи и кэш этого файла. Исходный файл вне программы останется на компьютере.'
-      : 'Будет удалён выбранный сохранённый результат. Загруженный файл, результаты в других форматах и данные для конвертации сохранятся.';
+    $('#delete-message').textContent = `Удалить файл «${record.name}» и все результаты конвертации?`;
     const trigger = document.activeElement;
     return new Promise(resolve => {
       deleteConfirmation = { resolve, trigger };
@@ -977,16 +985,25 @@
     render();
     if ($('#installed-dialog').open) renderInstalled();
     try {
-      await api(recordPath(item), { method: 'DELETE' });
+      const path = isJobRecord(item) ? recordPath(item) : `${recordPath(item)}/document`;
+      await api(path, { method: 'DELETE' });
       await refresh();
       if ($('#installed-dialog').open) await loadInstalled();
-      toast(isJobRecord(item) ? 'Файл, все результаты конвертации, логи и кэш удалены.' : `Результат в формате ${formats[item.format] || item.format} удалён.`);
+      toast('Файл, все результаты конвертации, журналы и кэш удалены.');
     } catch (error) {
       toast(error.message);
       await refresh();
       if ($('#installed-dialog').open) await loadInstalled();
     }
-    finally { state.deleting.delete(key); render(); if ($('#installed-dialog').open) renderInstalled(); }
+    finally {
+      state.deleting.delete(key);
+      render();
+      const inHistory = $('#installed-dialog').open;
+      if (inHistory) renderInstalled();
+      if (document.activeElement === document.body) {
+        $(inHistory ? '#installed-search' : '#job-search').focus({ preventScroll: true });
+      }
+    }
   }
   function setLogContent(record, content) {
     state.logRecord = record;

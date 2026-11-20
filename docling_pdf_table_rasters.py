@@ -20,6 +20,16 @@ def _same_table_footprint(bounds,source):
         and min(_coverage(bounds,source),_coverage(source,bounds))>=.98)
 
 
+def aligned_table_layout_crop(bounds, source, *, table_caption=False):
+    """Recognize the measured table inside a slightly padded layout crop."""
+    if min(_coverage(bounds, source), _coverage(source, bounds)) >= .97:
+        if all(abs(a-b) <= 6 for a,b in zip(bounds, source)):
+            return True
+    return (table_caption and all(abs(bounds[i]-source[i]) <= 4 for i in (0,1,2))
+            and 0 <= bounds[3]-source[3] <= min(24, (source[3]-source[1])*.06)
+            and _coverage(source,bounds) >= .98 and _coverage(bounds,source) >= .95)
+
+
 def _image_digest(picture):
     uri=str(getattr(getattr(picture,'image',None),'uri',''))
     if not uri.startswith('data:image/'):return None
@@ -211,3 +221,63 @@ def suppress_layout_table_rasters(doc,manifest,excluded,api):
     manifest['known_table_rasters_removed']=removed
     manifest['known_table_raster_policy_issues']=issues
     return removed
+
+
+def table_review_notice(soup, *, page=None, ref=None, caption=None):
+    """A user-visible notice that carries no image and survives all exports."""
+    attrs = {'role': 'note', 'data-unrecognized-table': 'true'}
+    if page is not None:
+        attrs['data-pdf-page'] = str(page)
+    if ref:
+        attrs['data-pdf-table-ref'] = ref
+    node = soup.new_tag('aside', attrs=attrs)
+    paragraph = soup.new_tag('p')
+    location = f' (страница PDF {page})' if page is not None else ''
+    paragraph.string = 'Таблица распознана не полностью' + location + '.'
+    if caption:
+        node.append(caption)
+    node.append(paragraph)
+    return node
+
+
+def remove_published_table_rasters(soup, *, captioned_layout=True):
+    """Replace legacy table screenshots before copying any referenced media."""
+    from docling_pdf_forms import FIGURE_CAPTION, FORM_HEADING
+
+    table_caption = re.compile(r'^\s*(?:(?:Продолжение|Окончание)\s+)?(?:Таблиц[аы]|Табл\.)\s*'
+        r'(?:[А-ЯЁA-Z]\s*\.\s*)?\d+(?:[.\-]\d+)*(?:\s*$|\s*[—–-])', re.I)
+    changed = 0
+    for figure in soup.find_all('figure'):
+        if figure.find_parent(['td', 'th']):
+            continue
+        caption = figure.find('figcaption', recursive=False)
+        title = caption.get_text(' ', strip=True) if caption else ''
+        marked = 'source-table' in figure.get('class', [])
+        if not marked and not (captioned_layout and figure.find('img') and table_caption.match(title)):
+            continue
+        if FIGURE_CAPTION.fullmatch(title) or FORM_HEADING.fullmatch(title):
+            classes = [value for value in figure.get('class', []) if value != 'source-table']
+            figure['class'] = list(dict.fromkeys([*classes, 'source-picture']))
+        else:
+            label = caption.extract() if caption else None
+            if label:
+                label.name = 'p'
+            figure.replace_with(table_review_notice(soup, caption=label,
+                page=figure.get('data-pdf-page'), ref=figure.get('data-pdf-table-ref')))
+        changed += 1
+    return changed
+
+
+def editable_table_partial(fragment, manifest, api):
+    """Keep an intact grid on error and leave gaps visible in unread cells."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(fragment, 'html.parser')
+    if soup.table is None or api.table_profile(str(soup.table))['issues']:
+        return None
+    known = {entry['source_sha256'] for entry in manifest.get('typed_table_picture_assets', [])}
+    for image in soup.table.find_all('img'):
+        digest = hashlib.sha256(image.get('src', '').encode()).hexdigest()
+        if image.get('data-table-content') != 'picture' or digest not in known:
+            image.replace_with('[Фрагмент ячейки не распознан]')
+    return str(soup.table) if soup.table.get_text(strip=True) or soup.table.find(['img', 'math']) else None

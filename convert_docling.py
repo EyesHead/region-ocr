@@ -2184,8 +2184,8 @@ def local_surya_backend(model):
                 for item, output in zip(items, outputs):
                     at_limit = (getattr(output, 'finish_reason', None) == 'length'
                                 or item.max_tokens and output.token_count >= item.max_tokens)
-                    reason = ('output_token_limit' if at_limit
-                              else 'repeating_output' if _detect_repeat_loop(output.raw) else None)
+                    reason = ('repeating_output' if _detect_repeat_loop(output.raw)
+                              else 'output_token_limit' if at_limit else None)
                     if reason:
                         output.error = True
                         diagnostic_event('OCR_RESPONSE_REQUIRES_RECOVERY', reason=reason,
@@ -5162,9 +5162,12 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
     a small, unretained drawing in a table does not establish duplication.
     """
     from docling_core.types.doc import ContentLayer, DocItemLabel
+    from docling_pdf_table_rasters import aligned_table_layout_crop
 
     table_items = {item.self_ref:item for item in doc.tables}
     table_entries = {entry['ref']: entry for entry in manifest['tables']}
+    illustrations = set(manifest.get('source_illustration_picture_refs', []))
+    illustrations.update(entry['ref'] for entry in manifest.get('captioned_figures', []))
 
     def caption_identity(text):
         caption=extract_table_caption(text)
@@ -5193,9 +5196,10 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
             by_page.setdefault(entry["page"], []).append((entry["ref"], obj["bbox"], "verified_cell_object"))
         if entry["method"] in {"pdf_geometry", "raster_geometry"} and geometry.get("glyph_coverage") == 1.0:
             by_page.setdefault(entry["page"], []).append((entry["ref"], geometry["bbox"], "verified_structured_table"))
-        if entry["method"] in {"source_image", "source_image_review"}:
-            source_bbox = entry.get("actual_source_image_bbox") or entry.get("source_render_bbox") or entry["bbox"]
-            by_page.setdefault(entry["page"], []).append((entry["ref"], source_bbox, "whole_table_crop"))
+        if geometry.get('source_grid_verified') or geometry.get('positioned_source_grid_verified'):
+            for bounds in (geometry.get('bbox'), entry.get('source_render_bbox')):
+                if bounds:
+                    by_page.setdefault(entry['page'], []).append((entry['ref'], bounds, 'verified_layout_table'))
         diagnostic_event("PICTURE_DUPLICATE_TABLE", ref=entry["ref"], page=entry["page"],
                          method=entry["method"], bbox=entry.get("bbox"),
                          geometry_bbox=geometry.get("bbox"), glyph_coverage=geometry.get("glyph_coverage"),
@@ -5209,10 +5213,10 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
         caption_refs={ref.cref for ref in picture.captions}
         captions=[ref.resolve(doc) for ref in picture.captions]
         independent=[ref.cref for ref in picture.children if ref.cref not in caption_refs and ref.cref not in excluded]
-        if (picture.self_ref in picture_routes or not picture.prov or independent
+        if (picture.self_ref in picture_routes or picture.self_ref in illustrations or not picture.prov
                 or any(not caption_identity(caption.text) or caption.children for caption in captions)):
             reason = ("already_routed" if picture.self_ref in picture_routes else "missing_provenance" if not picture.prov
-                      else "independent_picture_children" if independent else "non_table_caption")
+                      else "source_illustration" if picture.self_ref in illustrations else "non_table_caption")
             diagnostic_event("PICTURE_DUPLICATE_SKIP", picture=picture.self_ref, reason=reason,
                              pages=[prov.page_no for prov in (picture.prov or [])][:16],
                              caption_refs=[str(getattr(caption, "cref", ""))[:160] for caption in (picture.captions or [])][:16],
@@ -5237,7 +5241,7 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
             for table_ref, source, basis in candidates:
                 intersection = max(0, min(box[2], source[2]) - max(box[0], source[0])) * max(0, min(box[3], source[3]) - max(box[1], source[1]))
                 source_area = max(0, source[2] - source[0]) * max(0, source[3] - source[1])
-                whole = basis in {"whole_table_crop", "verified_structured_table"}
+                whole = basis in {"verified_layout_table", "verified_structured_table"}
                 coverage = intersection / (area if whole else max(area, source_area))
                 source_coverage=intersection/source_area if source_area else 0
                 margins=[float(source[0]-box[0]),float(source[1]-box[1]),float(box[2]-source[2]),float(box[3]-source[3])]
@@ -5245,9 +5249,10 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
                 if basis=='verified_structured_table':
                     matched=coincident
                     policy='matching_whole_table_edges_and_areas'
-                elif basis=='whole_table_crop':
-                    matched=coverage>=.99 or coincident
-                    policy='retained_whole_source_crop'
+                elif basis=='verified_layout_table':
+                    matched=aligned_table_layout_crop(box, source,
+                        table_caption=bool(captions and caption_compatible(captions,table_ref)))
+                    policy='confirmed_table_layout_crop'
                 else:
                     matched=coverage>=.85
                     policy='retained_cell_object'
@@ -5257,8 +5262,9 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
                                                           sys.modules[__name__]):
                             matched = True
                             policy = 'published_source_cell_contains_layout_crop'
-                captions_ok=not captions or (coincident and caption_compatible(captions,table_ref))
-                matched=matched and captions_ok
+                captions_ok=not captions or ((coincident or basis=='verified_layout_table')
+                    and caption_compatible(captions,table_ref))
+                matched=matched and captions_ok and (whole or not independent)
                 diagnostic_event("PICTURE_DUPLICATE_PAIR", picture=picture.self_ref, table=table_ref,
                                  page=prov.page_no, bbox=box, source_bbox=source, basis=basis,
                                  picture_area=area, source_area=source_area, intersection=intersection,
@@ -5280,6 +5286,20 @@ def suppress_table_picture_duplicates(doc, manifest, picture_routes, excluded):
                                  candidate_count=len(candidates))
                 break
         if len(matches) == len(picture.prov):
+            if independent:
+                if not picture.parent:
+                    continue
+                parent = picture.parent.resolve(doc)
+                offset = next((i for i, ref in enumerate(parent.children) if ref.cref == picture.self_ref), None)
+                if offset is None:
+                    continue
+                children = [ref for ref in picture.children if ref.cref in independent]
+                for ref in children:
+                    ref.resolve(doc).parent = parent.get_ref()
+                parent.children[offset:offset] = children
+                picture.children = [ref for ref in picture.children if ref.cref not in independent]
+                diagnostic_event('TABLE_LAYOUT_PICTURE_CHILDREN_REPARENTED', picture=picture.self_ref,
+                    child_refs=independent)
             if captions:
                 targets={match['table'] for match in matches}
                 if len(targets)!=1:
@@ -5882,6 +5902,8 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                 for row in list(soup.table.find_all("tr")):
                     if row.find_parent("thead") is None:
                         target.append(row.extract())
+                if soup.table.get('data-source-logical-rows') == 'true':
+                    old_soup.table['data-source-logical-rows'] = 'true'
                 normalize_joined_table_body(old_soup.table)
                 combined = str(old_soup.table)
                 profile = table_profile(combined, old_profile["columns"])
@@ -6551,8 +6573,21 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
             continue
         diagnostic_event('SCAN_RECOVERY_PAGE_BEGIN', page_no=page_no, char_count=len(page.chars), image_count=len(page.images))
         region_count = 0
-        for geometry in regions.scan_tables(page_no):
-            region_count += 1
+        candidates = [(geometry, None) for geometry in regions.scan_tables(page_no)]
+        for picture in doc.pictures:
+            if picture.self_ref in excluded or picture.children or picture.captions:
+                continue
+            picture_region = item_region(picture, doc)
+            if not picture_region or picture_region[0] != page_no:
+                continue
+            box = picture_region[1]
+            if (box[2]-box[0] < page.width*.25 or box[3]-box[1] < page.height*.05
+                    or any(overlap_ratio(g['bbox'], box) > .65 for g, _ in candidates)
+                    or any(item.self_ref not in excluded and (reg := item_region(item,doc))
+                           and reg[0] == page_no and overlap_ratio(reg[1], box) > .65 for item in doc.tables)):
+                continue
+            candidates.append((dict(bbox=box, basis='layout_picture_with_positioned_table_caption'), picture))
+        for geometry, picture in candidates:
             box = geometry['bbox']
             from docling_pdf_forms import form_owns_region
             if form_owns_region(manifest, page_no, box):
@@ -6564,6 +6599,12 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
             above = [c for c in page.chars if box[0]-6 <= (c['x0']+c['x1'])/2 <= box[2]+6
                      and box[1]-64 <= (c['top']+c['bottom'])/2 < box[1]]
             caption_line = next((line for line in reversed(native_cell_lines(above)) if extract_table_caption(line['text'])),None)
+            if picture is not None:
+                caption = extract_table_caption(caption_line['text']) if caption_line else None
+                if (not caption or not furniture_key(caption_line['text']).startswith(furniture_key(caption))
+                        or not 0 < box[1]-caption_line['y'] <= max(14, 2*caption_line['size'])):
+                    continue
+            region_count += 1
             if not matched and caption_line is None:
                 diagnostic_event('SCAN_RECOVERY_REGION_SKIP', page_no=page_no, bbox=box,
                                  reason='no_existing_table_or_caption', matched_count=len(matched), caption_found=False)
@@ -6577,18 +6618,33 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
             from docling_pdf_scan_recovery import read_source_scan_grid
             source_grid = read_source_scan_grid(reader, regions, page_no, box, refs,
                                                 sys.modules[__name__])
+            if source_grid is None and picture is not None:
+                # Leave room for outer vertical rails and trim only the
+                # layout padding at the foot before testing actual rules.
+                padded = [box[0]-3, box[1], box[2]+3, box[3]-1]
+                source_grid = read_source_scan_grid(reader, regions, page_no, padded, refs,
+                                                    sys.modules[__name__])
             native = source_grid['native'] if source_grid else None
             if source_grid:
                 source_grid['image'].close()
             if not native:
                 diagnostic_event('SCAN_RECOVERY_REGION_SKIP', page_no=page_no, bbox=box, reason='raster_reader_returned_no_table')
                 continue
+            if picture is not None:
+                from docling_pdf_table_rasters import aligned_table_layout_crop
+                if (not native[1].get('source_grid_verified')
+                        or not aligned_table_layout_crop(box, native[1]['bbox'])):
+                    continue
             # The render includes a rule-width margin; source ownership stays
             # attached to the actual measured table, not that helper margin.
             box = list(native[1].get('bbox', box))
             if page_no not in doc.pages:
                 doc.add_page(page_no=page_no,size=Size(width=page.width,height=page.height))
             item = matched[0] if matched else insert_source_item(doc,page_no,box,'table')
+            if picture is not None:
+                excluded.add(picture.self_ref)
+                diagnostic_event('SCAN_TABLE_RECOVERED_FROM_LAYOUT_PICTURE',
+                    page_no=page_no, ref=item.self_ref, picture=picture.self_ref, bbox=box)
             item.prov[0].bbox = BoundingBox(l=box[0],t=box[1],r=box[2],b=box[3],origin=CoordOrigin.TOPLEFT)
             for duplicate in matched[1:]:
                 routes[duplicate.self_ref]='';excluded.add(duplicate.self_ref)
@@ -6707,6 +6763,56 @@ def _borderless_source_lines(reader, cell, page, api):
     lines = cell.get('lines') or cell.get('ocr_lines') or []
     return sorted((dict(line) for line in lines if line.get('text', '').strip()
                    and line.get('y') is not None and line.get('size', 0) > 0), key=lambda l: l['y'])
+
+def _borderless_scan_lines(reader, regions, page, cells, fragments, api):
+    """Locate existing OCR fragments using glyph positions supported by visible ink."""
+    from bs4 import BeautifulSoup
+    from docling_pdf_text_cells import positioned_text_proof
+    import numpy as np
+
+    if reader is None or regions is None or not all(c.get('source_text_unreliable') and c.get('bbox') for c in cells):
+        return None
+    count = len(fragments[0])
+    if count < BORDERLESS_MIN_VALUE_ROWS or any(len(parts) != count for parts in fragments):
+        return None
+
+    region = [min(c['bbox'][0] for c in cells), min(c['bbox'][1] for c in cells),
+              max(c['bbox'][2] for c in cells), max(c['bbox'][3] for c in cells)]
+    lines, glyph_columns = [], []
+    reader.load_page(page)
+    for cell, parts in zip(cells, fragments, strict=True):
+        left, top, right, bottom = cell['bbox']
+        glyphs = [g for g in reader.chars if left < (g['x0'] + g['x1']) / 2 < right
+                  and top < (g['top'] + g['bottom']) / 2 < bottom]
+        source = [line for line in api.native_cell_lines(glyphs) if line['text'].strip()]
+        keys = [_borderless_key(BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+                for part in parts]
+        if [_borderless_key(line['text']) for line in source] != keys:
+            return None
+        lines.append(source)
+        glyph_columns.append(glyphs)
+
+    if not any(len({line['text'] for line in column}) == count
+               and all(_borderless_atomic(line['text']) for line in column) for column in lines):
+        return None
+    if any(max(line['y'] for line in group) - min(line['y'] for line in group)
+           > min(line['size'] for line in group) * BORDERLESS_Y_TOLERANCE_EM
+           for group in zip(*lines, strict=True)):
+        return None
+
+    with regions.crop(page, region) as image, image.convert('L') as gray:
+        mask = (np.asarray(gray) < 180).astype('uint8') * 255
+        sx = image.width / (region[2] - region[0])
+        sy = image.height / (region[3] - region[1])
+    proofs = []
+    for cell, parts, glyphs in zip(cells, fragments, glyph_columns, strict=True):
+        proof = positioned_text_proof('<br/>'.join(parts), glyphs, mask, region, cell['bbox'], sx, sy)
+        if proof is None:
+            return None
+        proofs.append(dict(column=cell['column'], method='visible_scan_ink_and_exact_aligned_ocr_lines',
+                           ink_coverage=proof['ink_coverage'], glyph_ink_support=proof['glyph_ink_support']))
+    return lines, proofs
+
 
 def _borderless_interior_rules(reader, regions, page, box, size, rails=()):
     rules = []
@@ -7059,8 +7165,13 @@ def repair_borderless_table_routes(doc, routes, manifest, reader, regions, api):
                 band = sorted(band, key=lambda c: c['column'])
                 if len(band) != len(cells) or [c['column'] for c in band] != [c['column'] for c in specs]:
                     continue
-                lines = [_borderless_source_lines(reader, c, page, api) for c in band]
-                alignment_proofs = []
+                scan = (_borderless_scan_lines(reader, regions, page, band, fragments, api)
+                        if geometry.get('basis') == 'raster_cell_rules' else None)
+                if scan is None:
+                    lines = [_borderless_source_lines(reader, c, page, api) for c in band]
+                    alignment_proofs = []
+                else:
+                    lines, alignment_proofs = scan
                 if any(len(values) != len(parts) for values, parts in zip(lines, fragments)):
                     aligned = _borderless_align_dom_lines(lines, fragments, band,
                         geometry.get('retained_cell_images', []))
@@ -8201,6 +8312,124 @@ thead{display:table-header-group}tr{break-inside:avoid}.source-table img{max-wid
 """
 
 
+def split_formula_source_crop(regions, page_no, left_box, right_box, notation):
+    """Prove that a recognized formula and an empty layout box own one equation."""
+    from bs4 import BeautifulSoup
+    from docling.utils.locks import pypdfium2_lock
+    from pypdfium2 import raw
+    from docling_pdf_native_system import _painted_text_objects
+
+    height = right_box[3] - right_box[1]
+    gap = right_box[0] - left_box[2]
+    vertical_overlap = min(left_box[3], right_box[3]) - max(left_box[1], right_box[1])
+    if not (height > 0 and 0 <= gap <= 1.5 * height and vertical_overlap >= .85 * height):
+        return None
+    if '<math' in notation:
+        math_node = BeautifulSoup(notation, 'html.parser').find('math')
+        notation = (math_node.get('data-latex') or math_node.get_text()) if math_node else ''
+    root = BeautifulSoup(latex_math(notation) or '', 'html.parser').find('mrow')
+    parts = root.find_all(True, recursive=False) if root else []
+    if len(parts) < 2 or parts[0].name not in {'munder', 'mover', 'msub', 'msup'}:
+        return None
+    operator = parts[0].find('mo')
+    if operator is None or operator.get_text() not in {'∑', '∏', '∫'}:
+        return None
+
+    def key(text):
+        return ''.join(unicodedata.normalize('NFKC', text).split()).replace('⋅', '·')
+
+    def glyph_bounds(boxes):
+        return [min(b[0] for b in boxes)-.35, min(b[1] for b in boxes)-.35,
+                max(b[2] for b in boxes)+.35, max(b[3] for b in boxes)+.35]
+
+    expected = [key(parts[0].get_text()), key(''.join(node.get_text() for node in parts[1:]))]
+    if len(expected[1]) < 6:
+        return None
+    with pypdfium2_lock:
+        page = regions.pdf[page_no - 1]
+        try:
+            if page.get_rotation():
+                return None
+            page_height = page.get_height()
+            text = page.get_textpage()
+            try:
+                members = [[], []]
+                other = []
+                for index in range(text.count_chars()):
+                    code = raw.FPDFText_GetUnicode(text, index)
+                    if not 0 < code <= 0x10ffff or chr(code).isspace() or raw.FPDFText_IsGenerated(text, index) != 0:
+                        continue
+                    x0, low, x1, high = text.get_charbox(index)
+                    if x1 <= x0 or high <= low:
+                        continue
+                    glyph = (x0, page_height-high, x1, page_height-low)
+                    x = (glyph[0] + glyph[2]) / 2
+                    y = (glyph[1] + glyph[3]) / 2
+                    owner = next((side for side, box in enumerate((left_box, right_box))
+                                  if box[0] <= x <= box[2] and box[1] <= y <= box[3]), None)
+                    (other if owner is None else members[owner]).append(glyph)
+                if not all(members):
+                    return None
+                for boxes, expected_text in zip(members, expected, strict=True):
+                    x0, top, x1, bottom = glyph_bounds(boxes)
+                    if key(text.get_text_bounded(x0, page_height-bottom, x1, page_height-top)) != expected_text:
+                        return None
+                bbox = glyph_bounds(members[0] + members[1])
+                if any(max(g[0], bbox[0]) < min(g[2], bbox[2])
+                       and max(g[1], bbox[1]) < min(g[3], bbox[3]) for g in other):
+                    return None
+            finally:
+                text.close()
+        finally:
+            page.close()
+    return bbox if _painted_text_objects(regions, page_no, bbox) else None
+
+
+def retain_split_formula_sources(doc, regions, orientation, excluded, other_routes, manifest):
+    from bs4 import BeautifulSoup
+    from docling_core.types.doc import DocItemLabel
+
+    routes = {}
+    for left, right in zip(doc.texts, doc.texts[1:]):
+        refs = [left.self_ref, right.self_ref]
+        if (left.label != DocItemLabel.FORMULA or right.label != DocItemLabel.FORMULA
+                or left.children or right.children or not left.parent or left.parent != right.parent
+                or any(ref in excluded or any(ref in route for route in other_routes) for ref in refs)):
+            continue
+        notation = (left.text or '').strip() or (left.orig or '').strip()
+        if not notation or (right.text or '').strip() or (right.orig or '').strip():
+            continue
+        siblings = [child.cref for child in left.parent.resolve(doc).children]
+        if refs[0] not in siblings:
+            continue
+        first = siblings.index(refs[0])
+        if siblings[first:first+2] != refs:
+            continue
+        left_region, right_region = item_region(left, doc), item_region(right, doc)
+        if not left_region or not right_region or left_region[0] != right_region[0]:
+            continue
+        page = left_region[0]
+        box = split_formula_source_crop(regions, page, left_region[1], right_region[1], notation)
+        if box is None:
+            continue
+        with regions.crop(page, box, scale=4.2) as image:
+            fragment = BeautifulSoup(image_html(image, box[2]-box[0], 'formula'), 'html.parser')
+        fragment.figure['data-source-ref'] = refs[0]
+        fragment.figure['data-source-formula-review'] = 'true'
+        fragment.figure['data-pdf-page'] = str(page)
+        fragment.img['alt'] = f'Формула из исходного PDF, страница {page}'
+        routes[refs[0]] = str(fragment)
+        excluded.add(refs[1])
+        proof = dict(ref=refs[0], source_refs=refs, page=page, bbox=box,
+                     source_bbox=source_bbox(box, orientation[page]), method='source_image')
+        manifest['formulas'].append(proof)
+        review = dict(proof, reason='split_formula_source_image',
+                      message='Формула сохранена изображением исходника. Требуется сверка записи.')
+        manifest.setdefault('formula_source_reviews', []).append(review)
+        diagnostic_event('FORMULA_SOURCE_CROP_RETAINED', **review)
+    return routes
+
+
 def export_local_html(args, result, normalized, orientation, source):
     from bs4 import BeautifulSoup
     from docling_core.transforms.serializer.html import HTMLDocSerializer, HTMLParams, HTMLTableSerializer, HTMLTextSerializer, HTMLPictureSerializer
@@ -8237,6 +8466,11 @@ def export_local_html(args, result, normalized, orientation, source):
                 "captioned_figures_enabled": getattr(args, 'pdf_captioned_figures', True),
                 "restored_mixed_math_text": [], "primary_ocr_only": args.primary_ocr_only,
                 "formula_reader": "surya", "content_source": "primary_surya"}
+    page_routes = getattr(args, 'page_ocr_routes', {})
+    if page_routes:
+        manifest['page_ocr_routes'] = page_routes
+        recognizers = {route['engine'] for route in page_routes.values()}
+        manifest['content_source'] = 'primary_' + (next(iter(recognizers)) if len(recognizers) == 1 else 'mixed')
     args.pdf_quality_current = manifest
     args.typed_cell_ocr_reviews = []
     records = getattr(args, "surya_records", [])
@@ -8723,6 +8957,9 @@ def export_local_html(args, result, normalized, orientation, source):
                     chosen, join_geometry, source_cell_fallback = None, None, True
                 else:
                     chosen = (chosen[0],method,content,profile)
+            recover_region = False
+            typed_region = bbox
+            recovery_issue = None
             if chosen and not chosen[3]["issues"]:
                 method, content, profile = chosen[1:]
                 if method in {"pdf_geometry", "raster_geometry"}:
@@ -8829,30 +9066,29 @@ def export_local_html(args, result, normalized, orientation, source):
                     manifest.setdefault('primary_text_regions', []).append(text_proof)
                     diagnostic_event('PRIMARY_TEXT_REGION_RESTORED', **text_proof)
                 else:
-                    method = "source_image"
-                    actual_source_image_bbox = list(bbox)
+                    method = 'typed_source_region'
+                    recover_region = True
+                    recovery_issue = (primary_region_guard['reason'] if primary_region_guard else
+                        'source_cell_ownership_not_proven' if source_cell_fallback else 'no_valid_table_candidate')
+                    content = ''
                     if getattr(args, 'pdf_source_image_bounds', True) and not primary_region_guard:
                         if native_reader is None:
                             try:
                                 native_reader = NativeTableReader(normalized)
                             except (OSError, ValueError, RuntimeError):
                                 pass
-                        image, actual_source_image_bbox = _source_image_bounds_crop(image, bbox,
+                        image, typed_region = _source_image_bounds_crop(image, bbox,
                             page_no, item.self_ref, doc, native_reader, regions, manifest)
-                    content = image_html(image, actual_source_image_bbox[2] - actual_source_image_bbox[0], "table")
-                    profile = chosen[3] if chosen else {"issues": [primary_region_guard['reason'] if primary_region_guard else
-                                                           'source_cell_ownership_not_proven' if source_cell_fallback else 'no_candidate'],
-                                                       "columns": 0, "rows": 0, "text": ""}
+                    profile = chosen[3] if chosen else dict(issues=[recovery_issue], columns=0, rows=0, text='')
                     # Never persist rejected cell contents as the repaired table data.
                     item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
-                    diagnostic_event('TABLE_SOURCE_IMAGE_FALLBACK', page_no=page_no, ref=item.self_ref, bbox=bbox,
+                    diagnostic_event('TABLE_REGION_OCR_REQUESTED', page_no=page_no, ref=item.self_ref, bbox=typed_region,
                                      selected_method=chosen[1] if chosen else None, issues=profile.get('issues',[]),
                                      numeric_conflict=conflict, retry_stop_reason=retry_stop_reason,
                                      attempted_reads=len(candidates), crop_width=image.width, crop_height=image.height)
             from docling_pdf_table_content import (normalize_table_content, TableContentError,
                                                     primary_table_fallback)
-            typed_region = actual_source_image_bbox if method == 'source_image' else bbox
-            if (args.primary_ocr_only and native and pdf_repair_enabled(args, 'subrows')):
+            if (content and args.primary_ocr_only and native and pdf_repair_enabled(args, 'subrows')):
                 from docling_pdf_primary_rows import source_primary_subrows
                 restored_subrows = source_primary_subrows(content, native[1], records, page_no,
                     native_reader, sys.modules[__name__])
@@ -8863,26 +9099,42 @@ def export_local_html(args, result, normalized, orientation, source):
                     manifest.setdefault('primary_source_logical_rows', []).append(subrow_proof)
                     diagnostic_event('PRIMARY_SOURCE_LOGICAL_ROWS_RESTORED', **subrow_proof)
             try:
-                content = normalize_table_content(content, native[1] if native else None,
-                    image, typed_region, page_no, args, manifest, sys.modules[__name__],
-                    ref=item.self_ref, source_reader=native_reader)
+                preferred_primary = None
+                if (content and native and args.primary_ocr_only and not recover_region
+                        and not source_graphics and not drawing_frame_proof and not conflict
+                        and pdf_repair_enabled(args, 'subrows')):
+                    from docling_pdf_semantic_rows import expand_partitioned_graphic_rows
+                    preview = dict(ref=item.self_ref, page=page_no, pdf_geometry=native[1], html=content)
+                    preferred_primary = expand_partitioned_graphic_rows(doc, routes, manifest, regions,
+                        native_reader, table_records, sys.modules[__name__], preview=preview)
+                if preferred_primary is None:
+                    content = normalize_table_content(content, native[1] if native else None,
+                        image, typed_region, page_no, args, manifest, sys.modules[__name__],
+                        ref=item.self_ref, source_reader=native_reader, recover_region=recover_region)
+                else:
+                    from docling_pdf_table_content import _source_graphic_context
+                    _source_graphic_context(content, table_profile(content), native[1], page_no,
+                        item.self_ref, manifest)
+                    content, proof, assets = preferred_primary
+                    method = 'primary_source_verified'
+                    manifest.setdefault('typed_table_picture_assets', []).extend(assets)
+                    manifest.setdefault('partitioned_graphic_row_repairs', []).append(proof)
+                    manifest.setdefault('primary_table_priority', []).append(proof)
+                    diagnostic_event('PRIMARY_TABLE_PRIORITY', **proof)
             except TableContentError as error:
+                from docling_pdf_table_rasters import editable_table_partial
+                selected = editable_table_partial(content, manifest, sys.modules[__name__])
                 fallback = primary_table_fallback(records, page_no, typed_region, sys.modules[__name__],
                     current=content, geometry=native[1] if native else None)
-                if fallback:
-                    content, proof = fallback
-                    if proof.get('basis') == 'visible_source_authority_retained':
-                        method = 'source_text_review'
-                        message = 'Сохранён исходный текст таблицы; сборка отдельных ячеек не завершена.'
-                    else:
-                        method = 'primary_surya_review'
-                        message = 'Сохранён полный первичный OCR таблицы; сборка отдельных ячеек не завершена.'
-                else:
-                    content = image_html(image, typed_region[2]-typed_region[0], 'table')
-                    actual_source_image_bbox = list(typed_region)
-                    proof = dict(source_bbox=list(typed_region))
-                    method = 'source_image_review'
-                    message = 'Таблицу не удалось полностью распознать; сохранено её исходное изображение.'
+                proof = dict(source_bbox=list(typed_region))
+                if fallback and (selected is None or fallback[1].get('basis') == 'visible_source_authority_retained'):
+                    retained = editable_table_partial(fallback[0], manifest, sys.modules[__name__])
+                    if retained:
+                        selected, proof = retained, fallback[1]
+                content = selected or ''
+                method = 'editable_table_review' if selected else 'unrecognized_table'
+                message = f'Не удалось полностью распознать таблицу на странице PDF {page_no}.'
+                recovery_issue = str(error)
                 # A rejected assembly no longer owns external primary packets.
                 # Keep those original items available instead of deleting them
                 # using proofs belonging to the abandoned candidate.
@@ -8894,8 +9146,15 @@ def export_local_html(args, result, normalized, orientation, source):
                 warning = dict(page=page_no, ref=item.self_ref, reason=str(error), message=message, **proof)
                 manifest.setdefault('table_assembly_reviews', []).append(warning)
                 diagnostic_event('TABLE_ASSEMBLY_PRIMARY_RETAINED', **warning)
-            if method == 'source_image':
-                method = 'typed_source_region'
+            if recover_region and '<table' not in content.lower() and method == 'typed_source_region':
+                method = 'unrecognized_table'
+                manifest.setdefault('table_assembly_reviews', []).append(dict(page=page_no,
+                    ref=item.self_ref, reason=recovery_issue, source_bbox=list(typed_region),
+                    message=f'Не удалось восстановить ячейки таблицы на странице PDF {page_no}.'))
+            if args.primary_ocr_only and native and pdf_repair_enabled(args, 'subrows'):
+                from docling_pdf_illustrated_rows import split_illustrated_table_rows
+                content = split_illustrated_table_rows(content, native[1], image, typed_region, page_no,
+                    item.self_ref, manifest, sys.modules[__name__], source_reader=native_reader)
             if '<table' in content.lower():
                 profile = table_profile(content, expected)
                 item.data = TableData(num_rows=profile['rows'], num_cols=profile['columns'], table_cells=[
@@ -8904,7 +9163,8 @@ def export_local_html(args, result, normalized, orientation, source):
                         start_col_offset_idx=c['column'], end_col_offset_idx=c['column']+c['column_span'],
                         column_header=c['header']) for c in profile['cells']])
             else:
-                profile = dict(issues=[], columns=0, rows=0, text=semantic_ocr_text(content))
+                profile = dict(issues=[recovery_issue] if method == 'unrecognized_table' else [],
+                    columns=0, rows=0, text=semantic_ocr_text(content))
                 item.data = TableData(num_rows=0, num_cols=0, table_cells=[])
             diagnostic_event('TABLE_CHOSEN', phase='final', page_no=page_no, ref=item.self_ref, method=method,
                              rows=profile.get('rows'), columns=profile.get('columns'), score=profile.get('score'),
@@ -8925,7 +9185,6 @@ def export_local_html(args, result, normalized, orientation, source):
             manifest["tables"].append({"ref": item.self_ref, "page": page_no, "bbox": table_source_bounds,
                 "source_bbox": source_bbox(table_source_bounds, orientation[page_no]),
                 "source_render_bbox": list(bbox),
-                "actual_source_image_bbox": actual_source_image_bbox if method in {'source_image', 'source_image_review'} else None,
                 "method": method, "raster_columns": raster_expected, "selected": profile,
                 "numeric_disagreement": conflict,
                 "regional_attempts": attempt_log,
@@ -8935,8 +9194,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 "retained_ocr_cell_graphics": retained_graphics,
                 "page_scan_backgrounds": len(page_scans),
                 "join_geometry": join_geometry,
-                "fallback_reason": (profile.get("issues", []) + (["numeric_disagreement"] if conflict else [])) if method == "source_image" else [],
-                "html": content if method != "source_image" else None,
+                "fallback_reason": [recovery_issue] if method in {'editable_table_review','unrecognized_table'} else [],
+                "html": content,
                 "candidates": [{"method": candidate[1], **candidate[3]} for candidate in candidates]})
             print(f"Table: page {page_no}; {method}; columns {profile.get('columns')}; "
                   f"issues {profile.get('issues', [])}; numeric disagreement {conflict}", flush=True)
@@ -8944,9 +9203,6 @@ def export_local_html(args, result, normalized, orientation, source):
                 print(f"Table grid repaired: page {page_no}; {len(profile['span_repairs'])} operations; cell contents retained", flush=True)
             if retained_graphics:
                 print(f"Source graphics retained in OCR cells: page {page_no}; {len(retained_graphics)} fragments", flush=True)
-            if method == "source_image" and profile.get("numeric_outliers"):
-                print(f"Rejected numeric cells: page {page_no}; "
-                      f"{json.dumps(profile['numeric_outliers'], ensure_ascii=False)}", flush=True)
 
         from docling_pdf_table_content import exclude_typed_primary_copies
         exclude_typed_primary_copies(doc, routes, excluded, manifest, sys.modules[__name__])
@@ -9072,6 +9328,10 @@ def export_local_html(args, result, normalized, orientation, source):
         if (args.primary_ocr_only and getattr(args, 'pdf_borderless_rows', True)
                 and pdf_repair_enabled(args, 'subrows')):
             repair_borderless_table_routes(doc,routes,manifest,native_reader,regions,sys.modules[__name__])
+        if args.primary_ocr_only and pdf_repair_enabled(args, 'subrows'):
+            from docling_pdf_semantic_rows import expand_partitioned_graphic_rows
+            expand_partitioned_graphic_rows(doc, routes, manifest, regions, native_reader, records,
+                                            sys.modules[__name__])
         if (args.primary_ocr_only and getattr(args, 'pdf_duplicate_primary_tables', True)
                 and pdf_repair_enabled(args, 'boundaries')):
             table_owned_refs = {item.self_ref: {role: [getattr(ref, 'cref', None) or str(ref)
@@ -9116,6 +9376,22 @@ def export_local_html(args, result, normalized, orientation, source):
             reconcile_captioned_figures(doc, captioned_figures, captioned_figure_routes, routes, picture_routes,
                                        excluded, manifest, regions, sys.modules[__name__])
 
+        from docling_pdf_table_rasters import table_review_notice, remove_published_table_rasters
+        table_issues_by_ref = {}
+        table_entries_by_ref = {entry['ref']: entry for entry in manifest['tables']}
+        warned_fragments = set()
+        for warning in manifest.get('table_assembly_reviews', []):
+            ref = warning['ref']
+            key = (warning['page'], ref)
+            if key in warned_fragments:
+                continue
+            warned_fragments.add(key)
+            seen = set()
+            while table_entries_by_ref.get(ref, {}).get('joined_into') and ref not in seen:
+                seen.add(ref)
+                ref = table_entries_by_ref[ref]['joined_into']
+            table_issues_by_ref.setdefault(ref, []).append(warning)
+
         class RoutedTables(HTMLTableSerializer):
             def serialize(self, *, item, doc_serializer, doc, **kwargs):
                 if item.self_ref in captioned_figures:
@@ -9133,7 +9409,8 @@ def export_local_html(args, result, normalized, orientation, source):
                         excluded, manifest, sys.modules[__name__], kwargs)
                     return create_ser_result(text=fragment,span_source=item)
                 fragment = routes[item.self_ref]
-                if not fragment:
+                attached_issues = table_issues_by_ref.get(item.self_ref, [])
+                if not fragment and not attached_issues:
                     diagnostic_event("TABLE_SERIALIZE", ref=item.self_ref, route="empty",
                                      pages=[prov.page_no for prov in (item.prov or [])][:16], excluded=item.self_ref in excluded)
                     return create_ser_result(text="", span_source=item)
@@ -9144,11 +9421,14 @@ def export_local_html(args, result, normalized, orientation, source):
                 if caption and parsed.table and not parsed.table.caption:
                     parsed.table.insert(0, BeautifulSoup(caption, "html.parser"))
                 elif caption and not parsed.table:
-                    fragment = caption + fragment
-                if parsed.table:
-                    fragment = str(parsed)
+                    caption_label = BeautifulSoup(caption, "html.parser").find('caption')
+                    if caption_label is not None:
+                        caption_label.name = 'p'
+                        parsed.insert(0, caption_label)
                 route = "routed_table" if parsed.table else "routed_fragment"
-                fragment = append_owned_footnotes(fragment, item, doc, doc_serializer,
+                for warning in attached_issues:
+                    parsed.append(table_review_notice(parsed, page=warning['page'], ref=warning['ref']))
+                fragment = append_owned_footnotes(str(parsed), item, doc, doc_serializer,
                     excluded, manifest, sys.modules[__name__], kwargs)
                 diagnostic_event("TABLE_SERIALIZE", ref=item.self_ref, route=route,
                                  pages=[prov.page_no for prov in (item.prov or [])][:16], excluded=item.self_ref in excluded,
@@ -9157,6 +9437,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 return create_ser_result(text=fragment, span_source=item)
 
         from docling_pdf_annotations import annotation_context, mark_source_text, normalize_semantic_annotations
+        split_formula_routes = retain_split_formula_sources(doc, regions, orientation, excluded,
+            (recovered_page_routes, note_routes), manifest)
         semantic_context = annotation_context(doc, excluded, manifest)
 
         class SourceFormulas(HTMLTextSerializer):
@@ -9172,6 +9454,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 if item.self_ref in excluded:
                     diagnostic_event('TEXT_SERIALIZE_SKIP',ref=item.self_ref,reason='excluded')
                     return create_ser_result(text="", span_source=item)
+                if item.self_ref in split_formula_routes:
+                    return create_ser_result(text=split_formula_routes[item.self_ref], span_source=item)
                 if item.self_ref in recovered_page_routes:
                     return create_ser_result(text=recovered_page_routes[item.self_ref], span_source=item)
                 if item.self_ref in note_routes:
@@ -9307,8 +9591,7 @@ def export_local_html(args, result, normalized, orientation, source):
             if table_profile(str(table))["columns"] >= 7:
                 container["class"] = "table-scroll wide"
             table.wrap(container)
-        for figure in soup.select("figure.source-table"):
-            figure.wrap(soup.new_tag("div", attrs={"class": "table-scroll wide"}))
+        remove_published_table_rasters(soup)
         for bad in soup.select(".formula-not-decoded"):
             raise RuntimeError("Formula placeholder blocked before HTML publication")
         from docling_pdf_table_content import validate_published_table_images
@@ -9332,6 +9615,8 @@ def export_local_html(args, result, normalized, orientation, source):
         from docling_pdf_review import annotate_primary_reviews
         annotate_primary_reviews(soup,manifest,sys.modules[__name__])
         manifest["regional_requests"] = retries
+        if getattr(args, 'grid_cell_line_ocr', None):
+            manifest.setdefault('grid_table_ocr', {})['line_batches'] = args.grid_cell_line_ocr
         diagnostic_event('PDF_IMAGE_BUDGET_SUMMARY', counters=manifest.get('image_budgets', {}),
                          classification_assets=sum(p['assets'] for p in manifest.get('image_budgets', {}).get('classification', {}).get('pages', {}).values()),
                          formula_candidates=sum(p['assets'] for p in manifest.get('image_budgets', {}).get('formula', {}).get('pages', {}).values()),
@@ -9411,6 +9696,8 @@ def finalize_published_html(path, content):
     path = Path(path)
     soup = BeautifulSoup(content, 'html.parser')
     strip_review_annotations(soup)
+    from docling_pdf_table_rasters import remove_published_table_rasters
+    remove_published_table_rasters(soup, captioned_layout=False)
     note_warnings = normalize_table_notes(soup)
     joins = join_captioned_tables(soup)
     if joins:
@@ -9528,7 +9815,7 @@ def parse_args(argv=None):
     p.add_argument('--no-pdf-source-cell-ownership', dest='pdf_source_cell_ownership', action='store_false', default=True,
                    help='отключить проверку принадлежности source-кропов физическим ячейкам и полный pixel fallback смешанных ячеек')
     p.add_argument('--no-pdf-source-image-bounds', dest='pdf_source_image_bounds', action='store_false', default=True,
-                   help='отключить расширение целых source-image fallback до однозначно принадлежащих исходных глифов')
+                   help='отключить расширение области повторного чтения до однозначно принадлежащих ей исходных глифов')
     p.add_argument('--no-pdf-primary-row-boundaries', dest='pdf_primary_row_boundaries', action='store_false', default=True,
                    help='разрешить прежнее слияние первичных строк только по открытым физическим границам страницы')
     p.add_argument('--no-pdf-source-unit-composition', dest='pdf_source_unit_composition', action='store_false', default=True,
@@ -9536,7 +9823,7 @@ def parse_args(argv=None):
     p.add_argument('--no-pdf-source-scripts', dest='pdf_source_scripts', action='store_false', default=True,
                    help='отключить проверку лишних индексов по изображению исходной ячейки')
     p.add_argument('--no-pdf-primary-region-ownership', dest='pdf_primary_region_ownership', action='store_false', default=True,
-                   help='отключить сохранение всей рамки изображением при недоказанной привязке первичного OCR к внутренней таблице')
+                   help='отключить повторное чтение рамки при недоказанной привязке первичного OCR к внутренней таблице')
     p.add_argument('--no-pdf-duplicate-primary-tables', dest='pdf_duplicate_primary_tables', action='store_false', default=True,
                    help='отключить защиту от повторного создания таблицы из одного физического первичного OCR-блока')
     p.add_argument('--no-pdf-captioned-figures', dest='pdf_captioned_figures', action='store_false', default=True,
@@ -10150,6 +10437,9 @@ def convert_document(args, converter, source):
         args.pdf_quality_current = {}
         args.pdf_export_context = {'stage': 'ocr'}
         args.surya_records = []
+        args.page_ocr_routes = {}
+        args.primary_ocr_page_failures = {}
+        args.grid_cell_line_ocr = None
         args.primary_table_refinements = []
         args.primary_table_refinement_reviews = []
         args.scan_header_requests = 0
@@ -10161,11 +10451,16 @@ def convert_document(args, converter, source):
             kwargs["source"] = normalized
             progress.start(len(orientation))
             converter = shared_converter(args, converter)
-            result = converter.convert(**kwargs)
+            result = converter.convert(raises_on_error=False, **kwargs)
             diagnostic_model(result.document,getattr(args,'surya_records',()))
             diagnostic_event('CONVERTER_RESULT',status=str(result.status),errors=diagnostic_summary(getattr(result,'errors',())))
             if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
-                raise RuntimeError(f"Docling failed: {result.status}. Errors: {result.errors}")
+                reported_pages = {error.page_no for error in result.errors}
+                if (result.status != ConversionStatus.FAILURE or not reported_pages
+                        or reported_pages != set(args.primary_ocr_page_failures)
+                        or reported_pages != set(orientation)):
+                    raise RuntimeError(f"Docling failed: {result.status}. Errors: {result.errors}")
+                diagnostic_event('PDF_PRIMARY_RECOVERY_FOR_FAILED_SELECTION', pages=sorted(reported_pages))
             if getattr(args, 'diagnostics_dir', None):
                 diagnostics = args.diagnostics_dir/f'{source.stem[:64]}_{uuid4().hex[:12]}'
                 diagnostics.mkdir(parents=True, exist_ok=False)
@@ -10191,7 +10486,8 @@ def convert_document(args, converter, source):
                 args.pdf_export_context = {'stage': 'publication'}
                 base = output_base(args, source)
                 base.parent.mkdir(parents=True, exist_ok=True)
-                publication = {'status': 'OK'}
+                needs_review = quality.get('table_quality_warnings') or quality.get('formula_source_reviews')
+                publication = {'status': 'REVIEW' if needs_review else 'OK'}
                 if not getattr(args, 'desktop_output', False):
                     from docling_pdf_review import write_quality_report
                     publication = write_quality_report(Path(f'{base}.html'),source,quality,sys.modules[__name__])
@@ -10205,8 +10501,12 @@ def convert_document(args, converter, source):
                              logical_tables=audit.get('tables'),formula_records=len(quality['formulas']),
                              regional_requests=quality.get('regional_requests'))
             print(f"Status: {publication['status']}; table fragments: {len(quality['tables'])}; formulas: {len(quality['formulas'])}")
-            if publication['status']=='REVIEW':
-                print(f"WARNING: Требуется визуальная проверка {publication['review_fragments']} табличных фрагментов; отчёт: {publication['report']}",flush=True)
+            if quality.get('formula_source_reviews'):
+                print("WARNING: Требуется визуальная проверка формул, сохранённых изображениями")
+            if quality.get('table_quality_warnings'):
+                print("WARNING: Требуется визуальная проверка таблиц", flush=True)
+            if publication['status'] == 'REVIEW' and 'report' in publication:
+                print(f"Отчёт о проверке: {publication['report']}", flush=True)
             print(f"Saved: {base}.html", flush=True)
         return publication
     if is_pdf:

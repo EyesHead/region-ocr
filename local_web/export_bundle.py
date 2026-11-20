@@ -12,7 +12,7 @@ if __package__:
 else:
     from file_paths import native_path, normal_path
 
-EXPORT_SCHEMA = 13
+EXPORT_SCHEMA = 14
 CANONICAL_MANIFEST_SCHEMA = 1
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
 FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
@@ -87,7 +87,10 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
     """Create a canonical once, then derive packages without mutating that source."""
     from bs4 import BeautifulSoup
     from docling_pdf_annotations import normalize_semantic_annotations
+    from docling_pdf_table_rasters import remove_published_table_rasters
     source, destination = normal_path(Path(source).resolve()), normal_path(Path(destination).resolve())
+    pdf_engine_output = source.suffix.lower() in {'.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff',
+                                               '.bmp', '.webp', '.gif'}
     if output_format is not None and output_format not in EXTENSIONS:
         raise ValueError('Неизвестный формат результата: ' + str(output_format))
     assets, structured = _components()
@@ -138,23 +141,33 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                                  initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
                                  initial_joins=list(initial_joins) + manifest.get('table_joins', []))
         removed_reviews = structured.strip_review_annotations(soup)
+        removed_rasters = remove_published_table_rasters(soup) if pdf_engine_output else 0
         joins = join_captioned_tables(soup)
         star_notes = normalize_table_star_notes(soup)
-        if removed_reviews or joins or star_notes:
+        if removed_reviews or removed_rasters or joins or star_notes:
             # Historical canonicals remain immutable. Republish only the
             # document layer; the OCR/layout snapshot is not involved.
             return build_exports(str(soup), source, destination,
                                  pages=manifest['stats'].get('pages', pages),
                                  output_format=output_format, resource_root=canonical.parent,
-                                 initial_warnings=manifest.get('warnings', []),
+                                 initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
                                  initial_joins=list(manifest.get('table_joins', [])) + joins)
     else:
         soup = BeautifulSoup(content, 'html.parser')
         if soup.body is None:
             raise ValueError('Документ не содержит body после нормализации HTML')
         structured.strip_review_annotations(soup)
+        if pdf_engine_output:
+            remove_published_table_rasters(soup)
         normalize_semantic_annotations(soup, {}, {})
         warnings = list(initial_warnings) + list(structured.normalize_table_notes(soup))
+        warnings.extend(notice.get_text(' ', strip=True) for notice in soup.select('aside[data-unrecognized-table]'))
+        if pdf_engine_output:
+            for figure in soup.select('figure[data-source-formula-review="true"][data-pdf-page]'):
+                page = figure['data-pdf-page']
+                if (page.isascii() and page.isdecimal() and page.strip('0')
+                        and figure.find('img', src=True, recursive=False)):
+                    warnings.append(f'Формула сохранена изображением (страница PDF {page}).')
         joins = list(initial_joins) + join_captioned_tables(soup)
         normalize_table_star_notes(soup)
         replay = destination / '.replay'
@@ -183,7 +196,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                         table_joins=joins)
         _save_manifest(canonical, manifest)
     replay = canonical.parent
-    stats, warnings = dict(manifest['stats']), list(manifest.get('warnings', []))
+    stats = dict(manifest['stats'])
+    warnings = list(dict.fromkeys([*initial_warnings, *manifest.get('warnings', [])]))
     media = dict(assets=manifest.get('assets', []))
     # Check the immutable assets before making any derivative package.
     if not replay_html:

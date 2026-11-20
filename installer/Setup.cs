@@ -19,13 +19,13 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("REGION OCR — установка")]
 [assembly: AssemblyProduct("REGION OCR")]
-[assembly: AssemblyVersion("1.9.0.0")]
-[assembly: AssemblyFileVersion("1.9.0.0")]
+[assembly: AssemblyVersion("1.9.1.0")]
+[assembly: AssemblyFileVersion("1.9.1.0")]
 
 internal static class Setup
 {
     internal const string Product = "REGION OCR";
-    internal const string Version = "1.9.0";
+    internal const string Version = "1.9.1";
     internal const string Marker = ".region-ocr-install.json";
     internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\RegionOCR";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };

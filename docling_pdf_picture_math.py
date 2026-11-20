@@ -284,6 +284,7 @@ def _read_atom(image, args, page, picture_ref, api):
     from PIL import ImageOps, Image
     from surya.inference.schema import BatchInputItem, PROMPT_TYPE_BLOCK
     from docling_pdf_table_content import _typed_payload_key
+    from docling_pdf_ocr import output_within_request_budget
 
     model = getattr(args, 'surya_ocr_model', None)
     if model is None:
@@ -297,7 +298,7 @@ def _read_atom(image, args, page, picture_ref, api):
         try:
             outputs = backend.generate([BatchInputItem(image=view, prompt_type=PROMPT_TYPE_BLOCK,
                 max_tokens=512, metadata=dict(page=page, element=picture_ref, reading='source_fraction_atom', scale=scale))])
-            if len(outputs) != 1 or outputs[0].error or outputs[0].token_count >= 512:
+            if len(outputs) != 1 or not output_within_request_budget(outputs[0], 512):
                 return None
             replies.append(outputs[0].raw)
         finally:

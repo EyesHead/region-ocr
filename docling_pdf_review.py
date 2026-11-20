@@ -81,12 +81,15 @@ def write_quality_report(output, source, quality, api):
     output = Path(output)
     reviews = quality.get('source_grid_reviews', [])
     warnings = quality.get('table_quality_warnings', quality.get('table_content_issues', []))
-    status = 'REVIEW' if reviews or warnings else 'OK'
+    formula_warnings = quality.get('formula_source_reviews', [])
+    review_required = bool(reviews or warnings or formula_warnings)
+    status = 'REVIEW' if review_required else 'OK'
     report = output.with_suffix('.report.md')
     machine = output.with_suffix('.report.json')
     clean = [{k: v for k, v in review.items() if k != 'source_preview_html'} for review in reviews]
-    data = dict(status=status, source=str(source), output=str(output), review_required=bool(reviews or warnings),
-                source_grid_reviews=clean, table_warnings=warnings, blocking_issues=[],
+    data = dict(status=status, source=str(source), output=str(output), review_required=review_required,
+                source_grid_reviews=clean, table_warnings=warnings, formula_warnings=formula_warnings,
+                blocking_issues=[],
                 table_checks_policy='diagnostic_only', primary_ocr_only=quality.get('primary_ocr_only'),
                 table_cell_schema=quality.get('table_cell_schema'))
     lines = ['# Отчёт конвертации', '', f'Статус: **{status}**.', '', f'Источник: {source}', '']
@@ -109,7 +112,12 @@ def write_quality_report(output, source, quality, api):
             lines.append(f'- Страница {warning.get("page", "?")}, '
                          f'{warning.get("ref", warning.get("element", "?"))}: '
                          f'{warning.get("message") or warning.get("reason", "table_quality_warning")}')
-    if not reviews and not warnings:
+    if formula_warnings:
+        lines += ['', '## Формулы в виде изображений', '']
+        for warning in formula_warnings:
+            message = warning.get('message') or 'Формула сохранена изображением исходника.'
+            lines.append(f'- Страница PDF {warning["page"]}. {message}')
+    if not review_required:
         lines += ['Предупреждений таблиц не найдено. Это не посимвольная проверка точности первичного OCR.']
     api.write_atomic(report, '\n'.join(lines)+'\n')
     api.write_atomic(machine, json.dumps(data, ensure_ascii=False, indent=2))

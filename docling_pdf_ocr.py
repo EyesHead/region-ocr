@@ -8,14 +8,13 @@ import math
 def _layout_error(item, output):
     if output is None:
         return 'inference_failed_or_empty'
-    if item.prompt_type == 'block':
-        if output.raw:
-            from surya.recognition import _detect_repeat_loop
-            if _detect_repeat_loop(output.raw):
-                return 'repeating_output'
-        if getattr(output, 'finish_reason', None) == 'length' or (
-                output.raw and item.max_tokens and output.token_count >= item.max_tokens):
-            return 'output_token_limit'
+    if output.raw:
+        from surya.recognition import _detect_repeat_loop
+        if _detect_repeat_loop(output.raw):
+            return 'repeating_output'
+    if getattr(output, 'finish_reason', None) == 'length' or (
+            item.max_tokens and output.token_count >= item.max_tokens):
+        return 'output_token_limit'
     if output.error:
         return 'inference_failed_or_empty'
     if not output.raw:
@@ -38,26 +37,41 @@ def _layout_error(item, output):
     return None
 
 
-def _complete_block_output(item, output, request, diagnostic):
-    """Correct an underestimated block length without extending decoder loops."""
+def _complete_region_output(item, output, request, diagnostic):
+    """Retry a truncated region once within the installed output budget."""
     reason = _layout_error(item, output)
-    if item.prompt_type != 'block' or reason != 'output_token_limit' or not item.max_tokens:
+    if reason != 'output_token_limit' or item.prompt_type == 'high_accuracy_bbox' or not item.max_tokens:
         return item, output, reason
     from surya.settings import settings
+    previous = item.max_tokens
     ceiling = settings.SURYA_MAX_TOKENS_BLOCK_CEILING
-    while reason == 'output_token_limit' and item.max_tokens < ceiling:
-        previous = item.max_tokens
-        item = replace(item, max_tokens=min(ceiling, previous*4), temperature=0.0)
-        diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
-                   image_size=list(item.image.size), metadata=item.metadata,
-                   previous_max_tokens=previous, max_tokens=item.max_tokens,
-                   method='underestimated_block_output_budget')
-        repeated = request([item])
-        if len(repeated) != 1:
-            raise RuntimeError('Local block budget retry result count mismatch')
-        output = repeated[0]
-        reason = _layout_error(item, output)
-    return item, output, reason
+    budget = min(ceiling, previous * 2)
+    if budget <= previous:
+        return item, output, reason
+    item = replace(item, max_tokens=budget, temperature=0.0)
+    diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
+               image_size=list(item.image.size), metadata=item.metadata,
+               previous_max_tokens=previous, max_tokens=budget,
+               method='increased_region_output_budget')
+    repeated = request([item])
+    if len(repeated) != 1:
+        raise RuntimeError('Local OCR budget retry result count mismatch')
+    result = repeated[0]
+    if result is None:
+        return item, result, 'inference_failed_or_empty'
+    reason = _layout_error(item, result)
+    if reason is None:
+        result = replace(result, metadata=dict(result.metadata, region_ocr_completed_budget=budget))
+    return item, result, reason
+
+
+def output_within_request_budget(output, initial_limit):
+    """Validate against the exact expanded budget recorded on successful retry."""
+    initial_limit = initial_limit or 2048
+    final_limit = output.metadata.get('region_ocr_completed_budget', initial_limit)
+    return (not output.error and type(final_limit) is int
+            and initial_limit <= final_limit <= 2 * initial_limit
+            and 0 <= output.token_count < final_limit)
 
 
 def _layout_parts(image):
@@ -92,17 +106,18 @@ def recovering_generate(batch, request, diagnostic):
         raise RuntimeError('Local inference result count mismatch')
     recovered = []
     for item, output in zip(batch, outputs, strict=True):
-        retry, output, reason = _complete_block_output(item, output, request, diagnostic)
+        retry, output, reason = _complete_region_output(item, output, request, diagnostic)
         if not reason:
             if retry.max_tokens != item.max_tokens:
                 diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
-                           image_size=list(item.image.size), method='completed_block_output_budget',
+                           image_size=list(item.image.size), method='completed_region_output_budget',
                            max_tokens=retry.max_tokens)
             recovered.append(output)
             continue
         # Repeating the same greedy loop or a known exhausted budget cannot
         # complete its transcription. Keep those failures explicit.
-        if reason not in {'output_token_limit', 'repeating_output'}:
+        if (retry.max_tokens == item.max_tokens
+                and reason not in {'output_token_limit', 'repeating_output'}):
             diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
                        image_size=list(item.image.size), metadata=item.metadata)
             if item.prompt_type == 'layout':
@@ -110,7 +125,7 @@ def recovering_generate(batch, request, diagnostic):
                 retry = replace(retry, guided_json=LAYOUT_JSON_SCHEMA, temperature=0.0)
             repeated = request([retry])
             output = repeated[0] if len(repeated) == 1 else None
-            retry, output, reason = _complete_block_output(retry, output, request, diagnostic)
+            retry, output, reason = _complete_region_output(retry, output, request, diagnostic)
         if not reason:
             diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
                        image_size=list(item.image.size), method='single_request_retry')
@@ -145,8 +160,9 @@ def recovering_generate(batch, request, diagnostic):
                 for crop,_ in parts:
                     crop.close()
             from surya.inference.schema import BatchOutputItem
-            output = BatchOutputItem(raw=json.dumps(blocks) if item.prompt_type == 'layout' else ''.join(blocks),
-                                     token_count=tokens, error=False, metadata=item.metadata)
+            output = BatchOutputItem(
+                raw=json.dumps(blocks) if item.prompt_type == 'layout' else ''.join(blocks),
+                token_count=tokens, error=False, metadata=item.metadata)
             diagnostic('OCR_REQUEST_RECOVERED', prompt_type=item.prompt_type,
                        image_size=list(item.image.size), method='source_gutter_layout_parts')
             recovered.append(output)

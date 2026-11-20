@@ -95,7 +95,12 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
 .job-actions>.button:disabled{color:var(--muted);border-color:var(--control);background:var(--canvas);opacity:.7}
 .job-actions>.page-control{order:1;flex:none;width:auto;max-width:100%}
 .job-actions .page-trigger{width:auto;min-width:115px;max-width:100%;font-size:12px}
-.job-actions .job-more{order:2;margin-left:0;align-self:center}
+.job-tools{display:inline-flex;align-items:center;order:2;gap:8px;flex:none}
+.job-actions .job-more{margin-left:0;align-self:center}
+.job-tools>.job-trash{display:inline-flex;align-items:center;justify-content:center;width:36px;min-height:36px;padding:0;color:var(--negative);border-color:var(--control);background:var(--white)}
+.job-trash:hover:not(:disabled){background:var(--error-surface);border-color:var(--negative)}
+.job-trash:disabled{opacity:.55}
+.job-trash svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round}
 .job-more>summary{width:36px;min-height:36px;color:var(--muted)}
 .job-more>summary:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .job-more-menu{width:260px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);padding:6px;gap:0;overflow-x:hidden;overflow-y:auto;color:var(--ink)}
@@ -111,8 +116,7 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
 .job-menu-group>.original-button svg:last-child{width:14px;height:14px}
 
 @media(min-width:1280px){
-  /* 32 + 120 + 175 + 190 + four 16px gaps leave the filename the remaining width. */
-  .job-row{grid-template-columns:32px minmax(160px,1fr) 120px 175px 190px;min-height:92px}
+  .job-row{grid-template-columns:32px minmax(160px,1fr) 120px 175px 218px;min-height:92px}
   .job-main{grid-column:2;grid-row:1}
   .job-pages{grid-column:3;grid-row:1;align-self:center;font-size:12px;line-height:1.5}
   .job-pages .page-control,.job-pages .page-trigger{width:100%}
@@ -165,8 +169,8 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
   .job-actions>.button,.job-actions>.page-control .button{min-height:40px;font-size:12px;padding:8px 10px;width:auto}
   .job-actions>.page-control{width:auto;flex:none}
   .job-actions .page-trigger{width:auto;min-width:110px}
-  .job-actions .job-more{margin-left:auto}
-  .job-more>summary{width:40px;min-height:40px}
+  .job-actions .job-tools{margin-left:auto}
+  .job-more>summary,.job-tools>.job-trash{width:40px;min-height:40px}
   .job-menu-group>.button,.job-more-menu>.button{font-size:13px;min-height:40px}
   .job-menu-heading{font-size:12px}
 }
@@ -178,7 +182,7 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
 }
 @media(pointer:coarse){
   .document-filter,.document-sort select,.document-search input,.output-location-actions .button,.job-actions>.button,.job-actions>.page-control .button,.job-pages .page-trigger,.job-more>summary,.job-menu-group>.button,.job-more-menu>.button,.queue-toolbar #clear-button{min-height:44px}
-  .job-more>summary{width:44px}
+  .job-more>summary,.job-tools>.job-trash{width:44px;min-height:44px}
   .job-name-button{display:inline-flex;align-items:center;min-height:44px}
   .document-search input,.document-sort select{font-size:16px}
 }

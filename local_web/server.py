@@ -37,7 +37,7 @@ else:
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {
@@ -648,11 +648,22 @@ class JobStore:
                 raise APIError('Сначала остановите обработку файла.', 409)
             self.saved_call('delete', ident)
 
-    def _delete_orphaned_document(self, job_id):
-        """Fully replace an old upload whose queue entry is no longer present."""
+    def delete_saved_document(self, ident):
+        """Delete the entire upload identified by one saved delivery."""
         with self.lock:
-            # Only explicit document replacement may remove all deliveries and
-            # the shared source. Deleting a history result never enters here.
+            job_id = self.saved_call('get', ident)['job_id']
+            if not isinstance(job_id, str) or not re.fullmatch(r'[0-9a-f]{32}', job_id):
+                raise APIError('Не удалось подтвердить принадлежность результата загрузке.', 409)
+            if job_id in self.jobs:
+                self.delete(job_id)
+                return
+            if job_id in self.scheduled:
+                raise APIError('Сначала остановите обработку файла.', 409)
+            self._delete_orphaned_document(job_id)
+
+    def _delete_orphaned_document(self, job_id):
+        """Delete an indexed upload whose queue entry is no longer present."""
+        with self.lock:
             target = self._owned_job_folder(job_id) if re.fullmatch(r'[0-9a-f]{32}', job_id) else None
             self.saved_call('validate_delete_job', job_id)
             if target is not None and native_path(target).exists():
@@ -1076,6 +1087,10 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
         elif self.command == "DELETE":
+            match = re.fullmatch(r'/api/installed/([0-9a-f]{32})/document', path)
+            if match:
+                store.delete_saved_document(match[1])
+                return self._json({'ok': True})
             match = re.fullmatch(r'/api/installed/([0-9a-f]{32})', path)
             if match:
                 store.delete_saved(match[1])

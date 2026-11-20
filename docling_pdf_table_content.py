@@ -1,6 +1,7 @@
 """Publish table text/math as markup and only typed pictures as source crops."""
 import base64
-from hashlib import sha256
+from functools import lru_cache
+from hashlib import file_digest, sha256
 import json
 import math
 
@@ -175,6 +176,7 @@ def _infer_typed_blocks(image, model, page, cell, api, *, args=None):
     # prose. Use the existing typed layout path before asking for text.
     layouts = LayoutPredictor(manager)([image])
     layout = layouts[0] if len(layouts) == 1 else None
+    detected_layout = layout
     has_pictures = False
     if layout is not None and not layout.error and layout.bboxes:
         pictures = [dict(label=b.label, bbox=[1000*b.bbox[0]/image.width,
@@ -196,6 +198,7 @@ def _infer_typed_blocks(image, model, page, cell, api, *, args=None):
         from dataclasses import replace
         from surya.layout.schema import LayoutBox, LayoutResult
         from surya.inference.util import detect_repeat_token
+        from docling_pdf_ocr import output_within_request_budget
         import cv2
         import numpy as np
 
@@ -208,22 +211,27 @@ def _infer_typed_blocks(image, model, page, cell, api, *, args=None):
         _, _, components, _ = cv2.connectedComponentsWithStats(content, 8)
         glyphs = sum(area >= 3 for _, _, _, _, area in components[1:])
         estimate = max(256, min(3996, glyphs*8))
+        compact_retry = bool(glyphs and glyphs <= 180 and max(image.size) <= 600
+                             and detected_layout is not None and not detected_layout.error
+                             and detected_layout.bboxes)
         layout = LayoutResult(image_bbox=[0, 0, image.width, image.height], bboxes=[LayoutBox(
             polygon=[[0, 0], [image.width, 0], [image.width, image.height], [0, image.height]],
             label='Text', raw_label='Text', position=0, count=estimate)])
         class CellManager:
             def generate(self, batch):
                 outputs = manager.generate(batch)
-                return [replace(out, error=bool(out.error or out.token_count >= item.max_tokens
-                    or detect_repeat_token(out.raw))) for item, out in zip(batch, outputs)]
+                return [replace(out, error=bool(not output_within_request_budget(out, item.max_tokens)
+                    or detect_repeat_token(out.raw))) for item, out in zip(batch, outputs, strict=True)]
         try:
             predictions = RecognitionPredictor(CellManager())([image], full_page=False, layout_results=[layout])
         except RuntimeError as error:
             if not str(error).startswith('Local block request failed after retry:'):
                 raise  # Allocation/backend failures are not an empty OCR reading.
-            failure = TableContentError('Physical cell OCR remained empty or invalid after block recovery')
-            failure.context = dict(stage='typed_table_content', page=page, element=cell)
-            raise failure from error
+            if not compact_retry:
+                failure = TableContentError('Physical cell OCR remained empty or invalid after block recovery')
+                failure.context = dict(stage='typed_table_content', page=page, element=cell)
+                raise failure from error
+            predictions = []
         blocks = predictions[0].blocks if len(predictions) == 1 else []
         if len(blocks) == 1 and not blocks[0].error:
             html = blocks[0].html or ''
@@ -234,9 +242,10 @@ def _infer_typed_blocks(image, model, page, cell, api, *, args=None):
                 return [dict(label='Text', bbox=[0, 0, 1000, 1000], html=html)]
         api.diagnostic_event('TYPED_PHYSICAL_CELL_BLOCK_REVIEW', page=page, cell=cell,
                              reason='bounded_block_has_no_complete_editable_payload')
-        failure = TableContentError('Physical cell OCR returned no complete editable block')
-        failure.context = dict(stage='typed_table_content', page=page, element=cell)
-        raise failure  # The publisher retains the complete primary table with REVIEW.
+        if not compact_retry:
+            failure = TableContentError('Physical cell OCR returned no complete editable block')
+            failure.context = dict(stage='typed_table_content', page=page, element=cell)
+            raise failure
     # RecognitionPredictor owns validation of repeats/HTML and the trained
     # layout + block recovery. Calling backend.generate directly bypasses it.
     predictions = RecognitionPredictor(manager)([image], full_page=True,
@@ -250,7 +259,7 @@ def _infer_typed_blocks(image, model, page, cell, api, *, args=None):
             for b in predictions[0].blocks]
 
 
-def _unwrap_text_cell_table(parsed, api, *, physical_cell, text_label):
+def _unwrap_text_cell_table(parsed, api, *, physical_cell, text_label, source_image=None):
     """Discard OCR-only empty columns around one ordered text stream."""
     wrappers = parsed.find_all('table')
     if len(wrappers) != 1 or wrappers[0].find('caption'):
@@ -271,6 +280,10 @@ def _unwrap_text_cell_table(parsed, api, *, physical_cell, text_label):
     columns = {position['column'] for position, _ in occupied}
     if not occupied or (profile['columns'] != 1 and (not text_label or len(columns) != 1)):
         return False
+    if source_image is not None and text_label:
+        line_limit = _source_line_upper_bound(source_image)
+        if line_limit is not None and len({position['row'] for position, _ in occupied}) > line_limit:
+            raise TableContentError('Text-cell OCR proposed more rows than the source ink')
     # A physical source cell and a text block supply the ownership. Empty
     # model columns/rows have no payload; a real multi-column reading stays.
     payload = BeautifulSoup('', 'html.parser')
@@ -283,8 +296,23 @@ def _unwrap_text_cell_table(parsed, api, *, physical_cell, text_label):
     return True
 
 
+def _source_line_upper_bound(image):
+    # Count distinct ink bands as an upper bound on the printed text lines.
+    import numpy as np
+    from docling_pdf_typed_lines import measured_cell_interior
+
+    interior = measured_cell_interior(image)
+    if interior is None:
+        return None
+    with image.crop(interior[0]) as crop, crop.convert('L') as gray:
+        rows = (np.asarray(gray) < 180).sum(axis=1) >= 2
+    edges = np.flatnonzero(np.diff(np.r_[False, rows, False]))
+    return sum(b-a >= 2 for a, b in zip(edges[::2], edges[1::2], strict=True))
+
+
 def _render_typed(image, blocks, width, page, position, manifest, api,
-                  *, source_reader=None, source_bbox=None, physical_cell=False, require_coverage=False):
+                  *, source_reader=None, source_bbox=None, physical_cell=False, require_coverage=False,
+                  allow_nested_table=False):
     if not blocks:
         raise TableContentError('Table raster has no typed recognition result')
     blocks = _refine_picture_bounds(image, blocks)
@@ -333,11 +361,12 @@ def _render_typed(image, blocks, width, page, position, manifest, api,
             # Keep its complete payload without inventing a nested source grid.
             text_label = label in {'text', 'caption', 'section-header', 'sectionheader', 'title'}
             if (physical_cell or text_label) and _unwrap_text_cell_table(
-                    parsed, api, physical_cell=physical_cell, text_label=text_label):
+                    parsed, api, physical_cell=physical_cell, text_label=text_label,
+                    source_image=image if physical_cell else None):
                 content = str(parsed)
                 api.diagnostic_event('TYPED_TEXT_CELL_TABLE_UNWRAPPED', page=page, cell=position)
-            if physical_cell and text_label and parsed.find('table'):
-                raise TableContentError('Text-cell OCR proposed an unverified nested table')
+            if physical_cell and parsed.find('table') and (text_label or not allow_nested_table):
+                raise TableContentError('Cell OCR proposed an unverified nested table')
             if not parsed.get_text(strip=True) and not parsed.find('math'):
                 raise TableContentError('Typed table text/equation was not recognized')
             parts.append(content)
@@ -450,6 +479,10 @@ def _refine_picture_bounds(image, blocks):
     result = []
     for block_index, block in enumerate(blocks):
         if block.get('label', '').casefold() not in PICTURE_LABELS:
+            result.append(block)
+            continue
+        if block.get('source_graphic_role') and block['source_graphic_role'].get('source_rule_proof'):
+            # Already bounded by measured cell interior in the original pixels.
             result.append(block)
             continue
         bounds = list(anchors[block_index])
@@ -585,6 +618,8 @@ def _is_source_graphic_header(text):
     if re.search(r'\b(?:наименован\w*|назван\w*|описан\w*|характеристик\w*|номер\w*|шифр\w*|код\w*|'
                  r'формул\w*|уравнен\w*|математич\w*|выражени\w*)\b', text, re.I):
         return False
+    if re.fullmatch(r'обозначение\s+и\s+изображение', text, re.I):
+        return True
     return bool(re.match(
         r'^(?:(?:условн\w*|графическ\w*|цветографическ\w*|схематическ\w*|принципиальн\w*|электрическ\w*)\s+){0,2}'
         r'(?:изображен\w*|эскиз\w*|схем\w*|черт[её]ж\w*|геометрическ\w*\s+форм\w*|'
@@ -597,7 +632,7 @@ def _source_graphic_context(fragment, profile, geometry, page, ref, manifest):
     from collections import Counter
 
     ledger = manifest.setdefault('typed_source_graphic_contexts', [])
-    context = dict(page=page, ref=ref, roles={}, x_grid=[], verified=False)
+    context = dict(page=page, ref=ref, roles={}, text_columns=[], x_grid=[], verified=False)
     previous = next((entry for entry in reversed(ledger) if entry['ref'] != ref), None)
     ledger.append(context)
     if not profile or not geometry or not geometry.get('source_grid_verified'):
@@ -613,13 +648,20 @@ def _source_graphic_context(fragment, profile, geometry, page, ref, manifest):
             tuple(cell[key] for key in keys) for cell in profile['cells']):
         return context
     parsed = BeautifulSoup(fragment, 'html.parser')
-    roles = {}
+    roles, text_columns = {}, set()
     nodes = [node for node in parsed.table.find_all(['td', 'th']) if node.find_parent('table') is parsed.table]
-    for node, position in zip(nodes, profile['cells']):
+    is_line_legend = any(position.get('header')
+                         and re.fullmatch(r'наименование\s+линии', node.get_text(' ', strip=True), re.I)
+                         for node, position in zip(nodes, profile['cells'], strict=True))
+    for node, position in zip(nodes, profile['cells'], strict=True):
         if not position.get('header') or position['column_span'] == columns:
             continue
         text = node.get_text(' ', strip=True)
-        if not _is_source_graphic_header(text):
+        if re.fullmatch(r'(?:наименование|название|описание|примечание)(?:\s+(?:объекта|сети|линии))?', text, re.I):
+            text_columns.update(range(position['column'], position['column']+position['column_span']))
+        is_line_sample = (is_line_legend and position['column_span'] == 1
+                          and re.fullmatch(r'обозначение', text, re.I))
+        if not (is_line_sample or _is_source_graphic_header(text)):
             continue
         evidence = dict(text=text, source_ref=ref, source_page=page,
                         source_bbox=list(_physical_cell(geometry, position)['bbox']),
@@ -647,13 +689,46 @@ def _source_graphic_context(fragment, profile, geometry, page, ref, manifest):
             roles = previous['roles']
             context['inherited_from'] = previous['ref']
             caption_id = caption_id or previous.get('caption_id', '')
-    context.update(roles=roles, x_grid=list(grid), verified=True, caption=caption, caption_id=caption_id)
+    context.update(roles=roles, text_columns=sorted(text_columns - set(roles)),
+                   x_grid=list(grid), verified=True, caption=caption, caption_id=caption_id)
     if roles:
         proof_cells = [{key: cell.get(key) for key in ('row', 'column', 'row_span', 'column_span', 'bbox')}
                        for cell in geometry.get('cells', [])]
         context['source_grid_sha256'] = sha256(json.dumps(
             dict(x_grid=grid, cells=proof_cells), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     return context
+
+
+def _has_separate_text_bands(content):
+    import cv2
+    import numpy as np
+
+    occupied = np.count_nonzero(content, axis=1) >= 2
+    edges = np.flatnonzero(np.diff(np.r_[False, occupied, False]))
+    groups = []
+    for start, end in zip(edges[::2], edges[1::2], strict=True):
+        if groups and start-groups[-1][1] <= 8:
+            groups[-1][1] = end
+        else:
+            groups.append([start, end])
+    strokes, small = [], []
+    for start, end in groups:
+        part = content[start:end]
+        _, _, items, _ = cv2.connectedComponentsWithStats(part, 8)
+        sizes = [max(w, h) for _, _, w, h, area in items[1:] if area >= 5]
+        if not sizes:
+            continue
+        columns = np.flatnonzero(part.any(axis=0))
+        band = (start, end, int(columns[0]), int(columns[-1]))
+        if max(sizes) >= max(28, .14 * content.shape[1]):
+            strokes.append(band)
+        elif len(sizes) >= 2:
+            small.append(band)
+    # Keep only small labels lying alongside a measured diagram stroke.
+    # Detached prose and standards references still require editable OCR.
+    return any(not any(max(top - b, a - bottom) <= max(8, bottom - top)
+                       and l <= left <= right <= r for a, b, l, r in strokes)
+               for top, bottom, left, right in small)
 
 
 def _source_graphic_blocks(image, position, context, physical_cell):
@@ -670,23 +745,31 @@ def _source_graphic_blocks(image, position, context, physical_cell):
     with image.convert('L') as gray:
         values = np.asarray(gray)
         ink = cv2.threshold(values, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
-    content = _coverage_without_enclosing_rules(ink, physical_cell=True)
+    from docling_pdf_typed_lines import measured_cell_interior
+    interior = measured_cell_interior(image)
+    left, top, right, bottom = interior[0] if interior else (0, 0, image.width, image.height)
+    content = ink[top:bottom, left:right] if interior else _coverage_without_enclosing_rules(
+        ink, physical_cell=True)
+    if _has_separate_text_bands(content):
+        return None
     yy, xx = np.where(content)
     if not len(xx):
         return None
     # Unproved boundary ink can be an open frame or a clipped drawing. It
     # cannot be swallowed into a whole-cell picture by the column heading.
-    if xx.min() < 3 or yy.min() < 3 or xx.max() >= image.width-3 or yy.max() >= image.height-3:
+    if xx.min() < 3 or yy.min() < 3 or xx.max() >= content.shape[1]-3 or yy.max() >= content.shape[0]-3:
         return None
     distance = cv2.distanceTransform(content, cv2.DIST_L2, 3)
     positive = distance[distance > 0]
     halo = max(2, math.ceil(2*float(np.median(positive))))
-    pixels = [max(0, int(xx.min())-halo), max(0, int(yy.min())-halo),
-              min(image.width, int(xx.max())+1+halo), min(image.height, int(yy.max())+1+halo)]
+    pixels = [max(left, left+int(xx.min())-halo), max(top, top+int(yy.min())-halo),
+              min(right, left+int(xx.max())+1+halo), min(bottom, top+int(yy.max())+1+halo)]
     evidence = dict(method='verified_physical_grid_and_explicit_graphic_column',
         source_grid_sha256=context['source_grid_sha256'],
         header_evidence=[header for column in sorted(occupied) for header in roles[column]],
         inherited_from=context.get('inherited_from'), source_content_pixel_bbox=pixels)
+    if interior:
+        evidence['source_rule_proof'] = interior[1]
     return [dict(label='Image', html='', bbox=[1000*pixels[0]/image.width, 1000*pixels[1]/image.height,
         1000*pixels[2]/image.width, 1000*pixels[3]/image.height], source_graphic_role=evidence)]
 
@@ -988,14 +1071,203 @@ def _combine_blocks(retained, recognized):
     return sorted(result, key=lambda b: (b['bbox'][1], b['bbox'][0]))
 
 
+
+
+def _require_preserved_cell_text(original, pending, rendered, api):
+    import re
+
+    expected, proposed, actual = [BeautifulSoup(s, 'html.parser') for s in (original, pending, rendered)]
+    required_math = _formula_anchors(original, api) | _formula_anchors(pending, api)
+    if required_math - _formula_anchors(rendered, api):
+        raise TableContentError('Typed table OCR omitted or changed an existing formula')
+    for parsed in (expected, proposed, actual):
+        for math_node in parsed.find_all('math'):
+            math_node.decompose()
+    def tokens(parsed):
+        return re.findall(r'\w+|[^\w\s]', parsed.get_text(' ', strip=True).replace('\u00ad', ''))
+    actual_tokens = tokens(actual)
+    for known in (expected, proposed):
+        remaining = iter(actual_tokens)
+        if not all(any(candidate == token for candidate in remaining) for token in tokens(known)):
+            raise TableContentError('Typed table OCR omitted or changed existing editable text')
+
+
+def _incomplete_plain_cell(image, rendered):
+    # Do not accept a short sample as a tall proved prose cell.
+    parsed = BeautifulSoup(rendered, 'html.parser')
+    if parsed.select_one('math, sub, sup, img, svg, table, .source-latex'):
+        return False
+    if not parsed.get_text(strip=True):
+        return True
+    from docling_pdf_primary_cells import _reading_is_short
+    return _reading_is_short(parsed, image)
+
+
+def _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, manifest, api, *, image=None):
+    from docling_pdf_table_audit import register_protected_source_graphic_cell
+
+    if node.find('img') and not register_protected_source_graphic_cell(
+            node, physical, geometry, page, ref, manifest):
+        known = {entry['source_sha256'] for entry in manifest.get('typed_table_picture_assets', [])
+                 if entry.get('page') == page and entry.get('cell', {}).get('row') == position['row']
+                 and entry.get('cell', {}).get('column') == position['column']}
+        for element in node.find_all('img'):
+            if (element.get('data-table-content') != 'picture'
+                    or sha256(element.get('src', '').encode()).hexdigest() not in known):
+                element.decompose()
+    for element in node.find_all(['svg','math']):
+        if element.name == 'svg' or (not element.get_text(strip=True) and not element.get('data-latex')):
+            element.decompose()
+    if image is not None and not node.find('img'):
+        from docling_pdf_typed_lines import measured_cell_interior
+        interior = measured_cell_interior(image)
+        bounds = interior[0] if interior else (0, 0, image.width, image.height)
+        with image.crop(bounds) as crop, crop.convert('L') as gray:
+            if sum(gray.histogram()[:180]) >= 3:
+                width = (physical['bbox'][2] - physical['bbox'][0]) * crop.width / image.width
+                preview = BeautifulSoup(api.image_html(crop, width, 'cell-review'), 'html.parser').img
+                preview['alt'] = 'Фрагмент исходной ячейки для сверки'
+                preview['data-table-content'] = 'picture'
+                preview['data-ocr-source-preview'] = 'true'
+                node.append(preview)
+                manifest.setdefault('typed_table_picture_assets', []).append(dict(
+                    page=page, source_ref=ref, label='Picture',
+                    cell={key: position[key] for key in ('row', 'column', 'row_span', 'column_span')},
+                    source_cell_bbox=list(physical['bbox']), source_pixel_bbox=list(bounds),
+                    source_sha256=sha256(preview['src'].encode()).hexdigest(),
+                    source_image_sha256=sha256(base64.b64decode(preview['src'].split(',', 1)[1])).hexdigest(),
+                    method='source_preview_for_unresolved_physical_cell'))
+    note = BeautifulSoup('', 'html.parser').new_tag('span', attrs={
+        'class': 'table-cell-review', 'data-ocr-review': 'true'})
+    note.string = '[Ячейка распознана не полностью]'
+    if node.get_text(strip=True) or node.find(['img','math']):
+        node.append(' ')
+    node.append(note)
+    _record_cell_review(physical, position, page, ref, str(error), manifest, api)
+
+
+def _record_cell_review(physical, position, page, ref, reason, manifest, api, *, unresolved_lines=0):
+    warning = dict(page=page, ref=ref, row=position['row'], column=position['column'],
+                   source_bbox=list(physical['bbox']), reason=reason, basis='unresolved_physical_cell',
+                   message='Ячейка таблицы распознана не полностью. Сверьте с исходным PDF.')
+    if unresolved_lines:
+        warning['unconfirmed_line_count'] = unresolved_lines
+    manifest.setdefault('table_assembly_reviews', []).append(warning)
+    api.diagnostic_event('TYPED_TABLE_CELL_REVIEW', **warning)
+
+@lru_cache(maxsize=1)
+def _decimal_line_recognizer():
+    """Use the local recognizer shipped in the pinned RapidOCR wheel."""
+    from pathlib import Path
+    import rapidocr
+
+    model = Path(rapidocr.__file__).parent / 'models' / 'PP-OCRv6_rec_small.onnx'
+    with model.open('rb') as stream:
+        checksum = file_digest(stream, 'sha256').hexdigest()
+    if checksum != '6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884':
+        raise ValueError('Unexpected bundled PP-OCRv6 recognizer')
+    return rapidocr.RapidOCR(params={
+        'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'warning',
+        'Rec.model_path': str(model), 'Rec.rec_batch_num': 16,
+        'EngineConfig.onnxruntime.intra_op_num_threads': 4,
+        'EngineConfig.onnxruntime.inter_op_num_threads': 1,
+    })
+
+
+def _verified_decimal_cells(tasks, geometry, source_image, region, page, args, ref,
+                            source_reader, graphic_context, api):
+    """Confirm simple decimals against source pixels and the positioned text layer."""
+    if (not tasks or source_reader is None or not geometry or not graphic_context['verified']
+            or not geometry.get('page_scan_transcription_required')
+            or geometry.get('hidden_ocr_direction_conflict')):
+        return {}
+    import cv2
+    import numpy as np
+    import re
+    from time import monotonic
+
+    start = monotonic()
+    source_reader.load_page(page)
+    glyphs = [g for g in source_reader.chars if g.get('text', '').strip()]
+    matches, views = [], []
+    for node, position, physical in tasks:
+        if (position.get('region') or position['header']
+                or (position['row_span'], position['column_span']) != (1, 1)
+                or position['column'] in graphic_context['roles']
+                or physical.get('pending_primary_html') or node.get_text(strip=True)
+                or node.select_one('math, sub, sup, svg, input, table, [data-formula], [data-latex], .source-latex')):
+            continue
+        images = node.find_all('img')
+        if len(images) != 1 or images[0].get('data-source-cell') != 'true':
+            continue
+        box = physical['bbox']
+        cell_glyphs = [g for g in glyphs if box[0] <= (g['x0'] + g['x1']) / 2 < box[2]
+                       and box[1] <= (g['top'] + g['bottom']) / 2 < box[3]]
+        lines = api.native_cell_lines(cell_glyphs)
+        if len(lines) != 1:
+            continue
+        literal = lines[0]['text'].strip()
+        if not re.fullmatch(r'(?:[0-9]{1,4}[,.][0-9]{1,4}|\([0-9]{1,4}[,.][0-9]{1,4}\))', literal):
+            continue
+        if _retained_blocks(args, page, box):
+            continue
+        try:
+            with _source_crop(source_image, region, box) as crop, crop.convert('L') as gray:
+                if max(crop.size) > 512:
+                    continue
+                support = _source_text_coverage(crop, [{'label': 'Text'}], source_reader, box, page, api, literal)
+                if support is None:
+                    continue
+                glyph_boxes, anchor = support
+                _require_ink_coverage(crop, glyph_boxes, physical_cell=True)
+                pixels = np.asarray(gray)
+                ink = cv2.threshold(pixels, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+                interior = _coverage_without_enclosing_rules(ink, physical_cell=True)
+                y, x = np.nonzero(interior)
+                if not len(x):
+                    continue
+                part = np.s_[y.min():y.max()+1, x.min():x.max()+1]
+                line = pixels[part].copy()
+                line[(interior[part] == 0) & (ink[part] != 0)] = 255
+        except TableContentError:
+            continue
+        for padding in (((3, 3), (4, 4)), ((5, 6), (5, 6))):
+            padded = np.pad(line, padding, constant_values=255)
+            views.append(cv2.cvtColor(padded, cv2.COLOR_GRAY2BGR))
+        cell = {name: position[name] for name in ('row', 'column', 'row_span', 'column_span')}
+        matches.append((id(node), literal, dict(anchor, page=page, ref=ref, cell=cell,
+                       method='rapidocr_and_positioned_source_agree_on_decimal')))
+        if len(matches) >= 128:
+            break
+    if not matches:
+        return {}
+    try:
+        result = _decimal_line_recognizer().recognize_txt(views)
+    except Exception as error:
+        api.diagnostic_event('TYPED_DECIMAL_BATCH_FALLBACK', page=page, ref=ref, reason=str(error))
+        return {}
+    if (result.txts is None or len(result.txts) != len(views) or len(result.scores) != len(views)):
+        return {}
+    confirmed = {}
+    for i, (key, literal, anchor) in enumerate(matches):
+        values = result.txts[2*i:2*i+2]
+        scores = result.scores[2*i:2*i+2]
+        if all(value.strip() == literal for value in values) and all(math.isfinite(s) and s >= .95 for s in scores):
+            confirmed[key] = (literal, dict(anchor, confidence=float(min(scores))))
+    api.diagnostic_event('TYPED_DECIMAL_BATCH', page=page, ref=ref, candidates=len(matches),
+                         accepted=len(confirmed), seconds=round(monotonic()-start, 3))
+    return confirmed
+
+
 def normalize_table_content(fragment, geometry, source_image, region, page, args, manifest, api,
-                            *, recognize=None, ref=None, source_reader=None):
+                            *, recognize=None, ref=None, source_reader=None, recover_region=False):
     """Resolve each raster in place, retaining mixed-cell order and spans.
 
     Existing editable markup is never deleted because of grid uncertainty.
-    OCR-supplied image URLs never become source-image evidence. Unresolved
-    crops stop publication rather than silently emitting a picture of text.
+    A disputed cell on a verified grid is marked locally for review.
+    An unresolved table region has no raster publication path.
     """
+    use_decimal_batch = recognize is None
     recognize = recognize or recognize_typed_crop
     soup = BeautifulSoup(fragment, 'html.parser')
     before = api.table_profile(fragment) if soup.table else None
@@ -1023,20 +1295,29 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                     tasks = [(soup, dict(region=True), dict(bbox=region))]
                     break
                 tasks.append((node, position, physical))
-    elif soup.find('img'):
+    elif recover_region or soup.find('img'):
         tasks = [(soup, dict(region=True), dict(bbox=region))]
+    decimal_cells = (_verified_decimal_cells(tasks, geometry, source_image, region,
+        page, args, ref, source_reader, graphic_context, api) if use_decimal_batch else {})
     for node, position, physical in tasks:
         # Never treat OCR HTML/base64 as evidence. Re-read ORIGINAL page
         # pixels for the physical owner, including text beside its picture.
         box = physical['bbox']
         physical_cell = bool(not position.get('region') and _physical_cell(geometry, position) is physical)
-        image = _source_crop(source_image, region, box)
+        image = None
         original = node.decode_contents()
         existing = [BeautifulSoup(value, 'html.parser') for value in
                     (original, physical.get('pending_primary_html') or '')]
         editable_existing = any(payload.get_text(strip=True) or payload.find(['math', 'sup', 'sub', 'input', 'table'])
                                 for payload in existing)
+        verified_cell = physical_cell and bool(geometry.get('source_grid_verified')
+                                               or geometry.get('positioned_source_grid_verified'))
+        occupied = range(position.get('column', 0), position.get('column', 0) + position.get('column_span', 0))
+        text_column = bool(verified_cell and not position.get('header')
+                           and occupied and set(occupied).issubset(graphic_context['text_columns']))
+        fragment_graft = None
         try:
+            image = _source_crop(source_image, region, box)
             retained = _retained_blocks(args, page, box)
             rendered = None
             complete_primary = False
@@ -1057,6 +1338,11 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                     complete_primary = physical_cell
                 except TableContentError:
                     pass  # Additional drawing/text must be resolved from source.
+            decimal = decimal_cells.get(id(node))
+            if rendered is None and decimal is not None:
+                rendered, anchor = decimal
+                blocks = [{'label': 'Text'}]
+                proof['typed_table_text_anchors'] = [anchor]
             if rendered is None:
                 blocks = (None if retained or editable_existing else
                           _source_graphic_blocks(image, position, graphic_context, physical_cell))
@@ -1068,10 +1354,15 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                     manifest.setdefault('typed_source_graphic_cells', []).append(dict(
                         page=page, ref=ref, row=position['row'], column=position['column'],
                         source_bbox=list(box), **blocks[0]['source_graphic_role']))
+                if position.get('region') and any(b['label'].casefold() in PICTURE_LABELS for b in blocks):
+                    raise TableContentError('Table region OCR could not recover a structured table without raster fallback')
                 proof = {}
                 rendered = _render_typed(image, blocks, box[2]-box[0], page, position, proof, api,
                                          source_reader=text_reader, source_bbox=box, physical_cell=physical_cell,
-                                         require_coverage=bool(native_fragments))
+                                         require_coverage=bool(native_fragments),
+                                         allow_nested_table=bool(node.find('table')))
+                if text_column and _incomplete_plain_cell(image, rendered):
+                    raise TableContentError('Physical text-cell OCR omitted source lines')
                 # A complete exact-cell OCR equation supersedes the native
                 # fraction's unassembled glyph/image pieces. Retained primary
                 # packets were reconciled by _combine_blocks above.
@@ -1096,63 +1387,62 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                     rendered, fraction_proof = grafted
                     complete_primary, complete_cell_reading = False, True
                     retained = []  # Only the proved fraction acquired ownership.
-                    manifest.setdefault('source_fraction_fragment_grafts', []).append(dict(
-                        page=page, ref=ref, row=position.get('row'), column=position.get('column'),
-                        **fraction_proof))
-            for key in ('typed_table_picture_assets', 'typed_table_text_anchors', 'typed_table_coverage_reviews'):
-                if proof.get(key):
-                    manifest.setdefault(key, []).extend(proof[key])
+                    fragment_graft = dict(page=page, ref=ref, row=position.get('row'),
+                                          column=position.get('column'), **fraction_proof)
+            if position.get('region') and (not BeautifulSoup(rendered, 'html.parser').table
+                                           or api.table_profile(rendered)['issues']):
+                raise TableContentError('Table region OCR returned no valid table grid')
+            # Preserve the whole known editable payload, including formula atoms.
+            expected = original
+            pending = physical.get('pending_primary_html') or ''
+            if complete_primary or complete_cell_reading:
+                primary = ''.join(block['html'] for block in retained) if complete_primary else rendered
+                if native_fragments:
+                    _require_native_formula_atoms(original, primary, api, cell=physical)
+                else:
+                    review_primary_cell_conflict(original, primary, page, position, box, manifest, api)
+                review_primary_cell_conflict(pending, primary, page, position, box, manifest, api)
+                expected, pending = primary, ''
+            _require_preserved_cell_text(expected, pending, rendered, api)
         except TableContentError as error:
             error.context = dict(stage='typed_table_content', page=page, element=ref,
                 cell={k: position[k] for k in ('row', 'column', 'row_span', 'column_span') if k in position},
                 bbox=list(box))
             api.diagnostic_event('TYPED_TABLE_CONTENT_FAILED', **error.context, reason=str(error))
-            raise
+            if not verified_cell:
+                raise
+            recovered = None
+            if text_column and image is not None and not any(
+                    payload.select_one('math, sup, sub, table, .source-latex') for payload in existing):
+                from docling_pdf_typed_lines import recover_typed_text_lines
+                recovered = recover_typed_text_lines(image, args, page, position, api)
+                if recovered:
+                    try:
+                        _require_preserved_cell_text(original, physical.get('pending_primary_html') or '',
+                                                     recovered[0], api)
+                    except TableContentError:
+                        recovered = None
+            if recovered is None:
+                _mark_unresolved_cell(node, physical, position, geometry, page, ref, error, manifest, api,
+                                      image=image)
+                continue
+            rendered, line_proof = recovered
+            proof, retained, fragment_graft = {}, [], None
+            blocks = [dict(label='Text')]
+            coordinates = {k: position[k] for k in ('row', 'column', 'row_span', 'column_span')}
+            manifest.setdefault('typed_table_text_anchors', []).append(
+                dict(page=page, cell=coordinates, **line_proof))
+            if line_proof.get('unconfirmed_line_count'):
+                _record_cell_review(physical, position, page, ref, 'source_lines_remained_unverified',
+                                    manifest, api, unresolved_lines=line_proof['unconfirmed_line_count'])
         finally:
-            image.close()
-        # Preserve known editable words: a shorter OCR answer is not a
-        # successful resolution of the mixed cell.
-        expected = BeautifulSoup(original, 'html.parser')
-        pending = BeautifulSoup(physical.get('pending_primary_html') or '', 'html.parser')
-        if complete_primary or complete_cell_reading:
-            primary = ''.join(block['html'] for block in retained) if complete_primary else rendered
-            if native_fragments:
-                try:
-                    _require_native_formula_atoms(original, primary, api, cell=physical)
-                except TableContentError as error:
-                    # One disputed native formula must not roll back already
-                    # recovered neighbouring cells. Keep its original payload.
-                    warning = dict(page=page, ref=ref, row=position.get('row'), column=position.get('column'),
-                        reason=str(error), bbox=list(box),
-                        message='Чтение формулы не сохранило все символы исходной ячейки; '
-                                'сохранена исходная запись, требуется проверка.')
-                    manifest.setdefault('native_formula_content_reviews', []).append(warning)
-                    manifest.setdefault('table_assembly_reviews', []).append(dict(
-                        warning, source_bbox=list(box), basis='native_formula_cell_retained'))
-                    api.diagnostic_event('NATIVE_FORMULA_CELL_RETAINED', **warning)
-                    continue
-            if not native_fragments:
-                # Native fragments were checked for complete source atoms,
-                # operators and indices above. Their new fraction structure
-                # is the intended repair, not a second conflicting reading.
-                review_primary_cell_conflict(original, primary, page, position, box, manifest, api)
-            review_primary_cell_conflict(str(pending), primary, page, position, box, manifest, api)
-            expected = BeautifulSoup(primary, 'html.parser')
-            pending = BeautifulSoup('', 'html.parser')
-        actual = BeautifulSoup(rendered, 'html.parser')
-        required_math = _formula_anchors(str(expected), api) | _formula_anchors(str(pending), api)
-        if required_math - _formula_anchors(str(actual), api):
-            raise TableContentError('Typed table OCR omitted or changed an existing formula')
-        for parsed in (expected, pending, actual):
-            for math_node in parsed.find_all('math'):
-                math_node.decompose()
-        import re
-        tokens = lambda parsed: re.findall(r'\w+|[^\w\s]', parsed.get_text(' ', strip=True).replace('\u00ad', ''))
-        actual_tokens = tokens(actual)
-        for known in (expected, pending):
-            remaining = iter(actual_tokens)
-            if not all(any(candidate == token for candidate in remaining) for token in tokens(known)):
-                raise TableContentError('Typed table OCR omitted or changed existing editable text')
+            if image is not None:
+                image.close()
+        for key in ('typed_table_picture_assets', 'typed_table_text_anchors', 'typed_table_coverage_reviews'):
+            if proof.get(key):
+                manifest.setdefault(key, []).extend(proof[key])
+        if fragment_graft:
+            manifest.setdefault('source_fraction_fragment_grafts', []).append(fragment_graft)
         node.clear()
         node.append(BeautifulSoup(rendered, 'html.parser'))
         physical.pop('pending_primary_html', None)
@@ -1173,6 +1463,9 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
         shape = lambda p: [(c['row'], c['column'], c['row_span'], c['column_span']) for c in p['cells']]
         if shape(before) != shape(after) or after['issues']:
             raise TableContentError('Typed table content changed the enclosing physical grid')
+        from docling_pdf_list_markers import repair_table_list_markers
+        repair_table_list_markers(soup, geometry, source_image, region, page, source_reader,
+                                  api, manifest, ref=ref)
     return str(soup)
 
 

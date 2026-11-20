@@ -238,3 +238,289 @@ def finalize_source_record_routes(doc, routes, excluded, manifest, api):
         api.diagnostic_event('SOURCE_SEMANTIC_RECORD_ROWS_DISPLAYED', ref=ref, repairs=proofs)
     manifest.setdefault('source_semantic_row_repairs', []).extend(repaired)
     return repaired
+
+
+def _partition_text_lines(box, fragments, image, reader, api, *, allow_wrap=False):
+    """Use a concordant hidden text layer solely to locate existing OCR output."""
+    import numpy as np
+    from docling_pdf_text_cells import positioned_text_proof
+
+    left, top, right, bottom = box
+    glyphs = [g for g in reader.chars if left < (g['x0'] + g['x1']) / 2 < right
+              and top < (g['top'] + g['bottom']) / 2 < bottom]
+    lines = [line for line in api.native_cell_lines(glyphs) if line['text'].strip()]
+    text = BeautifulSoup('<br/>'.join(fragments), 'html.parser')
+    if text.find(['img', 'math', 'svg', 'table']):
+        return None
+    keys = [api._borderless_key(BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+            for part in fragments]
+    source_keys = [api._borderless_key(line['text']) for line in lines]
+    aligned = ''.join(source_keys) == ''.join(keys) if allow_wrap else source_keys == keys
+    if not aligned:
+        return None
+    with image.convert('L') as gray:
+        mask = (np.asarray(gray) < 180).astype('uint8') * 255
+    proof = positioned_text_proof(str(text), glyphs, mask, box, box,
+                                  image.width / (right-left), image.height / (bottom-top))
+    return lines if proof else None
+
+
+def _partition_graphic_bands(image, interior, threshold):
+    import numpy as np
+
+    left, top, right, bottom = interior
+    with image.convert('L') as gray:
+        ink = np.asarray(gray)[top:bottom, left:right] < threshold
+    occupied = np.count_nonzero(ink, axis=1) >= 2
+    edges = np.flatnonzero(np.diff(np.r_[False, occupied, False]))
+    bands = []
+    for start, end in zip(edges[::2], edges[1::2]):
+        columns = np.flatnonzero(ink[start:end].any(axis=0))
+        bands.append((int(columns[0]) + left, int(start) + top,
+                      int(columns[-1]) + 1 + left, int(end) + top))
+    return bands
+
+
+def _reconstruct_partitioned_band(primary, nodes, source, graphic_col, page, reader, regions, api):
+    """Align every textual fragment and each independently visible graphic."""
+    import base64
+    from hashlib import sha256
+    from docling_pdf_table_content import TableContentError, _require_ink_coverage
+    from docling_pdf_typed_lines import measured_cell_interior
+
+    rows, anchor_columns, assets = {}, [], []
+    for col, node in enumerate(nodes):
+        if col == graphic_col:
+            continue
+        groups = [api._borderless_html_lines(row[col].decode_contents()) for row in primary]
+        if not all(groups):
+            return None
+        current = api._borderless_html_lines(node.decode_contents())
+        text_key = lambda part: api._borderless_key(
+            BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+        if [text_key(part) for part in current] != [text_key(part) for group in groups for part in group]:
+            return None
+        with regions.crop(page, source[col]['bbox']) as image:
+            lines = _partition_text_lines(source[col]['bbox'], current, image, reader, api)
+        if lines is None:
+            return None
+        anchors, payloads = [], []
+        start = 0
+        for group in groups:
+            end = start + len(group)
+            anchors.append(lines[end-1])
+            payloads.append('<br/>'.join(current[start:end]))
+            start = end
+        anchor_columns.append(anchors)
+        rows[col] = payloads
+
+    aligned = list(zip(*anchor_columns))
+    if any(max(line['y'] for line in group) - min(line['y'] for line in group)
+           > min(line['size'] for line in group) * .40 for group in aligned):
+        return None
+    centers = [median(line['y'] - line['size']/2 for line in group) for group in aligned]
+    box = source[graphic_col]['bbox']
+    rows[graphic_col] = []
+    with regions.crop(page, box) as image:
+        measured = measured_cell_interior(image)
+        if measured is None:
+            return None
+        interior = measured[0]
+        bands = _partition_graphic_bands(image, interior, 180)
+        if len(bands) != len(primary):
+            return None
+        for threshold in (160, 200):
+            alternative = _partition_graphic_bands(image, interior, threshold)
+            if len(alternative) != len(bands) or any(
+                    max(abs(a-b) for a, b in zip(first, second)) > 4
+                    for first, second in zip(bands, alternative)):
+                return None
+        normalized = [[1000 * left / image.width, 1000 * top / image.height,
+                       1000 * right / image.width, 1000 * bottom / image.height]
+                      for left, top, right, bottom in bands]
+        try:
+            _require_ink_coverage(image, normalized, physical_cell=True)
+        except TableContentError:
+            return None
+        sx = image.width / (box[2]-box[0])
+        sy = image.height / (box[3]-box[1])
+        for index, (row, band) in enumerate(zip(primary, bands)):
+            left, top, right, bottom = band
+            if abs((top+bottom)/(2*sy) + box[1] - centers[index]) > min(line['size'] for line in aligned[index]):
+                return None
+            cut = (max(interior[0], left-2), max(interior[1], top-2),
+                   min(interior[2], right+2), min(interior[3], bottom+2))
+            crop_box = [box[0]+cut[0]/sx, box[1]+cut[1]/sy, box[0]+cut[2]/sx, box[1]+cut[3]/sy]
+            payload = row[graphic_col].decode_contents()
+            with image.crop(cut) as crop:
+                # A citation can remain editable when its own cropped pixels
+                # verify it; an OCR dash or rail code does not replace a diagram.
+                if re.search(r'[A-Za-zА-Яа-яЁё]{2,}\s+[A-Za-zА-Яа-яЁё]{2,}',
+                             row[graphic_col].get_text(' ', strip=True)) and _partition_text_lines(
+                                 crop_box, api._borderless_html_lines(payload), crop, reader, api):
+                    rows[graphic_col].append(payload)
+                    continue
+                if right-left < .4 * (interior[2]-interior[0]):
+                    return None
+                img = BeautifulSoup(api.image_html(crop, crop_box[2]-crop_box[0], 'cell'), 'html.parser').img
+            img['data-table-content'] = 'picture'
+            img['data-source-cell'] = 'true'
+            rows[graphic_col].append(str(img))
+            assets.append(dict(page=page, cell=dict(row=source[graphic_col]['row']+index, column=graphic_col,
+                row_span=1, column_span=1), label='Diagram', source_bbox=crop_box,
+                source_pixel_bbox=list(cut), source_sha256=sha256(img['src'].encode()).hexdigest(),
+                source_image_sha256=sha256(base64.b64decode(img['src'].split(',', 1)[1])).hexdigest()))
+    return [list(parts) for parts in zip(*(rows[col] for col in range(len(nodes))))], assets, centers
+
+
+def _complete_primary_partition(table, profile, geometry, row, graphic_col, digest, page, reader, regions, api):
+    """Verify every cell before bypassing cell OCR."""
+    keys = ('row', 'column', 'row_span', 'column_span')
+    physical = {tuple(cell[key] for key in keys): cell for cell in geometry['cells']}
+    if set(physical) != {tuple(c[key] for key in keys) for c in profile['cells']}:
+        return False
+    nodes = [node for node in table.find_all(['td', 'th']) if node.find_parent('table') is table]
+    for cell, node in zip(profile['cells'], nodes, strict=True):
+        source = physical[tuple(cell[key] for key in keys)]
+        if (cell['row'], cell['column']) == (row, graphic_col):
+            if any(image.get('data-source-cell') != 'true' for image in node.find_all('img')):
+                return False
+            continue
+        if (source.get('primary_ocr', {}).get('source_record_sha256') != digest
+                or source.get('pending_primary_html') or not cell['text'].strip()
+                or node.find(['img', 'svg', 'math', 'sub', 'sup', 'table'])):
+            return False
+        if cell['row'] != row:
+            with regions.crop(page, source['bbox']) as image:
+                fragments = api._borderless_html_lines(node.decode_contents())
+                if not _partition_text_lines(source['bbox'], fragments, image, reader, api, allow_wrap=True):
+                    return False
+    return True
+
+
+def expand_partitioned_graphic_rows(doc, routes, manifest, regions, reader, records, api, *, preview=None):
+    """Restore one partitioned scan band when its original records and graphics agree."""
+    from hashlib import sha256
+    from docling_core.types.doc import TableCell, TableData
+
+    partitions = manifest.get('primary_source_grid_partitions', [])
+    if not partitions or reader is None or regions is None:
+        return
+    entries = ({preview['ref']: preview} if preview is not None
+               else {entry['ref']: entry for entry in manifest['tables']})
+    digests = {proof['source_record_sha256'] for proof in partitions}
+    originals = {}
+    for record in records:
+        if '<table' not in record.get('html', '').lower():
+            continue
+        digest = sha256(record['html'].encode()).hexdigest()
+        if digest in digests:
+            originals[(record['page_no'], digest)] = record['html']
+    for item in doc.tables:
+        entry = entries.get(item.self_ref, {})
+        geometry = entry.get('pdf_geometry') or {}
+        if (geometry.get('basis') != 'raster_cell_rules' or not geometry.get('source_grid_verified')
+                or geometry.get('hidden_ocr_direction_conflict')):
+            continue
+        page = entry['page']
+        fragment = entry['html'] if preview is not None else routes.get(item.self_ref, '')
+        table = BeautifulSoup(fragment, 'html.parser').table
+        if table is None:
+            continue
+        profile = api.table_profile(fragment)
+        if profile['issues'] or profile['columns'] < 4:
+            continue
+        columns = {c['column'] for c in profile['cells'] if c['header'] and c['column_span'] == 1
+                   and c['text'].casefold() == 'обозначение и изображение'}
+        if len(columns) != 1:
+            continue
+        graphic_col = columns.pop()
+        options = {(proof['source_record_sha256'], tuple(proof['row_mapping'])) for proof in partitions
+                   if proof['page'] == page and proof['source_rows'] == profile['rows']
+                   and api.overlap_ratio(proof['source_bbox'], geometry['bbox']) > .9}
+        if len(options) != 1:
+            continue
+        digest, mapping = options.pop()
+        repeated = [row for row, count in Counter(mapping).items() if count > 1]
+        if len(repeated) != 1 or (page, digest) not in originals:
+            continue
+        row_no = repeated[0]
+        physical = sorted((cell for cell in geometry['cells'] if cell['row'] == row_no),
+                          key=lambda cell: cell['column'])
+        if len(physical) != profile['columns'] or any(
+                cell['column'] != i or cell['row_span'] != 1 or cell['column_span'] != 1
+                or not cell.get('bbox') for i, cell in enumerate(physical)):
+            continue
+        clean = api.clean_table_html(str(BeautifulSoup(originals[(page, digest)], 'html.parser').table))
+        source_table = BeautifulSoup(clean, 'html.parser').table
+        if source_table is None:
+            continue
+        primary_rows = [r for r in source_table.find_all('tr') if r.find_parent('table') is source_table]
+        if len(primary_rows) != len(mapping):
+            continue
+        primary = [row.find_all('td', recursive=False) for i, row in enumerate(primary_rows) if mapping[i] == row_no]
+        original = [row for row in table.find_all('tr') if row.find_parent('table') is table][row_no]
+        nodes = original.find_all('td', recursive=False)
+        if len(nodes) != len(physical):
+            continue
+        graphic = BeautifulSoup(nodes[graphic_col].decode_contents(), 'html.parser')
+        for notice in graphic.select('.table-cell-review'):
+            notice.decompose()
+        if graphic.get_text(strip=True) or graphic.find('math'):
+            continue
+        targeted = [*primary, nodes]
+        if any(len(row) != len(physical) or any(int(c.get('rowspan', 1)) != 1
+                or int(c.get('colspan', 1)) != 1 for c in row) for row in targeted):
+            continue
+        reader.load_page(page)
+        if preview is not None:
+            rich_content = 'math, sub, sup, code, pre, table, input, textarea, select, [data-latex], [data-formula], .source-latex'
+            if any(row[graphic_col].select_one(rich_content) for row in primary):
+                continue
+            if not _complete_primary_partition(
+                    table, profile, geometry, row_no, graphic_col, digest, page, reader, regions, api):
+                continue
+        reconstructed = _reconstruct_partitioned_band(primary, nodes, physical,
+            graphic_col, page, reader, regions, api)
+        if reconstructed is None:
+            continue
+        payloads, assets, centers = reconstructed
+        markup = BeautifulSoup('', 'html.parser')
+        for index, parts in enumerate(payloads):
+            row = markup.new_tag('tr', attrs=dict(original.attrs))
+            if index:
+                row.attrs.pop('id', None)
+            row['data-pdf-page'] = str(page)
+            row['data-source-row'] = str(row_no+1)
+            for node, part in zip(nodes, parts, strict=True):
+                cell = markup.new_tag('td', attrs=dict(node.attrs))
+                if index:
+                    cell.attrs.pop('id', None)
+                cell.append(BeautifulSoup(part, 'html.parser'))
+                row.append(cell)
+            original.insert_before(row)
+        original.decompose()
+        table['data-source-logical-rows'] = 'true'
+        rendered = str(table)
+        checked = api.table_profile(rendered)
+        if checked['issues'] or checked['rows'] != profile['rows'] + len(payloads) - 1:
+            continue
+        proof = dict(page=page, ref=item.self_ref, source_row=row_no, logical_rows=len(payloads),
+            graphic_column=graphic_col, source_record_sha256=digest, anchors=centers,
+            method='aligned_primary_table_records_and_independent_source_graphic_bands')
+        if preview is not None:
+            return rendered, proof, assets
+        routes[item.self_ref] = rendered
+        item.data = TableData(num_rows=checked['rows'], num_cols=checked['columns'], table_cells=[
+            TableCell(text=c['text'], row_span=c['row_span'], col_span=c['column_span'],
+                      start_row_offset_idx=c['row'], end_row_offset_idx=c['row']+c['row_span'],
+                      start_col_offset_idx=c['column'], end_col_offset_idx=c['column']+c['column_span'],
+                      column_header=c['header']) for c in checked['cells']])
+        entry.update(html=rendered, selected=checked)
+        manifest.setdefault('typed_table_picture_assets', []).extend(assets)
+        manifest['table_assembly_reviews'] = [warning for warning in manifest.get('table_assembly_reviews', [])
+            if (warning.get('page'), warning.get('ref'), warning.get('row'), warning.get('column'))
+            != (page, item.self_ref, row_no, graphic_col)]
+        manifest.setdefault('partitioned_graphic_row_repairs', []).append(proof)
+        api.diagnostic_event('TABLE_GRAPHIC_ROWS_RECONSTRUCTED', **proof)
+

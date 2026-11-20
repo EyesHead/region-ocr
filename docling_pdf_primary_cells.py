@@ -1,4 +1,4 @@
-"""Read missing mixed-table text on exact physical cell crops with primary Surya."""
+"""Read missing mixed-table text on exact physical cell crops."""
 from copy import deepcopy
 import hashlib
 import math
@@ -6,6 +6,8 @@ import re
 from time import monotonic
 
 from bs4 import BeautifulSoup
+
+from docling_pdf_ocr import output_within_request_budget
 
 POSITION = ('row', 'column', 'row_span', 'column_span')
 GRAPHIC_HEADING = re.compile(r'изображен|обозначен|эскиз|схема|черт[её]ж|drawing|sketch|diagram|symbol', re.I)
@@ -45,74 +47,6 @@ def _cell_text_ink(source_image, region, box):
     return covered / np.count_nonzero(mask) >= .97
 
 
-def _whole_table_proposals(args, image, region, physical, header_rows, graphic_columns, page, api):
-    """A unique physical prose cell can own multiple primary display rows.
-
-    Source rails, rather than the model's header/row guesses, own the content.
-    This route requires one owner in each eligible column and matching source
-    text-line bands. Multiple source owners are never guessed from row order.
-    """
-    owners = {}
-    for key, cell in physical.items():
-        if cell['row'] >= header_rows and not graphic_columns.intersection(range(key[1], key[1]+key[3])):
-            owners.setdefault((key[1], key[3]), []).append((key, cell))
-    if not owners or any(len(values) != 1 for values in owners.values()):
-        return {}
-    key = hashlib.sha256(f'primary-table:{image.size}:'.encode()+image.convert('RGB').tobytes()).hexdigest()
-    model = getattr(args, 'surya_ocr_model', None)
-    if model is None: return {}
-    from surya.inference.schema import BatchInputItem, PROMPT_TYPE_BLOCK
-    started = monotonic()
-    api.diagnostic_event('PRIMARY_TABLE_CROP_REQUEST', page=page, bbox=region, max_tokens=4096)
-    outputs = api.local_surya_backend(model).generate([BatchInputItem(image=image,
-        prompt_type=PROMPT_TYPE_BLOCK, max_tokens=4096, metadata=dict(page=page, element='source_table_crop'))])
-    if len(outputs) != 1 or outputs[0].error or outputs[0].token_count >= 4096:
-        raise RuntimeError('Primary table crop OCR did not finish')
-    saved = dict(image_sha256=key, raw=outputs[0].raw,
-                 response_sha256=hashlib.sha256(outputs[0].raw.encode()).hexdigest(),
-                 token_count=outputs[0].token_count, elapsed=round(monotonic()-started, 3))
-    from surya.inference.parsers import clean_block_html
-    parsed = BeautifulSoup(clean_block_html(saved['raw']), 'html.parser')
-    if len(parsed.find_all('table')) != 1: return {}
-    primary = api.table_profile(str(parsed.table))
-    if primary['issues'] or primary['columns'] != len({x for c in physical.values()
-            for x in range(c['column'], c['column']+c['column_span'])}): return {}
-    proposals = {}
-    for (column, span), [(position, cell)] in owners.items():
-        readings = [c for c in primary['cells'] if not c.get('header') and c['text'].strip()
-                    and c['column'] == column and c['column_span'] == span]
-        if not readings or any(BeautifulSoup(c['html'], 'html.parser').find(['img','svg','table']) for c in readings):
-            continue
-        # Distinct source line bands reject hallucinated extra display rows.
-        import numpy as np
-        sx, sy = image.width/(region[2]-region[0]), image.height/(region[3]-region[1])
-        b = cell['bbox']
-        bounds = (max(0, math.ceil((b[0]-region[0]+1.5)*sx)),
-                  max(0, math.ceil((b[1]-region[1]+1.5)*sy)),
-                  min(image.width, math.floor((b[2]-region[0]-1.5)*sx)),
-                  min(image.height, math.floor((b[3]-region[1]-1.5)*sy)))
-        band_image = image.crop(bounds)
-        try: ink = np.asarray(band_image.convert('L')) < 180
-        finally: band_image.close()
-        if not ink.size: continue
-        occupied = np.count_nonzero(ink, axis=1) >= max(2, ink.shape[1]*.004)
-        bands = [];start = None
-        for y, value in enumerate(list(occupied)+[False]):
-            if value and start is None: start = y
-            elif not value and start is not None:
-                if y-start >= 3: bands.append((start,y))
-                start = None
-        if len(bands) != len(readings): continue
-        content = '<br/>'.join(c['html'] for c in readings)
-        proof = dict(method='primary_table_prose_on_unique_physical_source_cell',
-            source_bbox=list(cell['bbox']), primary_table_bbox=list(region),
-            response_sha256=saved['response_sha256'], image_sha256=key,
-            source_text_line_bands=len(bands), primary_display_rows=len(readings),
-            page=page, row=position[0], column=position[1])
-        proposals[position] = content, proof
-    return proposals
-
-
 def _read_cell_unverified(args, source_image, region, cell, page, api):
     box = cell['bbox']
     sx, sy = source_image.width/(region[2]-region[0]), source_image.height/(region[3]-region[1])
@@ -136,7 +70,7 @@ def _read_cell_unverified(args, source_image, region, cell, page, api):
         outputs = api.local_surya_backend(model).generate([BatchInputItem(image=crop,
             prompt_type=PROMPT_TYPE_BLOCK, max_tokens=2048,
             metadata=dict(page=page, element='source_table_cell', row=cell['row'], column=cell['column']))])
-        if len(outputs) != 1 or outputs[0].error or outputs[0].token_count >= 2048:
+        if len(outputs) != 1 or not output_within_request_budget(outputs[0], 2048):
             raise RuntimeError('Primary source-cell OCR did not finish')
         saved = dict(image_sha256=key, raw=outputs[0].raw,
                      response_sha256=hashlib.sha256(outputs[0].raw.encode()).hexdigest(),
@@ -190,7 +124,7 @@ def _detail_response(args, crop, page, cell, api, kind, max_tokens=256):
     outputs = api.local_surya_backend(model).generate([BatchInputItem(image=crop, prompt_type=PROMPT_TYPE_BLOCK,
         max_tokens=max_tokens, metadata=dict(page=page, element='source_table_cell', row=cell['row'],
                                            column=cell['column'], reading=kind))])
-    if len(outputs) != 1 or outputs[0].error or outputs[0].token_count >= max_tokens:
+    if len(outputs) != 1 or not output_within_request_budget(outputs[0], max_tokens):
         return None
     return dict(image_sha256=key, raw=outputs[0].raw,
         response_sha256=hashlib.sha256(outputs[0].raw.encode()).hexdigest(),
@@ -305,7 +239,7 @@ def _reading_is_short(parsed, crop):
     return count>=12 and chars/count<.65
 
 
-def _complete_line_reading(args,crop,page,cell,api):
+def _complete_line_reading(args,crop,page,cell,api, *, allow_fast=False):
     """Cover every original text-line band when a whole-cell read is partial."""
     import numpy as np
     from surya.inference.parsers import clean_block_html
@@ -322,11 +256,40 @@ def _complete_line_reading(args,crop,page,cell,api):
         if joined and (band[1]-band[0]<typical*.45 or joined[-1][1]-joined[-1][0]<typical*.45) and band[0]-joined[-1][1]<typical*.6:
             joined[-1][1]=band[1]
         else:joined.append(band)
-    contents=[];responses=[]
+    boxes=[]
     for top,bottom in joined:
         xs=np.flatnonzero(mask[top:bottom].any(axis=0))
         if not len(xs):return None
-        box=(max(0,int(xs.min())-6),max(0,top-6),min(crop.width,int(xs.max())+7),min(crop.height,bottom+6))
+        boxes.append((max(0,int(xs.min())-6),max(0,top-6),
+                      min(crop.width,int(xs.max())+7),min(crop.height,bottom+6)))
+    fast={}
+    if allow_fast:
+        from docling_pdf_grid_ocr import grid_batch_enabled, read_confirmed_lines, source_cell_ink
+        if grid_batch_enabled(args) and not ((source_cell_ink(crop) != 0) & (mask == 0)).any():
+            copies=[crop.crop(box) for box in boxes]
+            started=monotonic()
+            try:
+                fast=read_confirmed_lines(copies,line_ink=source_cell_ink)
+            except Exception as error:
+                api.diagnostic_event('GRID_CELL_LINE_BATCH_FAILED',page=page,error=str(error))
+            finally:
+                for copy in copies:copy.close()
+            stats=getattr(args,'grid_cell_line_ocr',None)
+            if stats is None:
+                stats=args.grid_cell_line_ocr={'batches':0,'candidates':0,'accepted_lines':0,'seconds':0.}
+            stats['batches']+=1
+            stats['candidates']+=len(boxes)
+            stats['accepted_lines']+=len(fast)
+            stats['seconds']=round(stats['seconds']+monotonic()-started,4)
+            api.diagnostic_event('GRID_CELL_LINE_BATCH',page=page,row=cell['row'],
+                                 column=cell['column'],accepted=len(fast),candidates=len(boxes))
+    contents=[];responses=[];methods=[]
+    for index, box in enumerate(boxes):
+        if index in fast:
+            contents.append(fast[index])
+            responses.append(hashlib.sha256(fast[index].encode()).hexdigest())
+            methods.append('occular')
+            continue
         line=crop.crop(box)
         try:
             scaled=line.resize((line.width*2,line.height*2))
@@ -358,8 +321,9 @@ def _complete_line_reading(args,crop,page,cell,api):
                 ordered.replace_with(BeautifulSoup(payload,'html.parser'))
             if _reading_is_short(parsed,line):return None
             contents.append(str(parsed));responses.append(saved['response_sha256'])
+            methods.append('surya')
         finally:line.close()
-    return '<br/>'.join(contents),responses
+    return '<br/>'.join(contents),responses,methods
 
 
 def _read_cell(args, source_image, region, cell, page, api):
@@ -385,10 +349,13 @@ def _read_cell(args, source_image, region, cell, page, api):
     try:
         if result and not singleton:
             if not _reading_is_short(parsed,crop):return result
-            complete=_complete_line_reading(args,crop,page,cell,api)
+            complete=_complete_line_reading(args,crop,page,cell,api,
+                allow_fast=cell.get('_source_cell_role')=='text' and not parsed.find(['math','sup','sub']))
             if complete is None:return None
-            content,responses=complete;proof=dict(result[1])
+            content,responses,methods=complete;proof=dict(result[1])
             proof.update(complete_source_line_responses=responses,source_text_lines=len(responses))
+            if 'occular' in methods:
+                proof['complete_source_line_methods'] = methods
             return content,proof
         prefix=_prefix_view(crop)
         if prefix is None:return None
@@ -613,11 +580,79 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
         return bool(node.get_text(strip=True) or node.find(['img', 'math']))
 
     proposals, unresolved = {}, []
+    from docling_pdf_grid_ocr import grid_batch_enabled, read_confirmed_cells, source_cell_ink
+    use_batch = grid_batch_enabled(args)
+    fast, source_proofs = {}, {}
+
+    def prepare_batch(keys, role):
+        if not use_batch:
+            return
+        eligible = []
+        for key in keys:
+            cell, node = physical[key], nodes[key]
+            if (node.find(['math', 'sup', 'sub', 'table', 'input', 'svg'])
+                    or node.select_one('[data-cell-content="source-diagram"]')):
+                continue
+            assets = [asset for asset in original.get('retained_cell_images', [])
+                      if (asset.get('row'), asset.get('column')) == key[:2]]
+            images = node.find_all('img')
+            if images or assets:
+                if (len(images) != 1 or len(assets) != 1
+                        or images[0].get('data-source-cell') != 'true'
+                        or node.get_text(strip=True)
+                        or assets[0].get('basis') not in {
+                            'nonempty_scan_cell_without_positioned_text',
+                            'visible_scan_pixels_without_hidden_ocr_authority'}
+                        or assets[0].get('mixed_source_html')
+                        or assets[0].get('source_column_context', {}).get('graphic_column')
+                        or assets[0].get('source_column_context', {}).get('dimension_column')
+                        or any((asset.get('row'), asset.get('column')) == key[:2]
+                               for asset in original.get('source_graphic_assets', []))):
+                    continue
+                if (assets[0].get('basis') == 'visible_scan_pixels_without_hidden_ocr_authority'
+                        and (not original.get('page_scan_transcription_required')
+                             or not cell.get('scan_layout_has_ink')
+                             or assets[0].get('bbox') != list(cell['bbox']))):
+                    continue
+            elif cell.get('source_text_unreliable'):
+                continue
+            prior = BeautifulSoup(cell.get('pending_primary_html') or '', 'html.parser')
+            if prior.find(['math', 'sup', 'sub', 'table', 'input', 'svg', 'img']):
+                continue
+            positioned = source_reading(cell)
+            if positioned:
+                source_proofs[key] = positioned
+            else:
+                reference = prior.get_text(' ', strip=True)
+                if not reference and not cell.get('source_text_unreliable'):
+                    reference = node.get_text(' ', strip=True)
+                eligible.append((cell, role, reference))
+        if not eligible:
+            return
+        started = monotonic()
+        try:
+            readings = read_confirmed_cells(source_image, region, eligible, page, line_ink=source_cell_ink)
+        except Exception as error:
+            api.diagnostic_event('GRID_CELL_BATCH_FAILED', page=page, role=role, error=str(error))
+            return
+        if role == 'header':
+            readings = {key: reading for key, reading in readings.items()
+                        if any(pattern.search(BeautifulSoup(reading[0], 'html.parser').get_text(' ', strip=True))
+                               for pattern in (TEXT_HEADING, GRAPHIC_HEADING))}
+        fast.update(readings)
+        ledger = manifest.setdefault('grid_table_ocr', {'batches': 0, 'candidates': 0, 'accepted_cells': 0, 'seconds': 0.})
+        ledger['batches'] += 1
+        ledger['candidates'] += len(eligible)
+        ledger['seconds'] = round(ledger['seconds'] + monotonic() - started, 4)
+        api.diagnostic_event('GRID_CELL_BATCH', page=page, role=role,
+                             candidates=len(eligible), accepted=len(readings))
 
     def read_cell(cell, role):
+        key = tuple(cell[k] for k in POSITION)
         try:
-            return source_reading(cell) or _read_cell(args, source_image, region,
-                                                     dict(cell, _source_cell_role=role), page, api)
+            return (source_proofs.get(key) or fast.get(key) or source_reading(cell)
+                    or _read_cell(args, source_image, region,
+                                  dict(cell, _source_cell_role=role), page, api))
         except RuntimeError as error:
             if not (str(error).startswith('Local block request failed after retry:')
                     or str(error) == 'Primary source-cell OCR did not finish'):
@@ -628,9 +663,11 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
                 row=cell['row'], column=cell['column'], error_type=type(error).__name__, error=str(error))
             return None
 
-    for key, c in physical.items():
-        if c['row'] >= header_rows or proved_text(key) or not has_payload(key):
-            continue
+    headers = [key for key, c in physical.items()
+               if c['row'] < header_rows and not proved_text(key) and has_payload(key)]
+    prepare_batch(headers, 'header')
+    for key in headers:
+        c = physical[key]
         reading = read_cell(c, 'header')
         if reading is None:
             unresolved.append(dict(row=c['row'], column=c['column'], bbox=list(c['bbox']), role='header'))
@@ -651,20 +688,10 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
         # Unnamed/value columns may contain dimensioned drawings. Only a
         # textual header authorizes prose OCR; other cells keep their typed
         # source payload for the content resolver.
-        missing_prose = any(c['row'] >= header_rows and not proved_text(key) and has_payload(key)
-                            and set(range(c['column'], c['column']+c['column_span'])).issubset(text_columns)
-                            for key, c in physical.items())
-        aggregate = {}
-        if missing_prose:
-            try:
-                aggregate = _whole_table_proposals(args, source_image, region, physical, header_rows,
-                                                   set(range(cols))-text_columns, page, api)
-            except RuntimeError as error:
-                if not (str(error).startswith('Local block request failed after retry:')
-                        or str(error) == 'Primary table crop OCR did not finish'):
-                    raise
-                api.diagnostic_event('PRIMARY_TABLE_CELL_RECOVERY_UNAVAILABLE', page=page,
-                                     error_type=type(error).__name__, error=str(error))
+        body_text = [key for key, c in physical.items()
+                     if c['row'] >= header_rows and not proved_text(key) and has_payload(key)
+                     and set(range(c['column'], c['column']+c['column_span'])).issubset(text_columns)]
+        prepare_batch(body_text, 'text')
         for key, c in physical.items():
             if c['row'] < header_rows:
                 continue
@@ -681,8 +708,7 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
                     continue  # A wide drawing is never converted by row position.
             else:
                 occupied = set(range(c['column'], c['column']+c['column_span']))
-                reading = (aggregate.get(key) or read_cell(c, 'text') if occupied.issubset(text_columns)
-                           else source_reading(c))
+                reading = read_cell(c, 'text') if occupied.issubset(text_columns) else source_reading(c)
             if reading is None:
                 unresolved.append(dict(row=c['row'], column=c['column'], bbox=list(c['bbox']), role='body'))
                 continue
@@ -698,10 +724,8 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
         physical[key].update(html=content, text=node.get_text(' ', strip=True))
         if proof.get('basis') == 'positioned_pdf_text_covers_source_cell_ink':
             physical[key]['positioned_source_text'] = proof
-            manifest.setdefault('positioned_source_text_cells_recovered', []).append(dict(page=page, row=key[0], column=key[1], **proof))
         else:
             physical[key]['primary_ocr'] = proof
-            manifest.setdefault('primary_source_cell_crops_preserved', []).append(proof)
         if key[0] + key[2] == rows and key[1] == 0 and key[3] == cols and NOTE_START.match(node.get_text(' ', strip=True)):
             node['data-table-note'] = 'true'
     for key, node in nodes.items():
@@ -725,10 +749,19 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
     geometry['retained_cell_images'] = [c for c in geometry.get('retained_cell_images', [])
                                         if (c['row'], c['column']) not in positions]
     geometry['header_rows'] = header_rows
-    geometry['text_method'] = 'primary_surya_source_cell_crops'
+    geometry['text_method'] = ('verified_source_cell_crops' if fast else 'primary_surya_source_cell_crops')
     result = str(soup.table)
-    if api.table_profile(result)['issues']:
+    checked = api.table_profile(result)
+    if checked['issues'] or {tuple(c[k] for k in POSITION) for c in checked['cells']} != set(physical):
         return grafted
+    if fast:
+        manifest['grid_table_ocr']['accepted_cells'] += len(fast.keys() & proposals.keys())
+    for key, (_, proof) in proposals.items():
+        if proof.get('basis') == 'positioned_pdf_text_covers_source_cell_ink':
+            manifest.setdefault('positioned_source_text_cells_recovered', []).append(
+                dict(page=page, row=key[0], column=key[1], **proof))
+        else:
+            manifest.setdefault('primary_source_cell_crops_preserved', []).append(proof)
     api.diagnostic_event('PRIMARY_TABLE_SOURCE_CELLS_RECOVERED', page=page,
                          cells=len(proposals), graphic_columns=sorted(graphic_columns))
     return result, geometry

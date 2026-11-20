@@ -260,6 +260,8 @@ def _merge(soup, first, current, old_grid, new_grid):
             if not body:
                 first.append(target)
             target.append(child.extract())
+    if current.get('data-source-logical-rows') == 'true':
+        first['data-source-logical-rows'] = 'true'
     current.decompose()
 
 

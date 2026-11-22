@@ -189,8 +189,8 @@ def recover_unrouted_native_tables(doc,reader,regions,routes,excluded,manifest,a
     known_pages={int(page) for page in (manifest.get('pages') or doc.pages)}
     for page in sorted(known_pages):
         try:
-            native_page=reader.load_page(page)
-            if not reader.tables:continue
+            native_page=reader.page_with_tables(page)
+            if native_page is None:continue
             lines=_native_lines(reader,api)
             furniture={re.sub(r'\s+','',text.text).casefold() for text in doc.texts
                 if (getattr(text,'content_layer',None)==ContentLayer.FURNITURE or

@@ -7,6 +7,7 @@ are derived from the *published*, repaired HTML, never the pre-repair model.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import queue
@@ -32,9 +33,15 @@ SUPPORTED_EXTENSIONS = frozenset({
 })
 IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp', '.gif'})
 RESULT_MARKER = 'LOCAL_WEB_RESULT '
+ASSET_MARKER = 'LOCAL_WEB_FAST_ASSET '
+ASSET_CHUNK_BYTES = 192 * 1024
 ERROR_MARKER = 'LOCAL_WEB_ERROR '
+PROGRESS_MARKER = 'LOCAL_WEB_PROGRESS '
+PDF_MODES = ('quality', 'fast')
 
 _FAILURES = {
+    'fast_ocr': ('RapidOCR не смог прочитать страницу.',
+        'Проверьте наличие локальных моделей быстрого режима или выберите качественный режим.', True),
     'quality_match': ('Не удалось однозначно сопоставить распознанный текст таблицы.',
         'Результат не опубликован, чтобы не потерять текст. OCR сохранён; повторная сборка без исправления причины может дать ту же ошибку. Скопируйте журнал для разбора.', False),
     'quality_integrity': ('Проверка целостности таблицы или формулы не пройдена.',
@@ -318,7 +325,8 @@ def _safe_html(content: str):
 
 
 def export_formats(content: str, source: Path, destination: Path, *, pages=None,
-                   output_format=None, resource_root=None, initial_warnings=()) -> dict:
+                   output_format=None, resource_root=None, initial_warnings=(), fast_pdf_stats=None,
+                   fast_assets=None) -> dict:
     """Export requested bundles; None retains the explicit library all-formats API."""
     soup, warnings = _safe_html(content)
     if __package__:
@@ -327,7 +335,8 @@ def export_formats(content: str, source: Path, destination: Path, *, pages=None,
         from export_bundle import build_exports
     result = build_exports(str(soup), source, destination, pages=pages,
                            output_format=output_format, resource_root=resource_root,
-                           initial_warnings=list(initial_warnings) + warnings)
+                           initial_warnings=list(initial_warnings) + warnings, fast_pdf_stats=fast_pdf_stats,
+                           fast_assets=fast_assets)
     return result
 
 
@@ -356,12 +365,59 @@ def _stop_process(process):
         process.wait(timeout=2)
 
 
-def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel_event, engine_host=None) -> dict:
-    if engine_host is not None:
+class _FastAssetStream:
+    """Receive consecutive chunks from the private worker without writing binary data to its log."""
+    def __init__(self):
+        self.assets = {}
+        self.pending_name = None
+        self.pending = bytearray()
+
+    def receive(self, frame):
+        if __package__:
+            from .fast_resources import MAX_IMAGE_BYTES
+        else:
+            from fast_resources import MAX_IMAGE_BYTES
+        path, last, encoded = frame.rstrip('\r\n').split('\t', 2)
+        if (last not in ('0', '1') or not encoded or len(encoded) > 4 * ((ASSET_CHUNK_BYTES + 2) // 3)
+                or path in self.assets or self.pending_name not in (None, path)):
+            raise ValueError('Нарушена последовательность передачи изображения PDF')
+        data = base64.b64decode(encoded, validate=True)
+        if len(self.pending) + len(data) > MAX_IMAGE_BYTES:
+            raise ValueError('Изображение PDF превышает допустимый размер')
+        if last == '1' and self.pending_name is None:
+            self.assets[path] = data
+            return
+        self.pending.extend(data)
+        if last == '1':
+            self.assets[path] = bytes(self.pending)
+            self.pending.clear()
+            self.pending_name = None
+        else:
+            self.pending_name = path
+
+    def finish(self, expected):
+        if self.pending_name is not None or len(self.assets) != expected:
+            raise ValueError('Передача изображений PDF прервалась')
+        return self.assets
+
+
+def _write_fast_asset(path, data):
+    for start in range(0, len(data), ASSET_CHUNK_BYTES):
+        stop = min(start + ASSET_CHUNK_BYTES, len(data))
+        encoded = base64.b64encode(memoryview(data)[start:stop]).decode('ascii')
+        print(f'{ASSET_MARKER}{path}\t{int(stop == len(data))}\t{encoded}', flush=True)
+
+
+def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel_event, engine_host=None,
+                *, pdf_mode='quality') -> dict:
+    if engine_host is not None and pdf_mode == 'quality':
         return engine_host.run(source, destination, pages, on_progress, cancel_event)
     engine_destination = destination / 'engine'
-    engine_destination.mkdir(parents=True, exist_ok=True)
-    command = [_runtime_python(), '-u', str(Path(__file__).resolve()), '--worker', str(source), str(engine_destination)]
+    if pdf_mode == 'quality':
+        engine_destination.mkdir(parents=True, exist_ok=True)
+    command = [_runtime_python(), '-B', '-u', str(Path(__file__).resolve()), '--worker', str(source), str(engine_destination)]
+    if pdf_mode == 'fast':
+        command += ['--pdf-mode', 'fast']
     if pages:
         command += ['--pages', pages]
     environment = os.environ.copy()
@@ -382,6 +438,7 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
     started, result, read_complete = time.monotonic(), None, False
+    resource_stream = _FastAssetStream() if pdf_mode == 'fast' else None
     last_error, error_detail, failure = '', '', None
     deadline = max(60, int(os.environ.get('DOCUMENT_CONVERTER_TIMEOUT_SECONDS', '7200')))
     try:
@@ -397,8 +454,24 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
                 if line is None:
                     read_complete = True
                     continue
+                if resource_stream is not None and line.startswith(ASSET_MARKER):
+                    resource_stream.receive(line[len(ASSET_MARKER):])
+                    continue
+                if resource_stream is not None and line.startswith(RESULT_MARKER):
+                    result = json.loads(line[len(RESULT_MARKER):])
+                    result['fast_assets'] = resource_stream.finish(result.pop('asset_count', 0))
+                    # This message carries the HTML to the normal publisher. The log
+                    # stores only the counts and never duplicates the document.
+                    log.write('Fast PDF: ' + json.dumps(result['stats'], ensure_ascii=False) + '\n')
+                    log.flush()
+                    continue
                 log.write(line)
                 log.flush()
+                if line.startswith(PROGRESS_MARKER):
+                    progress = json.loads(line[len(PROGRESS_MARKER):])
+                    if on_progress:
+                        on_progress(min(90, max(3, int(progress['percent']))), progress['stage'])
+                    continue
                 if re.search(r'error:', line, re.I):
                     message = line.strip()
                     last_error = message[-800:]
@@ -433,9 +506,13 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
 
 def convert_file(source: Path, destination: Path, *, pages: str = '',
                  on_progress: Callable[[int, str], None] | None = None, cancel_event=None,
-                 output_format: str = 'html', replay_html=None, engine_host=None) -> dict:
+                 output_format: str = 'html', replay_html=None, engine_host=None, pdf_mode: str = 'quality') -> dict:
     source, destination = native_path(Path(source).resolve()), Path(destination).resolve()
     pages = _validate_pages(pages)
+    if pdf_mode not in PDF_MODES:
+        raise ValueError('Неизвестный режим обработки PDF')
+    if pdf_mode == 'fast' and source.suffix.lower() != '.pdf':
+        raise ValueError('Быстрый режим доступен только для PDF')
     _check_cancel(cancel_event)
     if not source.is_file():
         raise FileNotFoundError('Исходный файл не найден')
@@ -449,6 +526,8 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
     _check_cancel(cancel_event)
     warnings = []
     technical_status = None
+    fast_stats = {}
+    fast_assets = None
     resource_root = source.parent
     page_count = 1 if source.suffix.lower() in {'.html', '.htm'} else None
     if replay_html:
@@ -487,6 +566,12 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         content, xlsx_warnings, page_count = export_xlsx(source, check_cancel=lambda: _check_cancel(cancel_event),
                                                        assets_dir=resource_root / 'src')
         warnings.extend(xlsx_warnings)
+    elif source.suffix.lower() == '.pdf' and pdf_mode == 'fast':
+        engine = _run_engine(source, destination, pages, on_progress, cancel_event, pdf_mode='fast')
+        content, fast_stats = engine['content'], engine['stats']
+        fast_assets = engine.pop('fast_assets')
+        page_count = fast_stats['pages']
+        warnings.extend(fast_stats.pop('warnings', ()))
     else:
         engine = _run_engine(source, destination, pages, on_progress, cancel_event, engine_host=engine_host)
         content = Path(engine['html']).read_text(encoding='utf-8')
@@ -500,13 +585,49 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         on_progress(94, 'Подготовка папки результата и изображений')
     result = export_formats(content, source, destination, pages=page_count,
                             output_format=output_format, resource_root=resource_root,
-                            initial_warnings=warnings)
+                            initial_warnings=warnings, fast_pdf_stats=fast_stats, fast_assets=fast_assets)
     if technical_status:
         result['technical_status'] = technical_status
     _check_cancel(cancel_event)
     if on_progress:
         on_progress(100, 'Готово')
     return result
+
+
+def _fast_worker(source: Path, pages: str):
+    """Send content-addressed image resources and HTML over the private worker pipe."""
+    # The worker is also launched as a script by system Python. Shared caption
+    # rules live at the project root, alongside the local_web package.
+    if str(ENGINE_DIR) not in sys.path:
+        sys.path.insert(0, str(ENGINE_DIR))
+    from local_web.fast_pdf import convert_fast_pdf
+
+    def recognize(image, page_no):
+        try:
+            from local_web.fast_ocr import recognize_page_with_layout
+            return recognize_page_with_layout(image, page_no)
+        except Exception as error:
+            raise ConversionFailure(str(error), _public_failure('fast_ocr', {'page': page_no})) from error
+
+    def publish_progress(percent, stage):
+        print(PROGRESS_MARKER + json.dumps(dict(percent=percent, stage=stage), ensure_ascii=False), flush=True)
+
+    sent = set()
+    def publish_asset(path, data):
+        if path not in sent:
+            _write_fast_asset(path, data)
+            sent.add(path)
+
+    try:
+        if source.suffix.lower() != '.pdf':
+            raise ValueError('Быстрый режим доступен только для PDF')
+        content, stats = convert_fast_pdf(source, pages, ocr_page=recognize, on_progress=publish_progress,
+                                          image_assets=publish_asset)
+    except Exception as error:
+        failure = describe_conversion_failure(error)
+        print(ERROR_MARKER + json.dumps(failure, ensure_ascii=False), flush=True)
+        raise
+    print(RESULT_MARKER + json.dumps(dict(content=content, stats=stats, asset_count=len(sent)), ensure_ascii=False), flush=True)
 
 
 def _worker(source: Path, destination: Path, pages: str):
@@ -577,7 +698,11 @@ if __name__ == '__main__':
     parser.add_argument('source', type=Path)
     parser.add_argument('destination', type=Path)
     parser.add_argument('--pages', default='')
+    parser.add_argument('--pdf-mode', choices=PDF_MODES, default='quality')
     arguments = parser.parse_args()
     if not arguments.worker:
         parser.error('Internal conversion worker; start the application server instead')
-    _worker(arguments.source.resolve(), arguments.destination.resolve(), _validate_pages(arguments.pages))
+    if arguments.pdf_mode == 'fast':
+        _fast_worker(arguments.source.resolve(), _validate_pages(arguments.pages))
+    else:
+        _worker(arguments.source.resolve(), arguments.destination.resolve(), _validate_pages(arguments.pages))

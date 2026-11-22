@@ -5,6 +5,7 @@ invented; incomplete source coverage declines this recovery route.
 """
 from hashlib import sha256
 import math
+import re
 
 from bs4 import BeautifulSoup
 
@@ -22,7 +23,86 @@ def _overlap(a, b):
     return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
 
 
-def recover_primary_text_region(image, region, records, page, api):
+def _source_form_fields(entries, regions, page_no, ink_threshold):
+    """Recover printed field lengths only when the surrounding line agrees."""
+    if regions is None:
+        return []
+    candidates = []
+    for entry in entries:
+        if '__' not in entry['html']:
+            continue
+        node = BeautifulSoup(entry['html'], 'html.parser').p
+        if node is not None and node.string and not node.find() and '__' in node.string:
+            candidates.append((entry, node))
+    if not candidates:
+        return []
+
+    import pypdfium2.raw as raw
+    from pypdfium2 import PdfiumError
+    import numpy as np
+
+    proofs = []
+    page = None
+    try:
+        page = regions.pdf[page_no-1]
+        text = page.get_textpage()
+        try:
+            height = page.get_height()
+            owners = [[] for _ in candidates]
+            for i in range(text.count_chars()):
+                x0, b, x1, t = text.get_charbox(i, loose=True)
+                x, y = (x0+x1)/2, height-(t+b)/2
+                rows = [j for j, (entry, _) in enumerate(candidates)
+                        if entry['bbox'][0] <= x <= entry['bbox'][2]
+                        and entry['bbox'][1] <= y <= entry['bbox'][3]]
+                if len(rows) > 1:
+                    return []
+                if rows:
+                    owners[rows[0]].append(i)
+            for (entry, node), indices in zip(candidates, owners):
+                chars = [chr(raw.FPDFText_GetUnicode(text, i)) for i in indices]
+                literal = ''.join(chars).strip()
+                ocr = str(node.string).strip()
+                if (literal == ocr or literal.startswith('_') or literal.endswith('_')
+                        or re.sub('_+', '_', literal) != re.sub('_+', '_', ocr)):
+                    continue
+                # Each underscore must be a separate, painted PDF character
+                # whose tight glyph box contains the visible horizontal stroke.
+                previous_end = -math.inf
+                for i, char in zip(indices, chars):
+                    if char != '_':
+                        continue
+                    obj = raw.FPDFText_GetTextObject(text, i)
+                    if not obj or raw.FPDFTextObj_GetTextRenderMode(obj) != raw.FPDF_TEXTRENDERMODE_FILL:
+                        break
+                    left, bottom, right, top = text.get_charbox(i)
+                    middle = (left+right)/2
+                    if not (left < middle < right and middle > previous_end and 0 < top-bottom < right-left):
+                        break
+                    previous_end = right
+                    with regions.crop(page_no, [left, height-top, right, height-bottom]) as glyph:
+                        with glyph.convert('L') as gray:
+                            pixels = np.asarray(gray)
+                            # Ignore the outer columns rounded by the renderer.
+                            if gray.width < 3 or not (pixels[:, 1:-1] <= ink_threshold).any(axis=0).all():
+                                break
+                else:
+                    node.string.replace_with(literal)
+                    entry['html'] = str(node)
+                    proofs.append(dict(record_index=entry['index'],
+                        source_runs=[len(run) for run in re.findall('_+', literal)],
+                        primary_runs=[len(run) for run in re.findall('_+', ocr)]))
+        finally:
+            text.close()
+    except (PdfiumError, ValueError, IndexError, OverflowError):
+        pass  # The primary line remains usable without a native field-length proof.
+    finally:
+        if page is not None:
+            page.close()
+    return proofs
+
+
+def recover_primary_text_region(image, region, records, page, api, *, source_regions=None):
     """Return (HTML, proof) only for completely covered, non-grid text regions.
 
     The caller must already have ruled out a usable table candidate, a source
@@ -55,9 +135,8 @@ def recover_primary_text_region(image, region, records, page, api):
         # OCR formatting is retained, but arbitrary markup attributes are not.
         for tag in soup.find_all():
             tag.attrs = {}
-        if any(_overlap(bounds, old['bbox']) for old in selected):
-            return None
-        selected.append(dict(bbox=list(bounds), html=str(soup), record=record, index=index))
+        selected.append(dict(bbox=list(bounds), layout_bbox=list(bounds),
+                             html=str(soup), record=record, index=index))
     if not selected:
         return None
 
@@ -79,8 +158,8 @@ def recover_primary_text_region(image, region, records, page, api):
     import numpy as np
 
     with image.convert('L') as gray:
-        ink = cv2.threshold(np.asarray(gray), 0, 255,
-                            cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+        ink_threshold, ink = cv2.threshold(np.asarray(gray), 0, 255,
+                                          cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
     sx = image.width/(region[2]-region[0])
     sy = image.height/(region[3]-region[1])
     glyph_height = coverage['source_glyph_height_pixels']
@@ -99,14 +178,52 @@ def recover_primary_text_region(image, region, records, page, api):
                 source_bbox=list(box), overhang_points=overhang,
                 source_glyph_height_pixels=glyph_height, affected_source_edges_clear=True))
 
+    # Detectors may overlap the margins of two successive text lines. Resolve
+    # only vertically ordered, horizontally aligned packets separated by a
+    # clear scanline inside their common band. Keep the original OCR boxes
+    # for coverage, ownership and diagnostics.
+    selected.sort(key=lambda entry: (entry['bbox'][1], entry['bbox'][0]))
+    separators = []
+    for i, lower in enumerate(selected):
+        bx, by, br, bb = lower['bbox']
+        for upper in selected[:i]:
+            ax, ay, ar, ab = upper['bbox']
+            if not _overlap(upper['bbox'], lower['bbox']):
+                continue
+            left, right = max(ax, bx), min(ar, br)
+            if (not left < (ax+ar)/2 < right or not left < (bx+br)/2 < right
+                    or not (ay+ab)/2 < by < ab < (by+bb)/2
+                    or (ab-by)*sy > glyph_height):
+                return None
+            # Use whole pixels lying inside both vertical bounds.
+            first = max(1, math.ceil((by-region[1])*sy))
+            stop = min(image.height-1, math.floor((ab-region[1])*sy))
+            if first >= stop:
+                return None
+            x0 = max(0, math.floor((min(ax, bx)-region[0])*sx))
+            x1 = min(image.width, math.ceil((max(ar, br)-region[0])*sx))
+            top = max(0, math.ceil((ay-region[1])*sy))
+            bottom = min(image.height, math.floor((bb-region[1])*sy))
+            if (x0 >= x1 or not ink[top:first, x0:x1].any()
+                    or not ink[stop:bottom, x0:x1].any()):
+                return None
+            clear = np.flatnonzero(~ink[first:stop, x0:x1].any(axis=1))
+            if not len(clear):
+                return None
+            cut = region[1]+(first+int(clear[len(clear)//2])+.5)/sy
+            upper['layout_bbox'][3] = min(upper['layout_bbox'][3], cut)
+            lower['layout_bbox'][1] = max(lower['layout_bbox'][1], cut)
+            separators.append(dict(above=upper['index'], below=lower['index'], y=cut))
+
     # Source boxes define row bands, including side-by-side title/identifier
     # blocks whose tops differ. A pure top/left sort would reverse that row.
     rows = []
-    for entry in sorted(selected, key=lambda value: (value['bbox'][1], value['bbox'][0])):
-        if rows and entry['bbox'][1] < max(old['bbox'][3] for old in rows[-1]):
+    for entry in sorted(selected, key=lambda value: (value['layout_bbox'][1], value['bbox'][0])):
+        if rows and entry['layout_bbox'][1] < max(old['layout_bbox'][3] for old in rows[-1]):
             rows[-1].append(entry)
         else:
             rows.append([entry])
+    form_fields = _source_form_fields(selected, source_regions, page, ink_threshold)
     width = region[2] - region[0]
     output = ['<div class="primary-text-region">']
     ordered = []
@@ -137,7 +254,7 @@ def recover_primary_text_region(image, region, records, page, api):
         record_sha256=[sha256(entry['record']['html'].encode()).hexdigest() for entry in ordered],
         record_bboxes=[entry['bbox'] for entry in ordered],
         record_labels=[entry['record'].get('label') for entry in ordered],
-        boundary_repairs=boundary_repairs,
+        boundary_repairs=boundary_repairs, row_separators=separators, source_form_fields=form_fields,
         source_rgb_sha256=sha256(image.tobytes()).hexdigest(),
         html_sha256=sha256(fragment.encode()).hexdigest(), **coverage)
     return fragment, proof

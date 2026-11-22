@@ -54,7 +54,46 @@ def _visible_source_word(regions, page_no, word):
         return False
 
 
-def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest):
+_DESIGNATION = re.compile(r'(?<!\w)[A-Za-zА-Яа-яЁё]+[0-9][A-Za-zА-Яа-яЁё0-9]*(?!\w)')
+_PROSE_HOMOGLYPHS = str.maketrans('АВСЕНКМОРТХасеорху', 'ABCEHKMOPTXaceopxy')
+
+
+def _restore_source_designation(paragraph, words, page, regions, manifest):
+    """Restore one letter in a designation in otherwise identical native prose."""
+    if len(paragraph.contents) != 1 or paragraph.find(True) or paragraph.string is None:
+        return False
+    plain = str(paragraph.string)
+    if not _DESIGNATION.search(plain) or '<math' in plain:
+        return False
+    native = [(ch, word) for word in words for ch in word['text'] if not ch.isspace()]
+    # The serializer prints a list marker through CSS, outside the text node.
+    prefix = ''
+    if paragraph.name == 'li':
+        marker = re.search(r"(?:^|;)\s*list-style-type:\s*'(\d+(?:\.\d+)*\.?)\s*'", paragraph.get('style',''))
+        if marker:
+            prefix = marker[1]+' '
+    positions = [(i-len(prefix), c) for i, c in enumerate(prefix+plain) if not c.isspace()]
+    if len(native) != len(positions):
+        return False
+    differences = [(i, before, after, word) for (i, before), (after, word) in zip(positions, native)
+                   if before != after]
+    if len(differences) != 1:
+        return False
+    i, before, after, word = differences[0]
+    if i < 0 or before.translate(_PROSE_HOMOGLYPHS) != after.translate(_PROSE_HOMOGLYPHS):
+        return False
+    match = next((m for m in _DESIGNATION.finditer(plain) if m.start() <= i < m.end()), None)
+    if (match is None or plain[match.start():i]+after+plain[i+1:match.end()] != word['text']
+            or not _visible_source_word(regions, page, word)):
+        return False
+    paragraph.string.replace_with(plain[:i]+after+plain[i+1:])
+    manifest.setdefault('source_prose_corrections', []).append(dict(
+        page=page, bbox=[word[k] for k in ('x0','top','x1','bottom')],
+        before=match[0], after=word['text'], method='painted_native_designation_in_matching_paragraph'))
+    return True
+
+
+def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest, *, scan_witness=None):
     """Recover a misread word when its visible source and neighboring words agree."""
     from collections import Counter
     from pdfplumber.utils import extract_words
@@ -65,8 +104,10 @@ def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest):
              if not node.find_parent(['math', 'sub', 'sup', 'code', 'pre', 'a', 'svg'])]
     if not any(len(matches) >= 5 for _, matches in spans):
         return False
-    source = [word for word in extract_words(glyphs, return_chars=True, split_at_punctuation=True)
-              if _PROSE_WORD.fullmatch(word['text'])]
+    words = extract_words(glyphs, return_chars=True, split_at_punctuation=True)
+    if not scan_witness and _restore_source_designation(paragraph, words, page_no, regions, manifest):
+        return True
+    source = [word for word in words if _PROSE_WORD.fullmatch(word['text'])]
     def neighbors(a, b):
         em = max(a['bottom'] - a['top'], b['bottom'] - b['top'])
         dy = b['top'] - a['top']
@@ -102,7 +143,9 @@ def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest):
             # surrounding prose on this line even if inline math precedes it.
             cross_script = before.isascii() and all(re.fullmatch(r'[А-Яа-яЁё]+', matches[i + j][0])
                                                      for j in edge)
-            offsets = edge if cross_script else balanced
+            if scan_witness and not cross_script:
+                continue
+            offsets = edge if cross_script and not scan_witness else balanced
             if i + min(offsets) < 0:
                 continue
             key = offsets, tuple(matches[i + j][0] for j in offsets)
@@ -116,16 +159,118 @@ def _restore_prose_words(paragraph, glyphs, page_no, box, regions, manifest):
                     continue
             elif len(before) != len(after) or sum(a != b for a, b in zip(before, after)) != 1:
                 continue
-            if not _visible_source_word(regions, page_no, word):
+            method = 'painted_word_two_pdf_readers_and_crop_ink'
+            evidence = {}
+            if scan_witness:
+                evidence = scan_witness(before, word)
+                if not evidence:
+                    continue
+                method = 'source_context_and_matching_independent_ocr_word_image'
+            elif not _visible_source_word(regions, page_no, word):
                 continue
             value = value[:match.start()] + after + value[match.end():]
             manifest.setdefault('source_prose_corrections', []).append(dict(
                 page=page_no, bbox=[word[k] for k in ('x0', 'top', 'x1', 'bottom')],
-                before=before, after=after, method='painted_word_two_pdf_readers_and_crop_ink'))
+                before=before, after=after, method=method, **evidence))
         if value != str(node):
             node.replace_with(value)
             changed = True
     return changed
+
+
+def _word_image(regions, page, box):
+    import cv2
+    import numpy as np
+
+    with regions.crop(page, box, scale=5.) as image, image.convert('L') as gray:
+        mask = cv2.threshold(np.asarray(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    x, y, width, height = cv2.boundingRect(mask)
+    if width < 8 or height < 4:
+        return None
+    return (width / height, cv2.resize(mask[y:y+height, x:x+width], (100, 28), interpolation=cv2.INTER_AREA))
+
+
+def _scan_word_witness(before, word, words, records, page, regions):
+    """Require the same printed Cyrillic spelling in an independently read region."""
+    import cv2
+    import math
+
+    simple = str.maketrans('абвгдезийклмнопрстуфхыэ', 'abvgdezijklmnoprstufhye')
+    after = word['text']
+    if after.lower().translate(simple) != before.lower():
+        return None
+    box = [word[k] for k in ('x0', 'top', 'x1', 'bottom')]
+    image = _word_image(regions, page, box)
+    if image is None:
+        return None
+    def contains(bounds, center):
+        return bounds[0] <= center[0] <= bounds[2] and bounds[1] <= center[1] <= bounds[3]
+    centers = lambda b: ((b[0]+b[2])/2, (b[1]+b[3])/2)
+    candidates = []
+    for other in words:
+        matches = [m for m in _PROSE_WORD.finditer(other['text']) if m[0] == after]
+        if len(matches) != 1 or len(other['chars']) != len(other['text']):
+            continue
+        chars = other['chars'][matches[0].start():matches[0].end()]
+        candidates.append([min(g['x0'] for g in chars), min(g['top'] for g in chars),
+                           max(g['x1'] for g in chars), max(g['bottom'] for g in chars)])
+    for record in records:
+        bounds = record.get('bbox')
+        if (record.get('page_no') != page or record.get('label') not in ('Text', 'Table')
+                or not bounds or contains(bounds, centers(box))
+                or _PROSE_WORD.findall(record.get('text', '')).count(after) != 1):
+            continue
+        located = [b for b in candidates if contains(bounds, centers(b))]
+        if len(located) != 1:
+            continue
+        witness = _word_image(regions, page, located[0])
+        if witness is None or abs(math.log(image[0] / witness[0])) > .15:
+            continue
+        if not image[1].std() or not witness[1].std():
+            continue
+        score = float(cv2.matchTemplate(image[1], witness[1], cv2.TM_CCOEFF_NORMED)[0, 0])
+        if score >= .85:
+            return dict(witness_bbox=located[0], template_correlation=round(score, 4))
+    return None
+
+
+def restore_owned_prose_words(soup, manifest, records, reader, regions):
+    """Check a published table paragraph against its uniquely owned OCR packet."""
+    from collections import defaultdict
+    from hashlib import sha256
+    from pdfplumber.utils import extract_words
+
+    if reader is None or regions is None:
+        return
+    owners = defaultdict(set)
+    for proof in manifest.get('typed_table_primary_ownership', []):
+        owners[(proof['page'], tuple(proof['source_bbox']), proof['source_record_sha256'])].add(proof['ref'])
+    cached_page, words = None, []
+    for record in records or ():
+        if (record.get('label') != 'Text' or not record.get('bbox') or not record.get('html')
+                or not re.search(r'\b[A-Za-z]{4,}\b', record.get('text', ''))):
+            continue
+        page, box = record['page_no'], record['bbox']
+        refs = owners.get((page, tuple(box), sha256(record['html'].encode()).hexdigest()))
+        if not refs or len(refs) != 1:
+            continue
+        tables = soup.find_all('table', attrs={'data-pdf-table-ref': next(iter(refs))})
+        if len(tables) != 1:
+            continue
+        original = BeautifulSoup(record['html'], 'html.parser').get_text(' ', strip=True)
+        paragraphs = [p for p in tables[0].find_all('p') if p.find_parent('table') is tables[0]
+                      and p.get_text(' ', strip=True) == original]
+        if len(paragraphs) != 1:
+            continue
+        if page != cached_page:
+            reader.load_page(page)
+            words = extract_words(reader.chars, return_chars=True, split_at_punctuation=True)
+            cached_page = page
+        glyphs = [g for g in reader.chars if box[0] <= (g['x0']+g['x1'])/2 <= box[2]
+                  and box[1] <= (g['top']+g['bottom'])/2 <= box[3]]
+        if glyphs and all(g.get('upright', True) for g in glyphs):
+            _restore_prose_words(paragraphs[0], glyphs, page, box, regions, manifest,
+                scan_witness=lambda before, word: _scan_word_witness(before, word, words, records, page, regions))
 
 
 def _restore_inline_source_letter(paragraph, glyphs, page, regions, manifest):
@@ -277,6 +422,112 @@ def restore_native_paragraph(fragment, reader, region, regions, manifest, *, con
     return str(soup)
 
 
+def _tagged_body_ids(page, glyphs, source_glyphs, value, anchors, api):
+    """Verify disputed body text against the tagged PDF, without altering table-owned text."""
+    from collections import defaultdict
+    from functools import lru_cache
+    from pdfminer.pdftypes import PDFException, PDFObjRef
+    from pdfminer.psparser import literal_name
+
+    if not glyphs or any(g.get('tag') == 'Artifact' or type(g.get('mcid')) is not int for g in glyphs):
+        return None
+    ids = {g['mcid'] for g in glyphs}
+    groups = defaultdict(list)
+    for g in source_glyphs:
+        if type(g.get('mcid')) is int:
+            groups[g['mcid']].append(g)
+    if sum(len(groups[i]) for i in ids) != len(glyphs):
+        return None
+    literal = ''.join(line['text'] for line in api.native_cell_lines(glyphs))
+    if ''.join(literal.split()) != ''.join(value.split()):
+        return None
+    top = min(g['top'] for g in glyphs)
+    bottom = max(g['bottom'] for g in glyphs)
+    artifacts = [g for g in source_glyphs if g.get('tag') == 'Artifact']
+    if (not any(g['bottom'] <= top for g in artifacts)
+            or any(g['top'] < bottom and g['bottom'] > top for g in artifacts)):
+        return None
+    following = [box for _, box, item in anchors if box[1] >= bottom
+                 and str(getattr(item, 'label', '')) in {'text', 'section_header', 'list_item', 'title'}
+                 and getattr(item, 'content_layer', None) == 'body']
+    if not following:
+        return None
+
+    def resolved(obj):
+        return obj.resolve() if isinstance(obj, PDFObjRef) else obj
+
+    # Walk just the page's number-tree branch. Invalid or cyclic references
+    # cannot turn an unverified margin into a body paragraph.
+    try:
+        root = resolved(page.pdf.doc.catalog.get('StructTreeRoot'))
+        key = page.page_obj.attrs.get('StructParents')
+        if not isinstance(root, dict) or type(key) is not int:
+            return None
+        pending, visited, owners = [root.get('ParentTree')], set(), []
+        while pending:
+            branch = resolved(pending.pop())
+            if not isinstance(branch, dict) or id(branch) in visited:
+                return None
+            visited.add(id(branch))
+            limits = resolved(branch.get('Limits'))
+            if limits is not None and not limits[0] <= key <= limits[1]:
+                continue
+            nums = resolved(branch.get('Nums', []))
+            if len(nums) % 2:
+                return None
+            owners.extend(resolved(v) for k, v in zip(nums[::2], nums[1::2]) if k == key)
+            pending.extend(resolved(branch.get('Kids', [])))
+        if len(owners) != 1 or not isinstance(owners[0], list):
+            return None
+
+        @lru_cache(maxsize=None)
+        def roles(mcid):
+            if not 0 <= mcid < len(owners[0]):
+                return set()
+            ref = owners[0][mcid]
+            node = resolved(ref)
+            if (not isinstance(node, dict) or type(node.get('K')) is not int or node['K'] != mcid
+                    or getattr(node.get('Pg'), 'objid', None) != page.page_obj.pageid):
+                return set()
+            path, seen = set(), set()
+            while isinstance(node, dict) and node is not root:
+                if id(node) in seen or 'S' not in node:
+                    return set()
+                seen.add(id(node))
+                path.add(literal_name(node['S']))
+                if not isinstance(ref, PDFObjRef):
+                    return set()
+                child_id = ref.objid
+                ref = node.get('P')
+                node = resolved(ref)
+                children = node.get('K') if isinstance(node, dict) else None
+                children = children if isinstance(children, list) else (children,)
+                if not any(isinstance(c, PDFObjRef) and c.objid == child_id for c in children):
+                    return set()
+            return path if node is root and 'Document' in path else set()
+
+        for i in ids:
+            path = roles(i)
+            if not path or not path.issubset({'Document', 'Part', 'Art', 'Sect', 'Div', 'NonStruct',
+                                            'P', 'H', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'Span'}):
+                return None
+        for i, group in groups.items():
+            if max(g['bottom'] for g in group) <= top and roles(i).intersection(
+                    {'P', 'H', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH', 'LI', 'LBody'}):
+                break
+        else:
+            return None
+        for i, group in groups.items():
+            if min(g['top'] for g in group) < bottom or not roles(i):
+                continue
+            if any(all(b[0] <= (g['x0'] + g['x1']) / 2 <= b[2] and
+                       b[1] <= (g['top'] + g['bottom']) / 2 <= b[3] for g in group) for b in following):
+                return sorted(ids)
+    except (AttributeError, KeyError, TypeError, ValueError, IndexError, PDFException, RecursionError):
+        return None
+    return None
+
+
 def page_furniture_parts(parts, doc, reader, regions, pages, manifest, api, make_part):
     """Place printed margin text between its actual source-page blocks."""
     from collections import defaultdict
@@ -293,6 +544,18 @@ def page_furniture_parts(parts, doc, reader, regions, pages, manifest, api, make
     removed = defaultdict(list)
     for entry in manifest.get('removed_page_furniture', []):
         removed[entry['page']].append(entry)
+    section_refs = {item.self_ref for item in doc.texts if str(item.label) == 'section_header'}
+    disputed = {_key(e['text']) for entries in removed.values() for e in entries
+                if e.get('reason') == 'ocr_furniture' and e.get('ref') in section_refs}
+    unique_headers = {}
+    if disputed:
+        matches = defaultdict(list)
+        for record in manifest.get('ocr_blocks', []):
+            text = _key(record.get('text') or '')
+            if text in disputed:
+                matches[text].append(record)
+        unique_headers = {text: records[0] for text, records in matches.items()
+                          if len(records) == 1 and records[0].get('label') == 'PageHeader'}
     inserts = defaultdict(list)
     published = []
     for page in sorted(pages):
@@ -347,10 +610,22 @@ def page_furniture_parts(parts, doc, reader, regions, pages, manifest, api, make
                 slot = min((index for later, items in anchors.items() if later > page
                             for index, _, _ in items), default=len(parts))
             coords = ','.join(f'{v:.3f}' for v in box)
-            fragment = (f'<p data-page-furniture="true" data-source-page="{page}" '
+            ids = None
+            header = unique_headers.get(_key(value))
+            if (glyphs and entry.get('reason') == 'ocr_furniture' and entry.get('ref') in section_refs
+                    and header and header.get('page_no') == page
+                    and api.overlap_ratio(header['bbox'], entry['bbox']) > .75):
+                ids = _tagged_body_ids(reader.page, glyphs, source_glyphs, value, anchors[page], api)
+            attributes = ' data-page-furniture="true"' if ids is None else ''
+            fragment = (f'<p{attributes} data-source-page="{page}" '
                         f'data-source-bbox="{coords}">{escape(value)}</p>')
             inserts[slot].append(make_part(text=fragment))
-            published.append(dict(page=page, bbox=box, text=value))
+            if ids is None:
+                published.append(dict(page=page, bbox=box, text=value))
+            else:
+                proof = dict(page=page, ref=entry['ref'], bbox=box, mcids=ids)
+                manifest.setdefault('published_tagged_body_text', []).append(proof)
+                api.diagnostic_event('TAGGED_BODY_PARAGRAPH_RETAINED', **proof)
     manifest['published_page_furniture'] = published
     result = []
     for index, part in enumerate(parts):
@@ -495,8 +770,72 @@ def _flow_region(item, doc, excluded, api, visiting=None):
                           max(r[1][2] for r in regions), max(r[1][3] for r in regions)]
 
 
+def _heading_followers(records):
+    from collections import defaultdict
+
+    pages = defaultdict(list)
+    for record in records:
+        if record.get('label') not in {'PageHeader', 'PageFooter'}:
+            pages[record.get('page_no')].append(record)
+    followers = {}
+    for page, blocks in pages.items():
+        # Overlapping bands or a second column make vertical order ambiguous.
+        if any(not block.get('bbox') or len(block['bbox']) != 4 for block in blocks):
+            continue
+        if any(a['bbox'][3] > b['bbox'][1] for a, b in zip(blocks, blocks[1:])):
+            continue
+        for heading, following in zip(blocks, blocks[1:]):
+            if heading.get('label') == 'SectionHeader' and following.get('label') in {'SectionHeader', 'Text'}:
+                key = _heading_key(page, heading['bbox'])
+                followers[key] = (_heading_key(page, following['bbox']), heading, following)
+    return followers
+
+
+def _heading_key(page, box):
+    return page, tuple(round(v, 3) for v in box)
+
+
+def _restore_heading_order(parent, doc, regions, followers, excluded, manifest):
+    from docling_core.types.doc import ContentLayer
+
+    if not followers:
+        return
+    items = [ref.resolve(doc) for ref in parent.children]
+    positions = {item.self_ref: i for i, item in enumerate(items)}
+    by_source = {}
+    for item in items:
+        region = regions[item.self_ref]
+        if region and getattr(item, 'text', '') and len(item.prov) == 1:
+            by_source.setdefault(_heading_key(*region), []).append(item)
+    for key, headings in by_source.items():
+        if key not in followers or len(headings) != 1:
+            continue
+        next_key, primary_heading, primary_next = followers[key]
+        following = by_source.get(next_key, [])
+        if len(following) != 1:
+            continue
+        heading, anchor = headings[0], following[0]
+        if str(heading.label) != 'section_header' or heading.children:
+            continue
+        left, right = positions[anchor.self_ref], positions[heading.self_ref]
+        if (left >= right or _key(primary_heading.get('text') or '') != _key(heading.text)
+                or _key(primary_next.get('text') or '') != _key(anchor.text)):
+            continue
+        page, box = regions[heading.self_ref]
+        crossed = [regions[item.self_ref] for item in items[left:right]
+                   if item.self_ref not in excluded and item.content_layer != ContentLayer.FURNITURE]
+        if any(not loc or loc[0] != page or loc[1][1] < box[3] for loc in crossed):
+            continue
+        items.insert(left, items.pop(right))
+        parent.children.insert(left, parent.children.pop(right))
+        for i in range(left, right + 1):
+            positions[items[i].self_ref] = i
+        manifest.setdefault('heading_reading_order_repairs', []).append(
+            dict(page=page, heading=heading.self_ref, before=anchor.self_ref))
+
+
 def restore_table_reading_order(doc, excluded, manifest, api):
-    """Sort only inverted, nonoverlapping intervals containing a wide table.
+    """Restore source-witnessed heading order and nonoverlapping wide-table intervals.
 
     Lists retain their internal structure. Their one-page descendant bounds
     allow a list definition to move before a later table without flattening it
@@ -504,10 +843,22 @@ def restore_table_reading_order(doc, excluded, manifest, api):
     """
     from docling_core.types.doc import ContentLayer
 
+    followers = _heading_followers(manifest.get('ocr_blocks', []))
     repairs = []
     for parent in [doc.body, *doc.groups]:
         regions = {ref.cref: _flow_region(ref.resolve(doc), doc, excluded, api) for ref in parent.children}
-        changed = True
+        wide_pages = set()
+        for ref, region in regions.items():
+            if region and ref.startswith("#/tables/"):
+                page, box = region
+                if box[2] - box[0] >= .7 * doc.pages[page].size.width:
+                    wide_pages.add(page)
+        page_positions = {page: [] for page in wide_pages}
+        for index, ref in enumerate(parent.children):
+            region = regions[ref.cref]
+            if region and region[0] in wide_pages:
+                page_positions[region[0]].append(index)
+        changed = bool(wide_pages)
         while changed:
             changed = False
             children = [ref.resolve(doc) for ref in parent.children]
@@ -516,7 +867,9 @@ def restore_table_reading_order(doc, excluded, manifest, api):
                 if not reg:
                     continue
                 page_no, box = reg
-                for other_index in range(index + 1, len(children)):
+                for other_index in page_positions.get(page_no, ()):
+                    if other_index <= index:
+                        continue
                     other_reg = regions[children[other_index].self_ref]
                     if not other_reg or other_reg[0] != page_no or box[1] < other_reg[1][3] - 2:
                         continue
@@ -546,7 +899,64 @@ def restore_table_reading_order(doc, excluded, manifest, api):
                     break
                 if changed:
                     break
+        _restore_heading_order(parent, doc, regions, followers, excluded, manifest)
     manifest["table_reading_order_repairs"] = repairs
+
+
+def restore_list_example_order(doc, excluded, manifest, reader, api):
+    """Place a detached example before a numbered clause that the list absorbed."""
+    from docling_core.types.doc import ListGroup, ListItem
+    from docling_pdf_annotations import annotation_kind
+
+    if reader is None:
+        return
+    for parent in [doc.body, *doc.groups]:
+        siblings = [ref.resolve(doc) for ref in parent.children if ref.cref not in excluded]
+        for group, example in zip(siblings, siblings[1:]):
+            if (not isinstance(group, ListGroup) or len(group.children) < 2
+                    or annotation_kind(getattr(example, 'text', '')) != 'example'
+                    or example.children or len(example.prov) != 1):
+                continue
+            items = [ref.resolve(doc) for ref in group.children]
+            if any(not isinstance(x, ListItem) or x.children or len(x.prov) != 1
+                   or x.self_ref in excluded for x in items):
+                continue
+            tail = items[-1]
+            if not re.fullmatch(r'\d+(?:\.\d+)+', tail.marker or ''):
+                continue
+            page, line = api.item_region(example, doc)
+            if any(x.prov[0].page_no != page for x in items):
+                continue
+            boxes = [api.item_region(x, doc)[1] for x in items]
+            above, below = boxes[-2:]
+            height = line[3]-line[1]
+            tolerance = height * .2
+            if (height <= 0 or not -tolerance <= line[1]-above[3] <= height
+                    or not -tolerance <= below[1]-line[3] <= height
+                    or any(b[3] > line[1]+tolerance for b in boxes[:-1])
+                    or any(b[2]-b[0] < .6*doc.pages[page].size.width
+                           or not b[0] <= line[0] < line[2] <= b[2] for b in (above, below))):
+                continue
+            # A second column or another object beside the example invalidates
+            # this local reading order, even if the preceding paragraph is wide.
+            own = {example.self_ref, *(x.self_ref for x in items)}
+            if any(x.self_ref not in own and x.self_ref not in excluded
+                   and (loc := api.item_region(x, doc)) and loc[0] == page
+                   and loc[1][1] < line[3]-tolerance and loc[1][3] > line[1]+tolerance
+                   for x in [*doc.texts, *doc.tables, *doc.pictures]):
+                continue
+            example_source = _source_text(reader, page, line, api) or ''
+            tail_source = _source_text(reader, page, below, api) or ''
+            prefix = ' '.join((tail.marker, *tail.text.split()[:3]))
+            if _key(example_source) != _key(example.text) or not _key(tail_source).startswith(_key(prefix)):
+                continue
+            new_group = doc.add_list_group(parent=parent, name=group.name, content_layer=group.content_layer)
+            new_group.children = [group.children.pop()]
+            tail.parent = new_group.get_ref()
+            parent.children.remove(new_group.get_ref())
+            parent.children.insert(parent.children.index(example.get_ref())+1, new_group.get_ref())
+            manifest.setdefault('list_example_order_repairs', []).append(dict(
+                page=page, example=example.self_ref, following_clause=tail.self_ref, marker=tail.marker))
 
 
 def _integer_keys(profile):

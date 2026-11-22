@@ -4,12 +4,12 @@ import re
 from types import SimpleNamespace
 
 
-FORM_HEADING = re.compile(r'^\s*(?:(?:Продолжение|Окончание)\s+формы|Форма)\s+'
+FORM_HEADING = re.compile(r'^\s*(?:(?:Продолжение|Окончание)\s+формы|Ф\s*о\s*р\s*м\s*а)\s*[.:№]?\s*'
                           r'(?P<number>(?:[A-ZА-ЯЁ]\s*\.\s*)?\d+(?:[.\-]\d+)*)'
-                          r'(?:(?:\s*[—–−-]\s*|\s+)(?P<title>\S[\s\S]*))?\s*$', re.I)
-FIGURE_CAPTION = re.compile(r'^\s*Рисунок\s+(?P<number>(?:[A-ZА-ЯЁ]\s*\.\s*)?\d+'
+                          r'(?:(?:\s*[.:—–−-]\s*|\s+)(?P<title>\S[\s\S]*))?[.]?\s*$', re.I)
+FIGURE_CAPTION = re.compile(r'^\s*Р\s*и\s*с(?:\s*у\s*н\s*о\s*к|\s*\.)\s*[.:№]?\s*(?P<number>(?:[A-ZА-ЯЁ]\s*\.\s*)?\d+'
                             r'(?:\s*[.\-]\s*\d+)*)'
-                            r'(?:\s*[—–−-]\s*(?P<title>\S[\s\S]*))?\s*$', re.I)
+                            r'(?:\s*[.:—–−-]\s*(?P<title>\S[\s\S]*))?[.]?\s*$', re.I)
 
 
 def form_owns_region(manifest, page, box):
@@ -160,7 +160,95 @@ def _source_form_title(reader, regions, page, caption, body, em, api):
                 editable_text_published=False)
 
 
-def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=None):
+def reserve_layout_graphics(doc, proofs, manifest, api):
+    """Keep crops authoritative even if Docling dropped an empty picture."""
+    registry = {}
+    for proof in proofs:
+        page, body, line = proof['page'], proof['bbox'], proof['caption_bbox']
+        located = [(item, api.item_region(item, doc)) for item in doc.pictures]
+        owner = next((item for item, pos in located if pos and pos[0] == page
+                      and max(abs(a-b) for a, b in zip(body, pos[1])) <= 1), None)
+        if owner is None:
+            owner = api.insert_source_item(doc, page, body, 'picture')
+        located = [(item, api.item_region(item, doc)) for item in doc.texts]
+        nearby = [(item, pos[1]) for item, pos in located if pos and pos[0] == page
+                  and api.overlap_ratio(line, pos[1]) > .6 and item.text.strip()]
+        # OCR can split the caption across several boxes, or include a whole
+        # paragraph in one. Keep mixed paragraphs in their original position.
+        refs = []
+        if nearby:
+            aligned = sorted(((item, box) for item, box in nearby if (
+                min(box[3], line[3])-max(box[1], line[1])) >= .5*(box[3]-box[1])),
+                key=lambda pair: pair[1][0])
+            if (not proof['intervening_lines'] and aligned
+                    and api.furniture_key(''.join(item.text for item, _ in aligned))
+                    == api.furniture_key(proof['caption_text'])):
+                refs = [item for item, _ in aligned]
+        else:
+            caption = api.insert_source_item(doc, page, line, 'text')
+            caption.text = caption.orig = proof['caption_text']
+            caption.prov[0].charspan = (0, len(caption.text))
+            if not proof['intervening_lines']:
+                refs = [caption]
+        _reparent_form(doc, owner, refs)
+        captions = [item.self_ref for item in refs]
+        # Assembly may have assigned neighboring prose to the picture. Its
+        # serializer emits only the source image and the verified caption.
+        # Restore exterior children at their measured place in reading order.
+        if owner.parent:
+            from docling_core.types.doc import ContentLayer, DocItemLabel, TextItem
+            parent = owner.parent.resolve(doc)
+            exterior = []
+            for ref in owner.children:
+                child = ref.resolve(doc)
+                if (ref.cref in captions or not isinstance(child, TextItem)
+                        or len(child.prov) != 1 or child.parent != owner.get_ref()):
+                    continue
+                child_page, box = api.item_region(child, doc)
+                if child_page == page and (box[3] <= body[1] or box[1] >= body[3]):
+                    exterior.append((box, child))
+            if exterior:
+                moved = {child.self_ref for _, child in exterior}
+                owner.children = [ref for ref in owner.children if ref.cref not in moved]
+                owner.captions = [ref for ref in owner.captions if ref.cref not in moved]
+                before, after = [], []
+                for box, child in sorted(exterior, key=lambda pair: (pair[0][1], pair[0][0])):
+                    child.parent = owner.parent
+                    if child.label == DocItemLabel.CAPTION:
+                        child.label, child.content_layer = DocItemLabel.TEXT, ContentLayer.BODY
+                    (before if box[3] <= body[1] else after).append(child.get_ref())
+                index = next(i for i, ref in enumerate(parent.children) if ref.cref == owner.self_ref)
+                parent.children[index:index+1] = [*before, owner.get_ref(), *after]
+        entry = dict(proof, ref=owner.self_ref, original_ref=owner.self_ref, original_bbox=body,
+                     caption_ref=next(iter(captions), None), caption_refs=captions, caption_position='before',
+                     source_font=line[3]-line[1], source_table_refs=[], excluded_refs=[],
+                     method='layout_graphic_before_ocr', primary_records=[])
+        registry[owner.self_ref] = entry
+        manifest.setdefault('captioned_figures', []).append(entry)
+    return registry
+
+
+def clear_caption_tail(image, entry):
+    """Remove a caption descender beside a higher dimension line at a source gutter."""
+    import math
+    import numpy as np
+    if not entry.get('overlaps_caption_tail'):
+        return
+    l, t, r, b = entry['bbox']
+    cl, ct, cr, cb = entry['caption_bbox']
+    sx, sy = image.width/(r-l), image.height/(b-t)
+    x0 = max(0, math.floor((cl-l)*sx)-1)
+    x1 = min(image.width, math.ceil((cr-l)*sx)+1)
+    limit = min(image.height, math.ceil((cb-t + .3*(cb-ct))*sy))
+    if x1 <= x0 or limit <= 0:
+        return
+    with image.crop((x0, 0, x1, limit)) as strip, strip.convert('L') as gray:
+        blank = np.flatnonzero((np.asarray(gray) >= 245).all(axis=1))
+    if blank.size and blank[0] > 0:
+        image.paste('white', (x0, 0, x1, int(blank[0])))
+
+
+def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=None, reserved=None):
     """Bind explicit captions to source boxes before semantic table repairs.
 
     The explicit heading owns the printed form regardless of whether layout
@@ -216,7 +304,7 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
         item = SimpleNamespace(self_ref=f'primary-table:{index}', captions=[])
         packet_items[item.self_ref] = record
         objects.append((item, (page, list(box))))
-    registry = {}
+    registry = dict(reserved or {})
     furniture = {'page_header', 'page_footer'}
 
     def x_overlap(a, b):
@@ -235,6 +323,9 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
         if not match:
             match = FIGURE_CAPTION.fullmatch(getattr(caption, 'text', ''))
         if not match or not position:
+            continue
+        if any(e['page'] == position[0] and api.overlap_ratio(e['caption_bbox'], position[1]) > .6
+               for e in (reserved or {}).values()):
             continue
         if any(caption.self_ref in entry.get('caption_refs', [entry['caption_ref']])
                for entry in manifest.get('captioned_figures', [])):
@@ -487,6 +578,8 @@ def capture_form_figures(doc, records, manifest, api, *, reader=None, regions=No
             forms.append(entry)
         api.diagnostic_event('SOURCE_FORM_CROP_REGISTERED' if caption_before
                              else 'SOURCE_FIGURE_TABLE_CROP_REGISTERED', **entry)
+    from docling_pdf_captions import bind_figure_pair_after_legend
+    bind_figure_pair_after_legend(doc, records, registry, manifest, api)
     _capture_split_containers(doc, registry, manifest, regions, api)
     from docling_pdf_captions import (locate_prose_wrapping_a_figure, recover_detached_raster_captions,
                                      split_lists_crossing_illustrations,

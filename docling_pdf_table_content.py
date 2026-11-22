@@ -421,7 +421,7 @@ def _render_typed(image, blocks, width, page, position, manifest, api,
     return ''.join(parts)
 
 
-def _source_text_coverage(image, blocks, reader, box, page, api, content):
+def _source_text_coverage(image, blocks, reader, box, page, api, content, *, formula_signs=False):
     """Anchor unchanged plain OCR text only to matching, visible PDF glyphs."""
     if reader is None or not box:
         return None
@@ -444,7 +444,9 @@ def _source_text_coverage(image, blocks, reader, box, page, api, content):
         return None
     # Source spelling never replaces the OCR answer. Every non-whitespace
     # character must already be present, in order, in both complete readings.
-    compact = lambda value: ''.join(value.split())
+    def compact(value):
+        value = ''.join(value.split())
+        return value.translate(_FORMULA_SIGNS) if formula_signs else value
     if compact(parsed.get_text()) != compact(''.join(line['text'] for line in lines)):
         return None
     import numpy as np
@@ -1395,19 +1397,30 @@ def _decimal_line_recognizer():
     })
 
 
-def _anchored_primary_literals(records, geometry, page, api):
-    """Locate plain OCR values by an independent reading of a different cell in their row."""
+def _anchored_primary_cells(records, geometry, page, api):
+    """Locate primary cells by independent row anchors on the measured grid."""
     from collections import Counter
     from docling_pdf_logical_rows import _same_region
 
+    box = geometry.get('bbox')
+    if not box:
+        return {}
+    regions = [box]
+    # Primary OCR can end its table before a full-width notes row.
+    cells_on_grid = geometry.get('cells', [])
+    columns = len(geometry.get('x_grid', [])) - 1
+    for cell in cells_on_grid:
+        if (cell['column_span'] == columns and cell['row'] > 0
+                and cell['row'] + cell['row_span'] == len(geometry.get('y_grid', [])) - 1):
+            regions.append([*box[:3], cell['bbox'][1]])
     tables = [record for record in records if record.get('page_no') == page
               and record.get('label') == 'Table' and geometry.get('bbox')
-              and _same_region(record.get('bbox'), geometry['bbox'])]
+              and any(_same_region(record.get('bbox'), region) for region in regions)]
     if len(tables) != 1:
         return {}
     record = tables[0]
     profile = api.table_profile(record['html'])
-    if profile['issues']:
+    if profile['issues'] or profile['columns'] != columns:
         return {}
     cells = [c for c in profile['cells'] if not c['header'] and (c['row_span'], c['column_span']) == (1, 1)]
     occurrences = Counter((c['column'], c['text']) for c in cells)
@@ -1426,22 +1439,18 @@ def _anchored_primary_literals(records, geometry, page, api):
     digest = sha256(record['html'].encode()).hexdigest()
     located = {}
     for c in cells:
-        value = c['text']
-        words = value.split()
-        plain = (len(value) == 1 and value.isalnum() or words and all(word.isalpha() for word in words)
-                 and any(len(word) >= 3 for word in words))
         owner = mapped.get(c['row'])
-        if not plain or owner is None or ownership_counts[owner] != 1 or c['html'].strip() != value:
+        if owner is None or ownership_counts[owner] != 1:
             continue
         neighbor = next((col for col in anchors[c['row']][owner] if col != c['column']), None)
         if neighbor is not None:
-            located[owner, c['column']] = value, dict(source_record_sha256=digest,
+            located[owner, c['column']] = c['html'], dict(source_record_sha256=digest,
                 primary_row=c['row'], anchor_column=neighbor)
     return located
 
 
 def _verified_scan_cell_literals(tasks, geometry, source_image, region, page, args, ref,
-                                 source_reader, graphic_context, api):
+                                 source_reader, graphic_context, api, anchored):
     """Confirm short OCR readings against the positioned glyphs and all source ink."""
     if (not tasks or source_reader is None or not geometry or not graphic_context['verified']
             or not geometry.get('page_scan_transcription_required')
@@ -1456,7 +1465,6 @@ def _verified_scan_cell_literals(tasks, geometry, source_image, region, page, ar
     source_reader.load_page(page)
     glyphs = [g for g in source_reader.chars if g.get('text', '').strip()]
     matches, views, confirmed = [], [], {}
-    primary_literals = None
     for node, position, physical in tasks:
         if (position.get('region') or position['header']
                 or position['column_span'] != 1
@@ -1479,9 +1487,7 @@ def _verified_scan_cell_literals(tasks, geometry, source_image, region, page, ar
         if not re.fullmatch(r'(?:[0-9]+(?:[,.][0-9]+)?|\([0-9]+[,.][0-9]+\))', literal):
             if position['row_span'] != 1:
                 continue
-            if primary_literals is None:
-                primary_literals = _anchored_primary_literals(getattr(args, 'surya_records', ()), geometry, page, api)
-            primary = primary_literals.get((position['row'], position['column']))
+            primary = anchored.get((position['row'], position['column']))
             if not primary or primary[0] != literal:
                 continue
         elif len(matches) >= 128:
@@ -1538,6 +1544,137 @@ def _verified_scan_cell_literals(tasks, geometry, source_image, region, page, ar
     return confirmed
 
 
+_FORMULA_SIGNS = str.maketrans({'−': '-', '•': '·', '⋅': '·'})
+
+
+def _linear_formula_chars(node):
+    """Keep each token's script level and position in its original text node."""
+    atoms = []
+    def visit(tag, level):
+        if tag.name is None:
+            atoms.extend((ch.translate(_FORMULA_SIGNS), level, tag, i)
+                         for i, ch in enumerate(str(tag)) if not ch.isspace())
+            return True
+        if tag.name in {'msup', 'msub'}:
+            parts = [child for child in tag.children if child.name or str(child).strip()]
+            if len(parts) != 2 or parts[0].name not in {'mn', 'mi', 'mo', 'mtext'}:
+                return False
+            return visit(parts[0], level) and visit(parts[1], level + (tag.name[1:],))
+        if tag.name in {'sup', 'sub'}:
+            level += (tag.name,)
+        elif tag.name not in {'[document]', 'p', 'div', 'span', 'math', 'mrow', 'mn', 'mi', 'mo', 'mtext'}:
+            return False
+        return all(visit(child, level) for child in tag.children)
+    return atoms if visit(node, ()) else []
+
+
+def _reconcile_anchored_formula(rendered, primary, image, box, page, reader, api):
+    """Correct letters only when two reads agree on the whole formula and its scripts."""
+    from html import escape
+    from local_web.structured_export import math_to_latex
+
+    parsed = BeautifulSoup(rendered, 'html.parser')
+    formula = parsed.find('math')
+    if formula is None or len(parsed.find_all('math')) != 1 or parsed.get_text(strip=True) != formula.get_text(strip=True):
+        return None
+    prior = _linear_formula_chars(BeautifulSoup(primary, 'html.parser'))
+    reread = _linear_formula_chars(parsed)
+    if not prior or len(prior) != len(reread) or not any(level for _, level, _, _ in prior):
+        return None
+    edits = {}
+    for (a, level, _, _), (b, other_level, node, index) in zip(prior, reread):
+        if level != other_level:
+            return None
+        if a == b:
+            continue
+        if not (a.isalpha() and b.isalpha()):
+            return None
+        _, chars = edits.setdefault(id(node), (node, list(str(node))))
+        chars[index] = a
+    if not edits:
+        return None
+    primary_text = ''.join(char for char, _, _, _ in prior)
+    support = _source_text_coverage(image, [{'label': 'Text'}], reader, box, page, api,
+                                    escape(primary_text), formula_signs=True)
+    if not support:
+        return None
+    for node, chars in edits.values():
+        node.replace_with(''.join(chars))
+    for attribute in ('data-latex', 'data-tex', 'latex'):
+        formula.attrs.pop(attribute, None)
+    formula['data-latex'] = math_to_latex(formula)
+    return str(parsed), dict(method='primary_formula_on_visible_source_glyphs_and_verified_script_positions',
+                             before=BeautifulSoup(rendered, 'html.parser').get_text(), after=primary_text,
+                             ink_coverage=support[1]['ink_coverage'])
+
+
+def _review_disputed_letter(rendered, primary, image, box, page, reader, position, ref, api, manifest):
+    prior = BeautifulSoup(primary, 'html.parser')
+    parsed = BeautifulSoup(rendered, 'html.parser')
+    if any(node.find(['img', 'svg', 'math', 'sup', 'sub', 'table', 'input']) for node in (parsed, prior)):
+        return
+    page_read, cell_read = prior.get_text(strip=True), parsed.get_text(strip=True)
+    if (len(page_read) != 1 or len(cell_read) != 1 or page_read == cell_read
+            or not page_read.isalpha() or not cell_read.isalpha()):
+        return
+    if not _source_text_coverage(image, [{'label': 'Text'}], reader, box, page, api, cell_read):
+        return
+    message = (f"Строка {position['row']+1}, столбец {position['column']+1}. "
+               f"Текстовый слой и чтение ячейки дают «{cell_read}», первичная таблица — «{page_read}».")
+    warning = dict(page=page, ref=ref, row=position['row'], column=position['column'], source_bbox=list(box),
+                   reason='single_letter_ocr_disagreement', primary=page_read, retained=cell_read, message=message)
+    manifest.setdefault('table_assembly_reviews', []).append(warning)
+    api.diagnostic_event('TYPED_TABLE_CELL_REVIEW', **warning)
+
+
+def _reconcile_cell_ending(rendered, primary, image, box, page, reader, api):
+    """Resolve a disputed final word when both OCR readings agree up to that word."""
+    import re
+
+    if not primary or reader is None:
+        return None
+    parsed = BeautifulSoup(rendered, 'html.parser')
+    prior = BeautifulSoup(primary, 'html.parser')
+    if any(part.find(['img', 'svg', 'table', 'input']) for part in (parsed, prior)):
+        return None
+    last = next((s for s in reversed(parsed.find_all(string=True)) if s.strip()), None)
+    if last is None or last.find_parent(['math', 'sup', 'sub']):
+        return None
+    end = re.compile(r'(?<!\w)([^\W_]+)\s*$')
+    page_text, cell_text = prior.get_text(), parsed.get_text()
+    first, second = end.search(page_text), end.search(cell_text)
+    if not first or not second:
+        return None
+    word, other = first[1], second[1]
+    prefix = ''.join(page_text[:first.start()].split())
+    if (not prefix or not word.isalpha() or word == other or not str(last).rstrip().endswith(other)
+            or ''.join(cell_text[:second.start()].split()) != prefix):
+        return None
+    reader.load_page(page)
+    glyphs = [g for g in reader.chars if g.get('text', '').strip()
+              and box[0] <= (g['x0']+g['x1'])/2 < box[2] and box[1] <= (g['top']+g['bottom'])/2 < box[3]]
+    lines = api.native_cell_lines(glyphs)
+    if len(lines) != 1 or not (match := end.search(lines[0]['text'])) or match[1] != word:
+        return None
+    suffix = sorted(glyphs, key=lambda g: g['x0'])[-len(word):]
+    if ''.join(g['text'] for g in suffix) != word:
+        return None
+    # Leave surrounding paper so the ink test can distinguish glyph strokes
+    # from enclosing rules. Another word in this window invalidates support.
+    margin = .25 * max(g['bottom'] - g['top'] for g in suffix)
+    bounds = [max(box[0], min(g['x0'] for g in suffix) - margin),
+              max(box[1], min(g['top'] for g in suffix) - margin),
+              min(box[2], max(g['x1'] for g in suffix) + margin),
+              min(box[3], max(g['bottom'] for g in suffix) + margin)]
+    with _source_crop(image, box, bounds) as crop:
+        support = _source_text_coverage(crop, [{'label': 'Text'}], reader, bounds, page, api, word)
+    if not support:
+        return None
+    last.replace_with(str(last).rstrip()[:-len(other)] + word + str(last)[len(last.rstrip()):])
+    return str(parsed), dict(method='primary_word_and_positioned_glyphs', bbox=bounds,
+                             original=other, verified=word, ink_coverage=support[1]['ink_coverage'])
+
+
 def normalize_table_content(fragment, geometry, source_image, region, page, args, manifest, api,
                             *, recognize=None, ref=None, source_reader=None, recover_region=False):
     """Resolve each raster in place, retaining mixed-cell order and spans.
@@ -1576,8 +1713,11 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                 tasks.append((node, position, physical))
     elif recover_region or soup.find('img'):
         tasks = [(soup, dict(region=True), dict(bbox=region))]
+    anchored = (_anchored_primary_cells(getattr(args, 'surya_records', ()), geometry, page, api)
+                if tasks and graphic_context['verified'] and geometry.get('page_scan_transcription_required')
+                and not geometry.get('hidden_ocr_direction_conflict') else {})
     verified_literals = (_verified_scan_cell_literals(tasks, geometry, source_image, region,
-        page, args, ref, source_reader, graphic_context, api) if verify_literals else {})
+        page, args, ref, source_reader, graphic_context, api, anchored) if verify_literals else {})
     for node, position, physical in tasks:
         # Never treat OCR HTML/base64 as evidence. Re-read ORIGINAL page
         # pixels for the physical owner, including text beside its picture.
@@ -1651,6 +1791,20 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
                                          source_reader=text_reader, source_bbox=box, physical_cell=physical_cell,
                                          require_coverage=bool(verified_cell or native_fragments),
                                          allow_nested_table=bool(node.find('table')))
+                cell_anchor = anchored.get((position.get('row'), position.get('column')))
+                if (cell_anchor and not retained and not editable_existing
+                        and position.get('row_span') == position.get('column_span') == 1
+                        and position['column'] not in graphic_context['roles']):
+                    corrected = (_reconcile_anchored_formula(rendered, cell_anchor[0], image, box, page, text_reader, api)
+                                 or _reconcile_cell_ending(rendered, cell_anchor[0], image, box, page, text_reader, api))
+                    if corrected:
+                        rendered, evidence = corrected
+                        proof.setdefault('typed_table_text_anchors', []).append(dict(
+                            page=page, ref=ref, cell={k: position[k] for k in ('row', 'column', 'row_span', 'column_span')},
+                            **evidence, **cell_anchor[1]))
+                    else:
+                        _review_disputed_letter(rendered, cell_anchor[0], image, box, page, text_reader,
+                                               position, ref, api, manifest)
                 if text_column and _incomplete_plain_cell(image, rendered):
                     raise TableContentError('Physical text-cell OCR omitted source lines')
                 # A complete exact-cell OCR equation supersedes the native

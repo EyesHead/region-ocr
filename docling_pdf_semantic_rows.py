@@ -281,6 +281,83 @@ def _partition_graphic_bands(image, interior, threshold):
     return bands
 
 
+def locate_partitioned_text_rows(cells, fragments, partitions, originals, page, reader, regions, api):
+    """Locate complete primary records within a ruled band with wrapped descriptions."""
+    if reader is None or regions is None:
+        return None
+    digests = {cell.get('primary_ocr', {}).get('source_record_sha256') for cell in cells}
+    if len(digests) != 1:
+        return None
+    digest = digests.pop()
+    primary = originals.get((page, digest))
+    if primary is None:
+        return None
+    mappings = {tuple(p['row_mapping']) for p in partitions
+                if p['page'] == page and p['source_record_sha256'] == digest}
+    if len(mappings) != 1:
+        return None
+    mapping = mappings.pop()
+    table = BeautifulSoup(primary, 'html.parser').table
+    if table is None or table.find('table'):
+        return None
+    rows = table.find_all('tr')
+    if len(rows) != len(mapping):
+        return None
+    owned = [row.find_all('td', recursive=False) for row, owner in zip(rows, mapping)
+             if owner == cells[0]['row']]
+    if len(owned) < 2 or any(len(row) != len(cells) for row in owned):
+        return None
+    text_key = lambda part: api._borderless_key(BeautifulSoup(part, 'html.parser').get_text(' ', strip=True))
+    anchors, payloads, verified = [], [], []
+    for col, (cell, current) in enumerate(zip(cells, fragments)):
+        nodes = [row[col] for row in owned]
+        if any(str(node.get('rowspan', 1)) != '1' or str(node.get('colspan', 1)) != '1'
+               or node.find(['img', 'math', 'svg', 'sub', 'sup', 'table']) for node in nodes):
+            return None
+        groups = [api._borderless_html_lines(node.decode_contents()) for node in nodes]
+        if not all(groups) or [text_key(part) for group in groups for part in group] != list(map(text_key, current)):
+            return None
+        box = cell['bbox']
+        with regions.crop(page, box) as image:
+            lines = _partition_text_lines(box, current, image, reader, api)
+        if lines:
+            verified.append(col)
+        else:
+            # The other columns must independently confirm every row. A small
+            # transcription difference in a positioned line cannot change its owner.
+            glyphs = [g for g in reader.chars if box[0] < (g['x0']+g['x1'])/2 < box[2]
+                      and box[1] < (g['top']+g['bottom'])/2 < box[3]]
+            lines = [line for line in api.native_cell_lines(glyphs) if line['text'].strip()]
+            if len(lines) != len(current):
+                return None
+            for line, part in zip(lines, current):
+                source, value = api._borderless_key(line['text']), text_key(part)
+                if source != value and (len(value) < 5 or len(value) != len(source)
+                        or sum(a != b for a, b in zip(source, value)) != 1):
+                    return None
+        column, content, start = [], [], 0
+        for group in groups:
+            end = start + len(group)
+            markup = '<br/>'.join(current[start:end])
+            column.append(dict(lines[start], last_y=lines[end-1]['y'],
+                               text=BeautifulSoup(markup, 'html.parser').get_text(' ', strip=True)))
+            content.append(markup)
+            start = end
+        anchors.append(column)
+        payloads.append(content)
+    if len(verified) < 2:
+        return None
+    for row, starts in enumerate(zip(*anchors)):
+        size = min(line['size'] for line in starts)
+        if max(line['y'] for line in starts) - min(line['y'] for line in starts) > .4 * size:
+            return None
+        if row and max(column[row-1]['last_y'] for column in anchors) + .4 * size >= min(line['y'] for line in starts):
+            return None
+    proof = dict(method='primary_row_groups_on_positioned_lines', source_record_sha256=digest,
+                 ink_verified_columns=verified)
+    return anchors, [proof], payloads
+
+
 def _reconstruct_partitioned_band(primary, nodes, source, graphic_col, page, reader, regions, api):
     """Align every textual fragment and each independently visible graphic."""
     import base64

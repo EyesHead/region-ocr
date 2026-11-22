@@ -69,9 +69,26 @@ def _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)
     def key(value):
         value = BeautifulSoup(value, 'html.parser').get_text()
         return re.sub(r'\s+', '', value).replace('\u00ad', '').translate(str.maketrans('−–—', '---'))
-    source = ''.join(line['html'] for line in api.native_cell_lines(glyphs))
-    if key(source) != key(''.join(c['html'] for c in tails)):
-        return None
+    lines = api.native_cell_lines(glyphs)
+    source = ''.join(line['html'] for line in lines)
+    tail_html = ''.join(c['html'] for c in tails)
+    note_evidence = 'literal_positioned_glyphs'
+    if key(source) != key(tail_html):
+        from docling_pdf_table_content import _typed_payload_key
+        if _typed_payload_key(source) == _typed_payload_key(tail_html):
+            # This comparison establishes ownership only. The native note keeps
+            # its original alphabet in the independently published paragraph.
+            note_evidence = 'equivalent_printed_glyphs'
+        else:
+            from docling_pdf_repairs import _primary_note_footer
+            note_box = [bounds[0], bottom, bounds[2], bounds[3]]
+            record = dict(page_no=page, bbox=bounds, html=fragment)
+            proof = _primary_note_footer([record], page, note_box,
+                ' '.join(line['text'] for line in lines), glyphs, lines,
+                reader.page.images, api)
+            if not proof or not proof.get('source_math_images'):
+                return None
+            note_evidence = 'positioned_inline_math_images'
     nodes = [n for n in parsed.table.find_all(['td', 'th']) if n.find_parent('table') is parsed.table]
     for cell, node in zip(primary['cells'], nodes):
         if cell['row'] >= end:
@@ -84,12 +101,77 @@ def _external_note_prefix(fragment, geometry, target, bounds, page, reader, api)
         return None
     profile['source_external_note_prefix'] = dict(
         method='exact_primary_grid_prefix_and_complete_positioned_external_note',
-        page=page, source_bbox=list(bounds), physical_table_bottom=bottom,
+        page=page, source_bbox=list(bounds), physical_table_bottom=bottom, note_evidence=note_evidence,
         source_note_bbox=[min(g['x0'] for g in glyphs), min(g['top'] for g in glyphs),
                           max(g['x1'] for g in glyphs), max(g['bottom'] for g in glyphs)],
         source_note_glyphs=len(glyphs), primary_tail_rows=len(tails),
         note_html_sha256=hashlib.sha256(''.join(c['html'] for c in tails).encode()).hexdigest())
     return profile
+
+
+def _fill_positioned_math_images(source_html, primary_html):
+    """Replace only source image slots corroborated by the complete surrounding text."""
+    from html import escape
+    from docling_pdf_table_content import _typed_payload_key
+
+    def text_key(text):
+        return ''.join(value for _, value in _typed_payload_key(escape(text)))
+
+    if '<img' not in source_html:
+        return None
+    source = BeautifulSoup(source_html, 'html.parser')
+    primary = BeautifulSoup(primary_html, 'html.parser')
+    images = source.find_all('img')
+    separator = '\ue000'
+    if (not images or any(im.get('data-source-cell') != 'true' for im in images)
+            or primary.find(['img', 'svg', 'table']) or separator in source_html + primary_html):
+        return None
+    atoms = [n for n in primary.find_all(['math', 'sup', 'sub'])
+             if n.find_parent(['math', 'sup', 'sub']) is None]
+    if len(atoms) < len(images):
+        return None
+    # Use a display key solely to locate the printed gap. A degree mark can
+    # be represented in MathML as a superscript circle. Retain the PDF unit.
+    literals = []
+    for atom in atoms:
+        display = BeautifulSoup(str(atom), 'html.parser')
+        for circle in display.select('msup > mo:last-child'):
+            if circle.get_text() == '∘':
+                circle.string = '°'
+        literals.append(text_key(display.get_text()))
+        atom.replace_with(separator)
+    segments = [text_key(s) for s in primary.get_text().split(separator)]
+    if len(segments) != len(atoms) + 1 or any(not v for v in literals):
+        return None
+    positions = {}
+    chunks = [segments[0]]
+    offset = len(segments[0])
+    for atom, literal, following in zip(atoms, literals, segments[1:]):
+        positions[offset] = (atom, len(literal))
+        chunks.extend([literal, following])
+        offset += len(literal) + len(following)
+    rendered = ''.join(chunks)
+    for image in images:
+        image.replace_with(separator)
+    anchors = [text_key(s) for s in source.get_text().split(separator)]
+    if not any(anchors) or len(anchors) != len(images) + 1:
+        return None
+    offset, replacements = 0, []
+    for anchor in anchors[:-1]:
+        if not rendered.startswith(anchor, offset):
+            return None
+        offset += len(anchor)
+        if offset not in positions:
+            return None
+        atom, length = positions[offset]
+        replacements.append(atom)
+        offset += length
+    if rendered[offset:] != anchors[-1]:
+        return None
+    result = BeautifulSoup(source_html, 'html.parser')
+    for image, atom in zip(result.find_all('img'), replacements):
+        image.replace_with(atom)
+    return str(result)
 
 
 def _trim_empty_right_columns(fragment, primary, width):
@@ -283,6 +365,148 @@ def _numeric_signature(value):
     return re.sub(r'\s+', '', value)
 
 
+def _restore_repeated_cell_symbols(nodes, positions, geometry, records, region, page, ref, reader, regions, manifest, api):
+    """Reuse a locally transcribed, identical PDF symbol on a separate source line."""
+    if (not reader or not regions or not geometry.get('positioned_source_grid_verified')
+            or not geometry.get('retained_cell_images') or geometry.get('hidden_ocr_direction_conflict')):
+        return
+    donors = {(c['row'], c['column']) for c in geometry.get('restored_cell_math', ())
+              if c.get('method') == 'page_ocr_math_with_matching_source_anchors_or_cas'}
+    if not donors:
+        return
+    physical = {_key(c): c for c in geometry['cells']}
+    eligible, examples = {}, {}
+    for position, node in zip(positions, nodes):
+        c = physical.get(_key(position))
+        if not c or c.get('source_text_unreliable'):
+            continue
+        at = (c['row'], c['column'])
+        if at in donors and c.get('restored_math') == 1 and len(c.get('lines', ())) == 1:
+            examples[at] = (c, node)
+        lines = c.get('lines', ())
+        if c.get('source_images') != 1 or c.get('restored_math') or len(lines) != 2:
+            continue
+        image = node.find('img', attrs={'data-source-cell': 'true'})
+        glyphs = [g for g in c.get('glyphs', ()) if g['text'].strip()]
+        if (image is None or image.has_attr('data-cell-content') or len(glyphs) != 1
+                or len(glyphs[0]['text']) != 1 or not glyphs[0]['text'].isalpha() or node.get_text(strip=True) != glyphs[0]['text']
+                or [tag.name for tag in node.find_all()] not in (['br', 'img'], ['img', 'br'])):
+            continue
+        blank = [line for line in lines if not line['text'].strip()]
+        if len(blank) == 1 and image.get('src') and image['src'] in blank[0]['html']:
+            eligible[at] = (c, image, glyphs[0])
+    if not eligible or not examples:
+        return
+
+    reader.load_page(page)
+    owners = {}
+    for at, (c, *_) in {**examples, **eligible}.items():
+        borders = c['bbox']
+        crossed = []
+        for obj in reader.page.images:
+            box = [obj['x0'], obj['top'], obj['x1'], obj['bottom']]
+            if min(borders[2], box[2]) > max(borders[0], box[0]) and min(borders[3], box[3]) > max(borders[1], box[1]):
+                crossed.append((box, obj['stream']))
+        if len(crossed) != 1:
+            continue
+        box, stream = crossed[0]
+        if (api._source_unit_contains(borders, box)
+                and not {'Mask', 'SMask', 'SMaskInData', 'ImageMask'}.intersection(stream.attrs)):
+            owners[at] = box
+    if not (examples.keys() & owners.keys() and eligible.keys() & owners.keys()):
+        return
+    try:
+        assets = api._source_unit_xobjects(regions, page, list(owners.values()))
+    except Exception as error:
+        api.diagnostic_event('REPEATED_SOURCE_CELL_SYMBOL_SKIPPED', page=page, ref=ref, reason=str(error))
+        return
+    def identity(at):
+        bounds = owners.get(at)
+        if not bounds:
+            return None
+        hits = [v for v in assets if all(abs(a - b) <= api.SOURCE_UNIT_COMPOSITION['bbox_epsilon_pt']
+                for a, b in zip(v['bbox'], bounds))]
+        if len(hits) == 1:
+            v = hits[0]
+            return v['source_png_sha256'], tuple(v['source_dimensions']), tuple(v['matrix'][:4])
+        return None
+
+    def compact(value):
+        return ''.join(value.split())
+
+    def atoms(node, left, right):
+        found = set()
+        for m in node.find_all('math'):
+            if (not m.get('data-latex') or len(m.get_text()) != 1 or not m.get_text().isalpha()
+                    or [t.name for t in m.find_all()] not in (['mi'], ['mrow', 'mi'])):
+                continue
+            chunks = []
+            for text in node.find_all(string=True):
+                chunks.append('\u0000' if text.find_parent('math') is m else str(text))
+            if compact(''.join(chunks)) == left + '\u0000' + right:
+                found.add(str(m))
+        return found
+
+    packets = [r for r in records or () if r.get('page_no') == page and r.get('bbox')
+               and _same_region(r['bbox'], region) and '<table' in r.get('html', '').lower()]
+    if len(packets) != 1:
+        return
+    try:
+        packet = BeautifulSoup(api.clean_table_html(packets[0]['html']), 'html.parser')
+    except (ValueError, TypeError):
+        return
+    if len(packet.find_all('table')) != 1:
+        return
+    labels, veto = {}, set()
+    for at, (cell, donor) in examples.items():
+        key = identity(at)
+        if not key:
+            continue
+        box = owners[at]
+        glyphs = sorted((g for g in cell.get('glyphs', ()) if g['text'].strip()), key=lambda g: g['x0'])
+        left = ''.join(g['text'] for g in glyphs if (g['x0'] + g['x1']) / 2 < box[0])
+        right = ''.join(g['text'] for g in glyphs if (g['x0'] + g['x1']) / 2 > box[2])
+        if (not left or not right or left + right != ''.join(g['text'] for g in glyphs)
+                or not any(g['bottom'] > box[1] and g['top'] < box[3] for g in glyphs)):
+            veto.add(key)
+            continue
+        words = atoms(donor, left, right)
+        candidates = [atoms(n, left, right) for n in packet.find_all(['th', 'td'])
+                      if compact(n.get_text()).startswith(left) and compact(n.get_text()).endswith(right)]
+        if len(words) != 1 or len(candidates) != 1 or candidates[0] != words:
+            veto.add(key)
+            continue
+        word = next(iter(words))
+        if key in labels and labels[key][0] != word:
+            veto.add(key)
+        labels[key] = (word, at)
+    changed = False
+    for at, (cell, image, glyph) in eligible.items():
+        key = identity(at)
+        if key not in labels or key in veto:
+            continue
+        box = owners[at]
+        before_text = image.find_previous_sibling('br') is None
+        if not (box[3] <= glyph['top'] if before_text else box[1] >= glyph['bottom']):
+            continue
+        word, donor = labels[key]
+        owner = image.parent
+        image.replace_with(BeautifulSoup(word, 'html.parser').math)
+        line = next(line for line in cell['lines'] if not line['text'].strip())
+        line.update(html=word, text=BeautifulSoup(word, 'html.parser').get_text())
+        cell.pop('positioned_source_text', None)
+        cell.update(html=owner.decode_contents(), text=owner.get_text(' ', strip=True), source_images=0, restored_math=1)
+        evidence = dict(page=page, ref=ref, row=at[0], column=at[1], donor_row=donor[0], donor_column=donor[1],
+                        source_bbox=box, donor_bbox=owners[donor], source_png_sha256=key[0], dimensions=list(key[1]),
+                        linear_transform=list(key[2]), latex=BeautifulSoup(word, 'html.parser').math['data-latex'])
+        geometry['retained_cell_images'] = [v for v in geometry['retained_cell_images'] if (v['row'], v['column']) != at]
+        geometry['restored_cell_math'].append(dict(method='identical_source_symbol_on_separate_line', bbox=box, **evidence))
+        manifest.setdefault('repeated_source_cell_symbols', []).append(evidence)
+        api.diagnostic_event('REPEATED_SOURCE_CELL_SYMBOL_RESTORED', **evidence)
+        changed = True
+    return changed
+
+
 def preserve_primary_cells(fragment, geometry, primary_records, region, page, manifest, api,
                            source_image=None, reader=None, args=None, source_regions=None, table_ref=None):
     """Transfer unambiguous primary cells, retaining physical spans and drawings.
@@ -352,7 +576,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             if _usable(cell):
                 proposals.setdefault(_key(cell), {}).setdefault(cell['html'], []).append(
                     dict(source_record_sha256=identity, source_bbox=list(bounds), basis=basis,
-                         header=cell.get('header', False), graphic_marker=graphic_marker))
+                         header=cell.get('header', False), graphic_marker=graphic_marker,
+                         positioned_math_only=(primary.get('source_external_note_prefix', {}).get('note_evidence')
+                             in {'equivalent_printed_glyphs', 'positioned_inline_math_images'})))
         compound = _compound_footer(raw, primary, target, geometry, bounds, identity, api)
         if compound:
             key, html, proof = compound
@@ -364,6 +590,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
                 proposals.setdefault(key, {}).setdefault(html, []).extend(readings)
     physical = {_key(c): c for c in geometry.get('cells', [])}
     nodes = [n for n in soup.table.find_all(['td', 'th']) if n.find_parent('table') is soup.table]
+    if not proposals and _restore_repeated_cell_symbols(nodes, target['cells'], geometry, primary_records,
+            region, page, table_ref, reader, source_regions, manifest, api):
+        return str(soup.table), []
     graphic_columns = set()
     for node, cell in zip(nodes, target['cells']):
         choices = proposals.get(_key(cell), {})
@@ -409,6 +638,12 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
             api.diagnostic_event('TABLE_PRIMARY_OCR_CONFLICT', **conflict)
             continue
         html, readings = next(iter(choices.items()))
+        if all(r.get('positioned_math_only') for r in readings):
+            if graphic:
+                continue
+            html = _fill_positioned_math_images(node.decode_contents(), html)
+            if html is None:
+                continue
         vector_confirmation = None
         if source_image is not None:
             from docling_pdf_vector_content import confirm_vector_cell
@@ -482,7 +717,7 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
         node.append(BeautifulSoup(html, 'html.parser'))
         if any(r['header'] for r in readings):
             node.name = 'th'
-        reading = {name: value for name, value in readings[0].items() if name != 'graphic_marker'}
+        reading = {name: value for name, value in readings[0].items() if name not in {'graphic_marker', 'positioned_math_only'}}
         proof = dict(page=page, row=key[0], column=key[1], row_span=key[2], column_span=key[3],
                      method='primary_ocr_payload_on_source_grid', **reading)
         if vector_confirmation:

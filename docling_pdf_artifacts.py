@@ -48,6 +48,42 @@ def _key(text):
                    if not c.isspace() and c != '\u00ad')
 
 
+def restore_picture_text_alternative(fragment, picture, doc, page_no, box, reader, records, excluded, api):
+    """Expose a text-bearing image's verified literal when Docling omits its child."""
+    from bs4 import BeautifulSoup
+
+    if reader is None or picture.captions or len(picture.children) != 1:
+        return fragment
+    child = picture.children[0].resolve(doc)
+    if (str(child.label) != 'text' or not child.parent or child.parent.cref != picture.self_ref
+            or child.children or child.self_ref in excluded or len(child.prov) != 1):
+        return fragment
+    page, bounds = api.item_region(child, doc)
+    text = ' '.join(child.text.split())
+    if (page != page_no or not text or '<' in text or api.overlap_ratio(box, bounds) < .9
+            or (bounds[2]-bounds[0])*(bounds[3]-bounds[1]) < .5*(box[2]-box[0])*(box[3]-box[1])):
+        return fragment
+    if not any(r.get('page_no') == page and r.get('label') == 'Text' and ' '.join((r.get('text') or '').split()) == text
+               and r.get('bbox') and max(abs(a-b) for a, b in zip(bounds, r['bbox'])) <= 1 for r in records):
+        return fragment
+    key = _key(text)
+    if any(t.self_ref != child.self_ref and any(p.page_no == page for p in t.prov)
+           and _key(t.text) == key for t in doc.texts):
+        return fragment
+    parsed = BeautifulSoup(fragment, 'html.parser')
+    images = parsed.find_all('img')
+    if len(images) != 1 or images[0].get('alt') or parsed.get_text(strip=True):
+        return fragment
+    try:
+        literal = reader.load_page(page).crop(tuple(box), strict=False).extract_text()
+    except (OSError, RuntimeError, ValueError):
+        return fragment
+    if ' '.join((literal or '').split()) != text:
+        return fragment
+    images[0]['alt'] = text
+    return str(parsed)
+
+
 def _contains_point(box, x, y):
     return box[0] <= x <= box[2] and box[1] <= y <= box[3]
 
@@ -397,3 +433,56 @@ def picture_caption_band(item, doc, reader, regions, page_no, box, api, *, detac
     if max(top for top, _, _ in labels) - min(top for top, _, _ in labels) > min(g['size'] for g in glyphs) / 2:
         return None
     return [box[0], box[1], box[2], cut], [label for _, _, label in sorted(labels, key=lambda row: row[1])], following_paragraph
+
+
+def unassigned_table_fragment_group(boxes, table_box):
+    """Keep adjacent pieces of a text-bearing table in their source positions."""
+    from statistics import median
+
+    left, top, right, bottom = table_box
+    inside = sorted({tuple(b) for b in boxes if left <= b[0] < b[2] <= right
+                     and top <= b[1] < b[3] <= bottom})
+    if len(inside) < 3:
+        return []
+    # Three neighbouring objects on a common baseline provide evidence of
+    # fragmented printing. An isolated diagram still uses its own picture.
+    typical_height = median(b[3] - b[1] for b in inside)
+    runs = {}
+    for i, box in enumerate(inside):
+        height = box[3] - box[1]
+        if height > 2 * typical_height:
+            continue
+        for j in range(i + 1, len(inside)):
+            other = inside[j]
+            if other[0] - box[2] > height:
+                break
+            overlap = min(box[3], other[3]) - max(box[1], other[1])
+            if (other[0] >= (box[0] + box[2]) / 2 and
+                    overlap >= .65 * max(height, other[3] - other[1])):
+                runs[j] = max(runs.get(j, 1), runs.get(i, 1) + 1)
+                if runs[j] >= 3:
+                    return inside
+    return []
+
+
+def table_fragment_picture(regions, page_no, boxes):
+    """Copy selected source pixels at their original spacing on a white canvas."""
+    from math import ceil, floor
+    from PIL import Image
+
+    bounds = [op(b[i] for b in boxes) for i, op in enumerate((min, min, max, max))]
+    scale = 3.0
+    x0, y0 = floor(bounds[0] * scale), floor(bounds[1] * scale)
+    width, height = ceil(bounds[2] * scale) - x0, ceil(bounds[3] * scale) - y0
+    if width * height > regions.pixel_budget:
+        return None
+    with regions.crop(page_no, bounds, scale=scale) as source:
+        if source.size != (width, height):
+            return None
+        result = Image.new('RGB', source.size, 'white')
+        for left, top, right, bottom in boxes:
+            window = (floor(left * scale) - x0, floor(top * scale) - y0,
+                      ceil(right * scale) - x0, ceil(bottom * scale) - y0)
+            with source.crop(window) as patch:
+                result.paste(patch, window)
+    return bounds, result

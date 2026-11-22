@@ -20,10 +20,12 @@ import uuid
 if __package__:
     from . import formula_preview
     from .file_paths import native_path, normal_path
+    from .fast_resources import FAST_PATH, served_asset_name
     from .upload_storage import UploadReservations
 else:
     import formula_preview
     from file_paths import native_path, normal_path
+    from fast_resources import FAST_PATH, served_asset_name
     from upload_storage import UploadReservations
 
 
@@ -398,13 +400,16 @@ class SavedResults:
                 if not isinstance(asset, dict):
                     raise ValueError('Некорректный манифест изображений старого результата')
                 path, digest = asset.get('path'), asset.get('sha256')
-                if (not isinstance(path, str) or not re.fullmatch(r'src/[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif|bmp|tif|tiff)', path, re.I)
+                if (not isinstance(path, str) or not path.startswith('src/') or not served_asset_name(path[4:])
                         or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)
                         or path in assets):
                     raise ValueError('Некорректный манифест изображений старого результата')
                 assets[path] = digest
+            required = {str(image.get('src', '')) for image in soup.find_all('img')}
             for image in soup.find_all('img'):
-                path = str(image.get('src', ''))
+                required.update(path for path in (image.get('data-original-src', ''), *image.get('data-original-srcs', '').split())
+                                if FAST_PATH.fullmatch(path))
+            for path in required:
                 if path not in assets:
                     raise ValueError('Изображение HTML отсутствует в манифесте')
                 saved_asset = self.asset(ident, path[4:])
@@ -541,7 +546,7 @@ class SavedResults:
     def asset(self, ident, name):
         with self.lock:
             folder = self._folder(self._record(ident))
-            if not re.fullmatch(r'[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif|bmp|tif|tiff)', name, re.I):
+            if not served_asset_name(name):
                 raise FileNotFoundError('Изображение не найдено')
             directory = folder / 'src'
             path = directory / name

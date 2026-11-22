@@ -15,8 +15,10 @@ import re
 from urllib.parse import unquote, urlsplit
 
 
-MAX_IMAGE_BYTES = 128 * 1024 * 1024
-MAX_IMAGE_PIXELS = 80_000_000
+if __package__:
+    from .fast_resources import FAST_PATH, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, exact_record
+else:
+    from fast_resources import FAST_PATH, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, exact_record
 RASTER_MIMES = frozenset({'image/png', 'image/jpeg', 'image/jpg', 'image/gif',
                           'image/webp', 'image/bmp', 'image/tiff', 'image/x-icon'})
 
@@ -212,13 +214,57 @@ def _read_reference(value: str, source: Path, resource_root: Path | None):
     return candidate.read_bytes()
 
 
-def externalize_images(soup, source: Path, assets_dir: Path, *, resource_root: Path | None = None) -> dict:
+def externalize_images(soup, source: Path, assets_dir: Path, *, resource_root: Path | None = None,
+                       fast_assets=None) -> dict:
     """Replace document image sources with deterministic relative asset paths."""
     assets, warnings, seen = [], [], set()
+    def save_exact(path):
+        if not FAST_PATH.fullmatch(path) or path not in fast_assets:
+            raise ValueError('В быстром результате отсутствует ресурс PDF')
+        if path not in seen:
+            data = fast_assets[path]
+            record = exact_record(path, data)
+            (assets_dir / Path(path).name).write_bytes(data)
+            seen.add(path)
+            assets.append(record)
+
     for image in soup.find_all('img'):
         value = str(image.get('src', '')).strip()
         image.attrs.pop('srcset', None)
+        original = image.attrs.pop('data-original-src', '')
+        extra = image.attrs.pop('data-original-srcs', '').split()
+        originals = list(dict.fromkeys(([original] if original else []) + extra))
         if not value:
+            if fast_assets is not None and originals:
+                raise ValueError('Для оригинала PDF отсутствует изображение предпросмотра')
+            continue
+        if fast_assets is not None and (value.startswith('src/fast-') or originals):
+            if not value.endswith(('.png', '.jpg')):
+                raise ValueError('Для предпросмотра PDF требуется PNG или JPEG')
+            save_exact(value)
+            for path in originals:
+                save_exact(path)
+            if len(originals) > 1:
+                image['data-original-srcs'] = ' '.join(originals)
+                previous = image.find_next_sibling()
+                if previous and previous.has_attr('data-fast-original-links'):
+                    previous.decompose()
+                links = soup.new_tag('span')
+                links['data-fast-original-links'] = ''
+                for number, path in enumerate(originals, 1):
+                    link = soup.new_tag('a', href=path, download='')
+                    link.string = f'Оригинал {number}'
+                    links.extend([' ', link])
+                image.insert_after(links)
+            elif originals and originals[0] != value:
+                image['data-original-src'] = originals[0]
+                link = image.parent
+                if link.name != 'a':
+                    link = soup.new_tag('a')
+                    image.wrap(link)
+                link['href'] = originals[0]
+                link['download'] = ''
+                link['title'] = 'Скачать оригинал изображения'
             continue
         try:
             record = store_image_bytes(_read_reference(value, source, resource_root), assets_dir,

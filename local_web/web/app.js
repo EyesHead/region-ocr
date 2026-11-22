@@ -3,7 +3,7 @@
   const $ = (selector) => document.querySelector(selector);
   const formats = { markdown: 'Markdown', html: 'HTML', json: 'JSON', plaintext: 'Текст' };
   const supported = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'webp', 'gif']);
-  const state = { jobs: [], uploading: [], format: 'html', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false, openingOutput: false };
+  const state = { jobs: [], uploading: [], format: 'html', pdfMode: 'quality', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false, openingOutput: false };
   const lifecycleNames = { uploading: 'Загрузка файла…', ready: 'Готов к обработке', queued: 'В очереди', running: 'Обработка…', error: 'Не удалось обработать', cancelled: 'Обработка остановлена', done: 'Результат готов', export: 'Нужен новый экспорт' };
   const nameCollator = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
   let toastTimer;
@@ -259,6 +259,12 @@
         reexport.disabled = state.busy || state.savingAll || state.saving.has(job.id) || !state.connected;
         results.push(reexport);
       }
+      if (extension(job.name) === 'pdf' && (job.pdf_mode || 'quality') !== state.pdfMode) {
+        const label = state.pdfMode === 'fast' ? 'Обработать в быстром режиме' : 'Обработать в точном режиме';
+        const again = button(label, 'button button-outline', () => startJobs([job.id], true));
+        again.disabled = state.busy || state.savingAll || state.saving.has(job.id) || !state.connected;
+        results.push(again);
+      }
       group('Результат', results);
     }
     const documentActions = [originalButton(job)];
@@ -489,6 +495,9 @@
     if (added) meta.push(`Добавлен: ${added}`);
     if (job.pages) meta.push(`Выбраны страницы ${job.pages.replace('-', '–')}`);
     if (job.size !== undefined) meta.push(sizeText(job.size));
+    if (extension(job.name) === 'pdf' && ['queued', 'running', 'done', 'export'].includes(lifecycle)) {
+      meta.push(job.pdf_mode === 'fast' ? 'Быстрый режим' : 'Точный режим');
+    }
     if (status === 'done') meta.push(`→ ${formats[convertedFormat]}`);
     main.append(element('p', 'job-meta', meta.join(' · ')));
     const pages = extension(job.name) === 'pdf' ? job.source_page_count || job.stats?.pages : job.stats?.pages;
@@ -595,7 +604,7 @@
     const list = $('#job-list');
     const existingRows = new Map([...list.children].map(row => [row.dataset.id, row]));
     const nextRows = visibleJobs.map(job => {
-      const key = JSON.stringify([state.format, state.busy, state.connected, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), job]);
+      const key = JSON.stringify([state.format, state.pdfMode, state.busy, state.connected, state.savingAll, state.saving.has(job.id), state.opening.has(job.saved_result_id), state.opening.has(`source:${job.id}`), state.deleting.has(`job:${job.id}`), job]);
       const previous = existingRows.get(job.id);
       if (previous?.dataset.renderKey === key) return previous;
       const row = createJobRow(job);
@@ -652,10 +661,10 @@
     $('#queue-summary').textContent = jobs.length ? `${visibleJobs.length === jobs.length ? countText(jobs.length, ['документ', 'документа', 'документов']) : `Показано ${visibleJobs.length} из ${jobs.length}`}${completed.length ? ` · Готово: ${completed.length}` : ''}${needsExport.length ? ` · Нужен экспорт: ${needsExport.length}` : ''}${queued.length ? ` · К обработке: ${queued.length}` : ''}` : 'Файлы появятся здесь после загрузки';
     $('#results-footnote').textContent = completed.length ? 'Готовые документы можно открыть или сохранить.' : active ? 'Документы обрабатываются последовательно. Можно продолжать добавлять файлы.' : 'Файлы и результаты доступны в «Истории»';
     const notes = {
-      markdown: 'Для заметок и текстовых редакторов. Сохраняет структуру документа.',
-      html: 'Для просмотра в браузере. Сохраняет таблицы, формулы и изображения.',
-      json: 'Для дальнейшей обработки данных. Сохраняет структуру таблиц и ссылки на изображения.',
-      plaintext: 'Текст без оформления. Для таблиц и формул выберите HTML или JSON.'
+      markdown: 'Для заметок и текстовых редакторов.',
+      html: 'Для просмотра в браузере.',
+      json: 'Структурированные данные для программ и языковых моделей.',
+      plaintext: 'Текст без оформления.'
     };
     $('#format-note').textContent = notes[state.format];
     if (updateSnapshot?.installing) renderUpdates(updateSnapshot);
@@ -736,10 +745,18 @@
     try {
       const result = await api('/api/status');
       state.jobs = result.jobs || [];
+      const fastAvailable = Array.isArray(result.pdf_modes) && result.pdf_modes.includes('fast');
+      const fastOption = $('input[name="pdf-mode"][value="fast"]');
+      fastOption.disabled = !fastAvailable;
+      $('#pdf-mode-restart').hidden = fastAvailable;
+      if (!fastAvailable && state.pdfMode === 'fast') {
+        state.pdfMode = 'quality';
+        $('input[name="pdf-mode"][value="quality"]').checked = true;
+      }
       updateOutputDirectory(result.output_dir, result.storage_error || '');
       state.connected = true;
       $('#connection-error').hidden = true;
-      const label = result.engine_ready ? 'Готов к обработке' : ['starting', 'warming'].includes(result.engine_runtime?.phase) ? 'Подготовка к обработке…' : 'Обработка пока недоступна';
+      const label = result.engine_ready ? 'Точный режим готов' : ['starting', 'warming'].includes(result.engine_runtime?.phase) ? 'Подготовка точного режима…' : 'Точный режим пока недоступен';
       $('#engine-label').textContent = label;
       $('#engine-status').className = `engine-status ${result.engine_runtime?.phase === 'warming' ? 'warming' : result.engine_ready ? 'ready' : 'unavailable'}`;
       $('#engine-status').title = label;
@@ -859,11 +876,11 @@
       }
     }
   }
-  async function startJobs(ids) {
+  async function startJobs(ids, reprocess = false) {
     closePageMenu();
     state.busy = true;
     render();
-    try { await post('/api/start', { ids, format: state.format }); }
+    try { await post(reprocess ? '/api/reprocess' : '/api/start', { ids, format: state.format, pdf_mode: state.pdfMode }); }
     catch (error) { toast(error.message); }
     finally { state.busy = false; await refresh(); }
   }
@@ -1107,6 +1124,12 @@
   $('#dropzone').addEventListener('drop', event => { event.preventDefault(); dragDepth = 0; $('#dropzone').classList.remove('drag-over'); uploadFiles([...event.dataTransfer.files]); });
   window.addEventListener('dragover', event => event.preventDefault());
   window.addEventListener('drop', event => event.preventDefault());
+  document.querySelectorAll('input[name="pdf-mode"]').forEach(input => input.addEventListener('change', () => {
+    if (input.checked) {
+      state.pdfMode = input.value;
+      render();
+    }
+  }));
   document.querySelectorAll('[data-format]').forEach(node => node.addEventListener('click', () => {
     state.format = node.dataset.format;
     document.querySelectorAll('[data-format]').forEach(item => { const selected = item.dataset.format === state.format; item.classList.toggle('selected', selected); item.setAttribute('aria-pressed', String(selected)); });

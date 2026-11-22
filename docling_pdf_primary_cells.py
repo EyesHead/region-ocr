@@ -765,3 +765,113 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
     api.diagnostic_event('PRIMARY_TABLE_SOURCE_CELLS_RECOVERED', page=page,
                          cells=len(proposals), graphic_columns=sorted(graphic_columns))
     return result, geometry
+
+
+def _painted_link_symbol(path, page_no, model_box, link_box, symbol):
+    """Measure the drawn PDF text object's contribution in a private read-only document."""
+    from PIL import ImageChops
+    from docling.utils.locks import pypdfium2_lock
+    import pypdfium2 as pdf
+    from pypdfium2 import raw
+
+    with pypdfium2_lock, pdf.PdfDocument(path) as document:
+        page = document[page_no - 1]
+        try:
+            if page.get_rotation():
+                return False
+            width, height = page.get_size()
+            l, t, r, b = model_box
+            text = page.get_textpage()
+            try:
+                a, y, c, z = link_box
+                if text.get_text_bounded(a, height-z, c, height-y).strip() != symbol:
+                    return False
+                index = text.get_index((l+r)/2, height-(t+b)/2, 0, 0)
+                if index is None or text.get_text_range(index, 1) != symbol:
+                    return False
+                obj = text.get_textobj(index)
+                if (obj is None or obj.extract().strip() != symbol
+                        or raw.FPDFTextObj_GetTextRenderMode(obj.raw) != 0):
+                    return False
+                left, low, right, high = obj.get_bounds()
+                # The visible glyph must lie in both the link and its measured model cell.
+                if not (a <= left < right <= c and y <= height-high < height-low <= z
+                        and l-1 <= left and right <= r+1 and t-1 <= height-high and height-low <= b+1):
+                    return False
+                scale = 3
+                pad = 1 / scale
+                margins = tuple(max(0, v-pad) for v in (left, low, width-right, height-high))
+                def raster():
+                    bitmap = page.render(scale=scale, crop=margins)
+                    try:
+                        return bitmap.to_pil().convert('RGB')
+                    finally:
+                        bitmap.close()
+                with raster() as before:
+                    if not raw.FPDFPageObj_SetIsActive(obj.raw, False):
+                        return False
+                    with raster() as after, ImageChops.difference(before, after) as delta:
+                        ink = delta.getbbox()
+                        return bool(ink and ink[2]-ink[0]+2 >= .9*(right-left)*scale
+                                    and ink[3]-ink[1]+2 >= .9*(high-low)*scale)
+            finally:
+                text.close()
+        finally:
+            page.close()
+
+
+def restore_link_symbol(content, profile, item, reader, page_no):
+    """Recover a single linked symbol when the full model grid and other cell texts agree."""
+    from unicodedata import category
+
+    if reader is None or profile['rows'] < 2 or profile['columns'] < 2:
+        return content, None
+    candidates = profile['cells']
+    if not any(len(c['text']) == 1 and category(c['text']).startswith('S') for c in candidates):
+        return content, None
+    grid = {(c.start_row_offset_idx, c.start_col_offset_idx, c.row_span, c.col_span): c for c in item.data.table_cells}
+    positions = [tuple(c[k] for k in POSITION) for c in candidates]
+    if (len(grid) != len(item.data.table_cells) or len(positions) != len(grid) or set(positions) != set(grid)
+            or item.data.num_rows != profile['rows'] or item.data.num_cols != profile['columns']):
+        return content, None
+    differences = [(i, c, grid[pos]) for i, (c, pos) in enumerate(zip(candidates, positions))
+                   if ' '.join(c['text'].split()) != ' '.join(grid[pos].text.split())]
+    if len(differences) != 1:
+        return content, None
+    index, ocr, model = differences[0]
+    old, symbol = ocr['text'], model.text
+    if (len(old) != 1 or len(symbol) != 1 or not all(category(v).startswith('S') for v in (old, symbol))
+            or not model.bbox or model.row_span != 1 or model.col_span != 1):
+        return content, None
+    try:
+        page = reader.pdf.pages[page_no - 1]
+        box = model.bbox.to_top_left_origin(page.height).as_tuple()
+        def bounds(obj):
+            return tuple(obj[k] for k in ('x0','top','x1','bottom'))
+        def overlaps(a, b):
+            return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+        links = [bounds(a) for a in (page.annots or []) if a.get('uri') and overlaps(bounds(a), box)]
+        if len(links) != 1:
+            return content, None
+        link = links[0]
+        if not (link[0] <= box[0] < box[2] <= link[2] and link[1] <= box[1] < box[3] <= link[3]):
+            return content, None
+        if (any(c.bbox is None or overlaps(c.bbox.to_top_left_origin(page.height).as_tuple(), link)
+                for c in grid.values() if c is not model)
+                or any(overlaps(bounds(image), link) for image in page.images)):
+            return content, None
+        chars = [g for g in page.chars if overlaps(bounds(g),link) and g['text'].strip()]
+        if len(chars) != 1 or chars[0]['text'] != symbol:
+            return content, None
+        parsed = BeautifulSoup(content, 'html.parser')
+        nodes = parsed.find_all(['td','th'])
+        if (len(nodes) != len(candidates) or parsed.table.find('table') or nodes[index].find(True)
+                or nodes[index].string != old):
+            return content, None
+        if not _painted_link_symbol(reader.path, page_no, box, link, symbol):
+            return content, None
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        return content, None
+    nodes[index].string.replace_with(symbol)
+    return str(parsed), dict(row=ocr['row'], column=ocr['column'], before=old, after=symbol,
+                                   bbox=list(box), method='visible_native_link_symbol_in_matching_model_grid')

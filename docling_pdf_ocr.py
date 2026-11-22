@@ -27,8 +27,18 @@ def _layout_error(item, output):
     if item.prompt_type == 'layout':
         from surya.inference.parsers import parse_layout
         try:
-            parse_layout(output.raw)
-        except (ValueError, TypeError, KeyError) as error:
+            blocks = parse_layout(output.raw)
+            if item.metadata.get('purpose') == 'physical_cell_layout':
+                # Surya logs and drops bad boxes. A partial layout can turn a
+                # mixed text/picture cell into an apparently picture-only cell.
+                raw_array = output.raw[output.raw.index('['):output.raw.rindex(']') + 1]
+                if len(blocks) != len(json.loads(raw_array)):
+                    return 'invalid_layout: parser dropped one or more cell regions'
+                for block in blocks:
+                    left, top, right, bottom = block.bbox
+                    if not (0 <= left < right <= 1000 and 0 <= top < bottom <= 1000):
+                        return 'invalid_layout: cell region outside normalized crop bounds'
+        except (ValueError, TypeError, KeyError, OverflowError) as error:
             return f'invalid_layout: {error}'
     elif item.prompt_type == 'high_accuracy_bbox':
         from surya.inference.parsers import parse_full_page_html

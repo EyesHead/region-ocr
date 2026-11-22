@@ -56,6 +56,76 @@ def attach_source_captions(doc,excluded,manifest,api):
     return repairs
 
 
+def bind_figure_pair_after_legend(doc, records, registry, manifest, api):
+    """Resolve a caption between two illustrations using their printed sequence."""
+    from collections import defaultdict
+    from docling_pdf_forms import FIGURE_CAPTION, _reparent_form
+
+    pages = defaultdict(list)
+    for item in (*doc.pictures, *doc.tables, *doc.texts):
+        pos = api.item_region(item, doc)
+        if pos:
+            pages[pos[0]].append((item, pos[1]))
+    primary = defaultdict(list)
+    for record in records:
+        if record.get('label') == 'Caption' and record.get('bbox'):
+            primary[record['page_no'], ' '.join((record.get('text') or '').split())].append(record['bbox'])
+
+    for page, items in pages.items():
+        if not any(str(item.label) == 'picture' and item.captions for item, _ in items):
+            continue
+        items.sort(key=lambda pair: pair[1][1])
+        for i in range(len(items) - 4):
+            sequence = items[i:i+5]
+            (upper, u), (legend, l), (first, a), (lower, v), (second, b) = sequence
+            if str(upper.label) != 'picture' or str(lower.label) != 'picture':
+                continue
+            first_title = FIGURE_CAPTION.fullmatch(getattr(first, 'text', ''))
+            next_title = FIGURE_CAPTION.fullmatch(getattr(second, 'text', ''))
+            if not first_title or not next_title or not first_title['title'] or not next_title['title']:
+                continue
+            numbers = [re.fullmatch(r'(.*?)(\d+)', re.sub(r'\s+', '', title['number']))
+                       for title in (first_title, next_title)]
+            if numbers[0][1] != numbers[1][1] or int(numbers[0][2])+1 != int(numbers[1][2]):
+                continue
+            if not re.fullmatch(r'\s*\d+\s*[-–—]\s*[^;\n]+(?:;\s*\d+\s*[-–—]\s*[^;\n]+)+\s*',
+                                getattr(legend, 'text', '')):
+                continue
+            # All five boxes share the same column. The intervening legend and
+            # both captions have independent matching records in the page OCR.
+            common_width = min(box[2] for _, box in sequence) - max(box[0] for _, box in sequence)
+            if common_width < .8 * min(box[2]-box[0] for _, box in sequence):
+                continue
+            em = min(box[3]-box[1] for box in (l, a, b))
+            if any(not 0 <= right[1]-left[3] <= 3*em for (_, left), (_, right) in zip(sequence, sequence[1:])):
+                continue
+            if not all(sum(api.overlap_ratio(box, other) >= .9
+                           for other in primary[page, ' '.join(text.text.split())]) == 1
+                       for text, box in ((legend, l), (first, a), (second, b))):
+                continue
+            wrong_link = any(ref.cref == first.self_ref for ref in lower.captions)
+            if not wrong_link:
+                continue
+            owned = {legend.self_ref, first.self_ref, second.self_ref}
+            if (upper.parent != lower.parent or upper.captions
+                    or any(ref.cref not in owned for pic in (upper, lower) for ref in [*pic.children, *pic.captions])
+                    or any(registry.get(pic.self_ref, {}).get('source_table_refs') for pic in (upper, lower))):
+                continue
+            for pic, box, title, capbox, captions in ((upper, u, first, a, [legend, first]),
+                                                      (lower, v, second, b, [second])):
+                _reparent_form(doc, pic, captions)
+                entry = dict(ref=pic.self_ref, original_ref=pic.self_ref, page=page, original_bbox=list(box),
+                             bbox=list(box), caption_ref=title.self_ref, caption_refs=[c.self_ref for c in captions],
+                             caption_text=title.text, caption_bbox=list(capbox), caption_position='after',
+                             source_font=em, source_table_refs=[], excluded_refs=[], primary_records=[],
+                             method='numbered_figure_pair_after_legend')
+                registry[pic.self_ref] = entry
+                entries = manifest.setdefault('captioned_figures', [])
+                entries[:] = [old for old in entries if old['ref'] != pic.self_ref]
+                entries.append(entry)
+                api.diagnostic_event('FIGURE_CAPTION_OWNER_REPAIRED', **entry)
+
+
 def restore_prose_beside_figures(doc, figures, records, excluded, manifest, api):
     """Return misassigned caption text to its reading position outside a source figure."""
     from collections import Counter

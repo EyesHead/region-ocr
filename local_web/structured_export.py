@@ -550,7 +550,12 @@ def _rich(node):
         return {'type': 'formula', 'latex': node.get('data-latex') or node.get_text().strip(),
                 'display': node.get('data-formula') == 'display'}
     if node.name == 'img':
-        return {'type': 'image', 'src': node.get('src', ''), 'alt': node.get('alt', '')}
+        item = {'type': 'image', 'src': node.get('src', ''), 'alt': node.get('alt', '')}
+        if node.get('data-original-src'):
+            item['original_src'] = node['data-original-src']
+        if node.get('data-original-srcs'):
+            item['original_sources'] = node['data-original-srcs'].split()
+        return _source_metadata(node, item)
     if node.name == 'br':
         return {'type': 'break'}
     if node.name == 'table':
@@ -659,6 +664,7 @@ def _source_metadata(node, item):
             item[prop.lower().replace('-', '_')] = value.strip()
     if node.get('data-page-furniture') == 'true':
         item['page_furniture'] = True
+    if node.name == 'img' or item.get('page_furniture'):
         try:
             page = int(node.get('data-source-page', ''))
             bounds = [float(value) for value in node.get('data-source-bbox', '').split(',')]
@@ -703,6 +709,18 @@ def _json_blocks(container):
         elif node.name in BLOCK_TAGS - {'p'}:
             metadata = _source_metadata(node, {})
             children = _json_blocks(node)
+            # The fast PDF reader groups its blocks by physical source page,
+            # including empty pages and pages preserved as an image.
+            if node.name == 'section' and node.get('data-text-method') in ('native', 'ocr', 'blank'):
+                number = node.get('data-source-page', '')
+                try:
+                    physical_page = int(number)
+                except (TypeError, ValueError):
+                    physical_page = 0
+                if physical_page > 0 and node.get('id') == f'page-{physical_page}' and number == str(physical_page):
+                    metadata['source_page'] = physical_page
+                    for child in children:
+                        child.setdefault('source_page', metadata['source_page'])
             if metadata:
                 output.append(dict(type='group', children=children, **metadata))
             else:

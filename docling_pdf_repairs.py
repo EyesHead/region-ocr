@@ -312,7 +312,8 @@ def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api, 
         return note_routes, native_candidates
     pages = sorted({p.page_no for t in doc.tables for p in t.prov})
     for page_no in pages:
-        reader.load_page(page_no)
+        if reader.page_with_tables(page_no) is None:
+            continue
         source_tables = list(reader.tables)
         for source_table in source_tables:
             box = list(source_table.bbox)
@@ -598,6 +599,19 @@ def recover_uncovered_ocr_table_text(doc, reader, records, routes, excluded, not
             text = api.semantic_ocr_text(str(cell))
             box = [min(g['x0'] for g in glyphs), min(g['top'] for g in glyphs),
                    max(g['x1'] for g in glyphs), max(g['bottom'] for g in glyphs)]
+            if previous and not following and not cell.find(['math', 'sub', 'sup', 'img', 'svg', 'a']):
+                # A physical full-width note owns more space than its printed
+                # glyphs. Check containment in that direction and retain its
+                # native spelling when OCR substituted a look-alike letter.
+                native_note = next((note for note in manifest.get('recovered_source_notes', [])
+                    if note.get('method') == 'literal_notes_in_source_fullwidth_cell'
+                    and note.get('table') == previous['ref'] and note.get('page') == page_no
+                    and note.get('bbox') and _coverage(box, note['bbox']) == 1
+                    and key(note['text']) == key(text) == key(native)), None)
+                if native_note:
+                    api.diagnostic_event('OCR_TABLE_NOTE_ALREADY_RECOVERED', page=page_no,
+                        table=previous['ref'], ref=native_note['ref'], source_row=row)
+                    continue
             if any((loc := api.item_region(item, doc)) and loc[0] == page_no
                    and _coverage(loc[1], [box[0]-3, box[1]-3, box[2]+3, box[3]+3]) >= .8
                    and key(item.text) in {key(text), key(native)} for item in doc.texts

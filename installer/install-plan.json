@@ -1076,6 +1076,14 @@
   },
   "models": [
     {
+      "path": "models/rapidocr/eslav_PP-OCRv5_rec_mobile.onnx",
+      "bytes": 7911802,
+      "sha256": "08705d6721849b1347d26187f15a5e362c431963a2a62bfff4feac578c489aab",
+      "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/eslav_PP-OCRv5_rec_mobile.onnx",
+      "license": "Apache-2.0",
+      "upstream": "https://huggingface.co/PaddlePaddle/eslav_PP-OCRv5_mobile_rec"
+    },
+    {
       "path": "models/orientation/PP-LCNet_x1_0_doc_ori.onnx",
       "bytes": 6788069,
       "sha256": "af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92",

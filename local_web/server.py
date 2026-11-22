@@ -29,11 +29,17 @@ import tempfile
 
 if __package__:
     from . import formula_preview
+    from .converter import PDF_MODES
+    from .export_bundle import FAST_PDF_STAT_KEYS
+    from .fast_resources import ASSET_TYPES, served_asset_name
     from .file_paths import native_path, normal_path
     from .result_storage import ResultStorage
     from .conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 else:
     import formula_preview
+    from converter import PDF_MODES
+    from export_bundle import FAST_PDF_STAT_KEYS
+    from fast_resources import ASSET_TYPES, served_asset_name
     from file_paths import native_path, normal_path
     from result_storage import ResultStorage
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
@@ -156,6 +162,8 @@ class JobStore:
                 # A manifest cannot direct file reads/deletion outside this workspace.
                 job["source"] = str(self.root / ident / "input" / safe_filename(job["name"]))
                 job.setdefault('pages', '')
+                if job.get('pdf_mode') not in PDF_MODES or Path(job['name']).suffix.lower() != '.pdf':
+                    job['pdf_mode'] = 'quality'
                 if 'source_page_count' not in job and native_path(job['source']).is_file():
                     job.update(source_page_metadata(job['source']))
                 job.setdefault('source_page_count', None)
@@ -212,7 +220,8 @@ class JobStore:
         if error is None:
             error = ConversionFailure(job.get('error', ''), dict(
                 kind=job.get('error_kind'), location=job.get('error_location')))
-        failure = describe_conversion_failure(error, self.root / job['id'] / 'result' / 'engine')
+        engine = None if job.get('pdf_mode') == 'fast' else self.root / job['id'] / 'result' / 'engine'
+        failure = describe_conversion_failure(error, engine)
         return dict(user_error=failure['message'], error_kind=failure['kind'],
                     error_action=failure['action'], error_retryable=failure['retryable'],
                     error_location=failure['location'])
@@ -225,7 +234,7 @@ class JobStore:
                   if key not in {"source", "source_pdf", "artifacts", "packages", "replay_html", "attempt_id", "review_count", "reviewed_count", "review_error_count"}
                   and not key.startswith(('_', 'technical_'))}
         result['warnings'] = [text for text in result.get('warnings', []) if not (
-            re.match(r'^Страница PDF \d+: ', str(text))
+            (job.get('pdf_mode') != 'fast' and re.match(r'^Страница PDF \d+: ', str(text)))
             or str(text).startswith(('Результат требует сверки с исходным документом.',
                                      'Проверьте строки, столбцы и значения таблицы: её сетка',
                                      'Движок пометил результат для визуальной проверки таблиц')))]
@@ -253,7 +262,7 @@ class JobStore:
                 jobs.append(public)
             runtime = self.engine_host.snapshot() if self.engine_host is not None else None
             idle_ready = bool(runtime and runtime.get('phase') == 'stopped' and self.engine.get('available'))
-            return {"version": VERSION, "session_id": self.session_id,
+            return {"version": VERSION, "session_id": self.session_id, "pdf_modes": PDF_MODES,
                     "engine": "convert_docling · local", "engine_ready": idle_ready or runtime.get('phase') == 'ready' if runtime else bool(self.engine.get("available")),
                     "engine_message": 'Готов к обработке' if idle_ready else runtime['message'] if runtime else self.engine.get("message", ""),
                     "engine_runtime": runtime,
@@ -401,7 +410,7 @@ class JobStore:
             job = {"id": ident, "name": name, "size": size, "source": str(path),
                    "status": "queued", "progress": 0, "stage": "Ожидает запуска", "error": "",
                    "stats": {}, "warnings": [], "artifacts": {}, "created_at": utc_now(),
-                   'pages': '', 'source_available': True, **source_page_metadata(path)}
+                   'pages': '', 'pdf_mode': 'quality', 'source_available': True, **source_page_metadata(path)}
             with self.lock:
                 previous = guard.validate_commit(ticket)
                 self.jobs[ident] = job
@@ -481,7 +490,9 @@ class JobStore:
             self._save()
         return self.snapshot()
 
-    def start(self, ids, pages=None, output_format="html", *, export_only=False, reprocess=False):
+    def start(self, ids, pages=None, output_format="html", *, export_only=False, reprocess=False, pdf_mode=None):
+        if pdf_mode is not None and pdf_mode not in PDF_MODES:
+            raise APIError('Неизвестный режим обработки PDF.')
         if output_format not in FORMATS:
             raise APIError("Неизвестный формат результата.")
         if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
@@ -500,6 +511,8 @@ class JobStore:
                     continue
                 selected_pages = chosen_pages[ident]
                 if not export_only:
+                    mode = pdf_mode if pdf_mode is not None else job.get('pdf_mode', 'quality')
+                    job['pdf_mode'] = mode if Path(job['name']).suffix.lower() == '.pdf' else 'quality'
                     job.update(attempt_id=uuid.uuid4().hex,
                                artifacts={}, packages={}, replay_html=None, stats={}, warnings=[])
                     job.pop('completed_at', None)
@@ -512,7 +525,9 @@ class JobStore:
                            saved_result_id=None)
                 for field in ('user_error', 'error_kind', 'error_action', 'error_retryable', 'error_location'):
                     job.pop(field, None)
-                append_job_log(self.root / ident, f'{"Повторный экспорт из HTML" if export_only else "Конвертация"}: формат={output_format}; страницы={selected_pages or "все"}.')
+                mode_info = ('; режим PDF=' + job.get('pdf_mode', 'quality')
+                             if Path(job['name']).suffix.lower() == '.pdf' else '')
+                append_job_log(self.root / ident, f'{"Повторный экспорт из HTML" if export_only else "Конвертация"}: формат={output_format}; страницы={selected_pages or "все"}{mode_info}.')
                 self.events[ident] = threading.Event()
                 self.scheduled.add(ident)
                 self.pending.put(ident)
@@ -746,13 +761,13 @@ class JobStore:
         return {'items': items, 'errors': errors}
 
     def asset(self, ident, name):
-        if Path(name).name != name or not re.fullmatch(r"[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif|bmp|tif|tiff)", name, re.I):
+        if not served_asset_name(name):
             raise APIError("Изображение не найдено.", 404)
         folder = self.package(ident)
         path = (folder / "src" / name).resolve()
         if not path.is_relative_to(folder / "src") or not native_path(path).is_file():
             raise APIError("Изображение не найдено.", 404)
-        kind = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp", ".tif": "image/tiff", ".tiff": "image/tiff"}[path.suffix.lower()]
+        kind = ASSET_TYPES[path.suffix.lower()]
         return native_path(path), kind
 
     def _work(self):
@@ -781,7 +796,8 @@ class JobStore:
                         job["stage"] = str(stage)
 
             try:
-                if self.converter is None and not job.get('_replay') and Path(job['source']).suffix.lower() not in {'.html', '.htm', '.xlsx', '.docx'}:
+                if (self.converter is None and not job.get('_replay') and job.get('pdf_mode') != 'fast'
+                        and Path(job['source']).suffix.lower() not in {'.html', '.htm', '.xlsx', '.docx'}):
                     while not self.engine_probe_done.wait(.15):
                         if event.is_set() or self.stopping.is_set():
                             raise RuntimeError('Обработка отменена до подготовки движка')
@@ -789,6 +805,8 @@ class JobStore:
                     archive_engine_logs(self.root / ident)
                 convert = self.converter or importlib.import_module("converter").convert_file
                 runtime_options = {'engine_host': self.engine_host} if self.converter is None else {}
+                if job.get('pdf_mode') == 'fast' and not job.get('_replay'):
+                    runtime_options = {'pdf_mode': 'fast'}
                 result = convert(Path(job["source"]), self.root / ident / "result",
                                  pages=job.get("pages", ""), on_progress=progress, cancel_event=event,
                                  output_format=job.get("format", "html"), replay_html=job.get("_replay"), **runtime_options)
@@ -809,6 +827,9 @@ class JobStore:
                         if job.get("_replay") and result.get("stats", {}).get("pages") is None:
                             result["stats"]["pages"] = job.get("stats", {}).get("pages")
                         if job.get("_replay"):
+                            for key in FAST_PDF_STAT_KEYS:
+                                if key in job.get('stats', {}):
+                                    result['stats'][key] = job['stats'][key]
                             result['warnings'] = list(dict.fromkeys(job.get('warnings', []) + result.get('warnings', [])))
                         job.update(status="done", progress=100, stage="Готово", artifacts=artifacts, packages=packages,
                                    replay_html=str(replay), export_schema=result.get("export_schema"), legacy_export=False,
@@ -954,9 +975,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _image_type(path):
-        return {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp',
-                '.tif': 'image/tiff', '.tiff': 'image/tiff'}[path.suffix.lower()]
+        return ASSET_TYPES[path.suffix.lower()]
 
     def _dispatch(self):
         self._check_host(self.command != "GET")
@@ -1000,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
                     kind = self._image_type(file)
                 else:
                     file, kind = store.asset(job_id, name)
-                return self._file(file, kind)
+                return self._file(file, kind, file.name if kind == 'application/pdf' else None)
             match = re.fullmatch(r"/api/(download|document|preview)/([0-9a-f]{32})", path)
             if match:
                 if match[1] == "download":
@@ -1025,7 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/assets/([0-9a-f]{32})/([^/]+)", path)
             if match:
                 file, kind = store.asset(match[1], unquote(match[2]))
-                return self._file(file, kind)
+                return self._file(file, kind, file.name if kind == 'application/pdf' else None)
             if path == "/api/archive":
                 return self._archive(fmt)
             static = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -1105,13 +1124,15 @@ class Handler(BaseHTTPRequestHandler):
                                               replace_token=query.get('replace_token', [None])[0]), 201)
             if path == "/api/start":
                 data = self._body()
-                return self._json(store.start(data.get("ids"), data.get("pages"), data.get("format", "html")))
+                return self._json(store.start(data.get("ids"), data.get("pages"), data.get("format", "html"),
+                                              pdf_mode=data.get("pdf_mode")))
             if path == "/api/export":
                 data = self._body()
                 return self._json(store.start(data.get("ids"), data.get("pages"), data.get("format", "html"), export_only=True))
             if path == "/api/reprocess":
                 data = self._body()
-                return self._json(store.start(data.get("ids"), data.get("pages"), data.get("format", "html"), reprocess=True))
+                return self._json(store.start(data.get("ids"), data.get("pages"), data.get("format", "html"),
+                                              reprocess=True, pdf_mode=data.get("pdf_mode")))
             if path == "/api/cancel":
                 return self._json(store.cancel(self._body().get("ids")))
             if path == "/api/shutdown":

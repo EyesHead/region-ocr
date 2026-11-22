@@ -10,12 +10,15 @@ import uuid
 if __package__:
     from . import formula_preview
     from .file_paths import native_path, normal_path
+    from .fast_resources import FAST_PATH, exact_record
 else:
     import formula_preview
     from file_paths import native_path, normal_path
+    from fast_resources import FAST_PATH, exact_record
 
 EXPORT_SCHEMA = 14
 CANONICAL_MANIFEST_SCHEMA = 1
+FAST_PDF_STAT_KEYS = ('native_pages', 'ocr_pages', 'blank_pages', 'image_fallback_pages', 'vector_tables', 'scan_tables')
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
 FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
 
@@ -59,18 +62,35 @@ def _check_assets(replay, manifest):
             raise ValueError('Канонический кроп изображения изменён после обработки')
 
 
+def _fast_references(soup):
+    for image in soup.find_all('img'):
+        for path in (image.get('src', ''), image.get('data-original-src', ''),
+                     *image.get('data-original-srcs', '').split()):
+            if FAST_PATH.fullmatch(path):
+                yield path
+
+
+def _replay_fast_assets(canonical, soup):
+    return {path: native_path(_asset_path(canonical.parent, path)[1]).read_bytes()
+            for path in set(_fast_references(soup))}
+
+
 def _legacy_manifest(canonical, content_bytes, soup, pages, structured):
     """Index an existing external-asset canonical without rewriting any pixels."""
     from PIL import Image
     records, seen = [], set()
-    for image in soup.find_all('img'):
-        value = str(image.get('src', ''))
+    paths = [str(image.get('src', '')) for image in soup.find_all('img')]
+    for value in [*paths, *_fast_references(soup)]:
         if not value or value in seen:
             continue
         if value.lower().startswith('data:'):
             raise ValueError('Старый HTML со встроенными изображениями требует создания нового канонического документа перед повторным экспортом.')
         relative, origin = _asset_path(canonical.parent, value)
         data = native_path(origin).read_bytes()
+        if FAST_PATH.fullmatch(value):
+            records.append(exact_record(value, data))
+            seen.add(value)
+            continue
         with Image.open(native_path(origin)) as opened:
             width, height, image_format = opened.width, opened.height, opened.format
         records.append(dict(path=relative.as_posix(), sha256=hashlib.sha256(data).hexdigest(),
@@ -85,7 +105,7 @@ def _legacy_manifest(canonical, content_bytes, soup, pages, structured):
 
 
 def build_exports(content, source, destination, *, pages=None, output_format='html', resource_root=None,
-                  replay_html=None, initial_warnings=(), initial_joins=()):
+                  replay_html=None, initial_warnings=(), initial_joins=(), fast_pdf_stats=None, fast_assets=None):
     """Create a canonical once, then derive packages without mutating that source."""
     from bs4 import BeautifulSoup
     from docling_pdf_annotations import normalize_semantic_annotations
@@ -128,10 +148,15 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                 sanitized, legacy_warnings = _safe_html(canonical_bytes.decode('utf-8'))
                 return build_exports(str(sanitized), source, destination, pages=pages,
                                      output_format=output_format, resource_root=canonical.parent,
+                                     fast_assets=_replay_fast_assets(canonical, sanitized) or None,
                                      initial_warnings=list(initial_warnings) + legacy_warnings)
             if soup.body is None:
                 raise ValueError('Канонический HTML не содержит body')
             manifest = _legacy_manifest(canonical, canonical_bytes, soup, pages, structured)
+        indexed = {asset['path']: asset['sha256'] for asset in manifest.get('assets', ())}
+        for path in set(_fast_references(soup)):
+            if indexed.get(path) != FAST_PATH.fullmatch(path).group(1):
+                raise ValueError('Ресурс PDF не соответствует манифесту')
         _check_assets(canonical.parent, manifest)
         comparison_info = manifest.get('formula_preview')
         if comparison_info:
@@ -144,8 +169,9 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
             normalize_semantic_annotations(soup, {}, {})
             content = formula_preview.migration_content(canonical, comparison_info, soup)
             return build_exports(content, source, destination,
-                                 pages=manifest['stats'].get('pages', pages),
+                                 pages=manifest['stats'].get('pages', pages), fast_pdf_stats=manifest['stats'],
                                  output_format=output_format, resource_root=canonical.parent,
+                                 fast_assets=_replay_fast_assets(canonical, soup) or None,
                                  initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
                                  initial_joins=list(initial_joins) + manifest.get('table_joins', []))
         removed_reviews = structured.strip_review_annotations(soup)
@@ -157,8 +183,9 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
             # document layer; the OCR/layout snapshot is not involved.
             content = formula_preview.migration_content(canonical, comparison_info, soup)
             return build_exports(content, source, destination,
-                                 pages=manifest['stats'].get('pages', pages),
+                                 pages=manifest['stats'].get('pages', pages), fast_pdf_stats=manifest['stats'],
                                  output_format=output_format, resource_root=canonical.parent,
+                                 fast_assets=_replay_fast_assets(canonical, soup) or None,
                                  initial_warnings=list(initial_warnings) + manifest.get('warnings', []),
                                  initial_joins=list(manifest.get('table_joins', [])) + joins)
     else:
@@ -189,7 +216,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
             replay = destination / '.versions' / uuid.uuid4().hex / '.replay'
         native_path(replay / 'src').mkdir(parents=True, exist_ok=True)
         expected_images = [image for image in soup.find_all('img') if image.get('src')]
-        media = assets.externalize_images(soup, source, native_path(replay / 'src'), resource_root=resource_root)
+        media = assets.externalize_images(soup, source, native_path(replay / 'src'),
+                                         resource_root=resource_root, fast_assets=fast_assets)
         warnings.extend(media.get('warnings', []))
         if any(image.get('data-image-unavailable') == 'true' for image in expected_images):
             raise ValueError('Не удалось сохранить изображение документа: ' + '; '.join(media.get('warnings', [])))
@@ -207,6 +235,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
                         html_sha256=hashlib.sha256(canonical_bytes).hexdigest(), assets=media.get('assets', []),
                         warnings=list(dict.fromkeys(warnings)), stats=_document_stats(soup, pages, structured),
                         table_joins=joins)
+        if fast_pdf_stats:
+            manifest['stats'].update((key, fast_pdf_stats[key]) for key in FAST_PDF_STAT_KEYS if key in fast_pdf_stats)
         if comparison_info:
             manifest['formula_preview'] = comparison_info
         _save_manifest(canonical, manifest)

@@ -74,6 +74,14 @@
           <p class="drop-hint">Один или несколько файлов</p>
         </div>
       </section>
+      <fieldset class="pdf-mode-options">
+        <legend>Режим обработки PDF</legend>
+        <label><input type="radio" name="pdf-mode" value="quality" checked aria-labelledby="quality-mode-title" aria-describedby="quality-mode-help">
+          <span><strong id="quality-mode-title">Точный</strong><small id="quality-mode-help">Восстанавливает ячейки таблиц, формулы и схемы.</small></span></label>
+        <label><input type="radio" name="pdf-mode" value="fast" disabled aria-labelledby="fast-mode-title" aria-describedby="fast-mode-help">
+          <span><strong id="fast-mode-title">Быстрый</strong><small id="fast-mode-help">Извлекает текст и простые таблицы. Сохраняет рисунки и фрагменты формул.</small></span></label>
+        <p id="pdf-mode-restart" class="format-note" hidden>Для быстрого режима перезапустите конвертер.</p>
+      </fieldset>
       <section class="format-section" aria-labelledby="format-title">
         <h2 id="format-title">Формат результата</h2>
         <div class="format-options" role="group" aria-label="Формат новых заданий">
@@ -82,7 +90,7 @@
           <button type="button" class="format-option" data-format="json" aria-pressed="false">JSON</button>
           <button type="button" class="format-option" data-format="plaintext" aria-pressed="false">Текст</button>
         </div>
-        <p class="format-note" id="format-note">Для просмотра в браузере. Сохраняет таблицы, формулы и изображения.</p>
+        <p class="format-note" id="format-note">Для просмотра в браузере.</p>
       </section>
       <div class="convert-actions">
         <p id="selection-note">Добавьте файлы для преобразования</p>

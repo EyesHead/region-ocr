@@ -186,3 +186,26 @@ body{background:var(--canvas);min-height:540px}.sr-only{position:absolute;width:
   .job-name-button{display:inline-flex;align-items:center;min-height:44px}
   .document-search input,.document-sort select{font-size:16px}
 }
+
+.pdf-mode-options {
+  min-width: 0;
+  margin: 18px 0 0;
+  padding: 0;
+  border: 0;
+}
+.pdf-mode-options legend { padding: 0; margin-bottom: 6px; font-size: 15px; font-weight: 600; color: var(--ink); }
+.pdf-mode-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-height: 44px;
+  padding: 7px 3px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.pdf-mode-options input { width: 17px; height: 17px; margin: 2px 0 0; accent-color: var(--navy); flex: none; }
+.pdf-mode-options strong { font-weight: 600; }
+.pdf-mode-options small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+@media (max-width: 760px) {
+  .pdf-mode-options { margin: 0; }
+}

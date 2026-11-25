@@ -183,10 +183,12 @@ def recover_unrouted_native_tables(doc,reader,regions,routes,excluded,manifest,a
     """
     if reader is None:return {}
     from docling_core.types.doc import ContentLayer,DocItemLabel
+    from docling_pdf_cell_pipeline import owns_grid
     candidates=[];rejected=[]
     # The page map is the requested export scope, including any omitted layout
     # pages. The PDF reader still contains the entire source document.
     known_pages={int(page) for page in (manifest.get('pages') or doc.pages)}
+    known_pages.difference_update(entry['page'] for entry in manifest.get('recovered_source_page_images', ()))
     for page in sorted(known_pages):
         try:
             native_page=reader.page_with_tables(page)
@@ -200,6 +202,7 @@ def recover_unrouted_native_tables(doc,reader,regions,routes,excluded,manifest,a
                 proof=complete_native_grid(source,native_page.edges)
                 if not proof:continue
                 box=proof['bbox'];labels,figures=_nearby_labels(box,lines)
+                if owns_grid(manifest, page, box):continue
                 from docling_pdf_forms import form_owns_region
                 if form_owns_region(manifest,page,box):
                     rejected.append(dict(page=page,bbox=box,reason='explicit_source_form_illustration'));continue

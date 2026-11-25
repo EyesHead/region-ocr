@@ -8,6 +8,8 @@ MAX_IMAGE_PIXELS = 80_000_000
 MIME_EXTENSIONS = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/jp2': 'jp2',
                    'image/j2k': 'j2k', 'image/tiff': 'tif', 'application/pdf': 'pdf'}
 FAST_PATH = re.compile(r'src/fast-([0-9a-f]{64})\.(png|jpg|jp2|j2k|tif|pdf)')
+FORMULA_CROP_ATTR = 'data-source-formula-crop'
+FORMULA_CROP_PATH = re.compile(r'src/fast-[0-9a-f]{64}\.png')
 LEGACY_NAME = re.compile(r'[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif|bmp|tif|tiff)', re.I)
 ASSET_TYPES = {'.' + ext: mime for mime, ext in MIME_EXTENSIONS.items()}
 ASSET_TYPES.update({'.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
@@ -16,6 +18,13 @@ ASSET_TYPES.update({'.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/
 
 def served_asset_name(name):
     return isinstance(name, str) and (LEGACY_NAME.fullmatch(name) or FAST_PATH.fullmatch('src/' + name))
+
+
+def formula_crop_paths(soup):
+    for math in soup.find_all('math', attrs={FORMULA_CROP_ATTR: True}):
+        value = math[FORMULA_CROP_ATTR]
+        if FORMULA_CROP_PATH.fullmatch(value):
+            yield value
 
 
 def register_image(image_assets, mime, data):

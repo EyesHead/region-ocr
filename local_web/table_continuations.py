@@ -276,6 +276,10 @@ def join_captioned_tables(soup):
     for index, table in enumerate(events):
         if getattr(table, 'name', None) != 'table':
             continue
+        if table.has_attr('data-balanced-grid'):
+            # The physical edges and column dividers were already matched by the PDF reader.
+            active = None
+            continue
         caption = _caption_for(table, events, index)
         if caption and not caption['title'] and table.get('data-table-continuation-title'):
             caption = dict(caption, title=str(table['data-table-continuation-title']))

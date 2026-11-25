@@ -245,12 +245,32 @@ def install_table_retention(model, args, diagnostic):
         return outputs
 
     def predict_pages(conv_res, pages):
+        from docling_pdf_cell_pipeline import table_predictions
+
         nonlocal current_page
         predictions = []
-        for page in pages:
-            current_page = page.page_no
-            predictions.extend(predict(conv_res, [page]))
-        current_page = None
+        try:
+            for page in pages:
+                current_page = page.page_no
+                tables = getattr(args, 'raster_cell_tables', {}).get(current_page)
+                direct = table_predictions(page, tables) if tables else {}
+                if not direct:
+                    predictions.extend(predict(conv_res, [page]))
+                    continue
+
+                # Keep the layout for reading order. Only these clusters skip
+                # the TableFormer inference and its token reassignment.
+                layout = page.predictions.layout
+                original = layout.clusters
+                try:
+                    layout.clusters = [cluster for cluster in original if cluster.id not in direct]
+                    predicted = predict(conv_res, [page])
+                    predicted[0].table_map.update(direct)
+                    predictions.extend(predicted)
+                finally:
+                    layout.clusters = original
+        finally:
+            current_page = None
         return predictions
 
     model.tf_predictor.multi_table_predict = retain

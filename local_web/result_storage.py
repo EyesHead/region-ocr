@@ -96,11 +96,17 @@ class ResultStorage:
                 return getattr(self._manager(ident), name)(ident, *args, **kwargs)
             return call
         # Non-routing attributes remain compatible with the single-root manager.
-        if name in {'index', 'index_dir', 'logs_dir', 'uploads', 'reserve_source', 'save'}:
+        if name in {'index', 'index_dir', 'logs_dir', 'uploads', 'reserve_source'}:
             if self.active is None:
                 raise ValueError(self.storage_error)
             return getattr(self.active, name)
         raise AttributeError(name)
+
+    def save(self, package, *, output_dir=None, **kwargs):
+        manager = self.active if output_dir is None else self.managers.get(str(output_dir))
+        if manager is None:
+            raise ValueError('Папка сохранения недоступна. Выберите другую папку перед сохранением результатов.')
+        return manager.save(package, **kwargs)
 
     def list(self):
         values = [record for manager in self.managers.values() for record in manager.list()]

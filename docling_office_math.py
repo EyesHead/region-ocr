@@ -15,6 +15,25 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 
+def latex_math(latex, display="block"):
+    """Return executable-free MathML, or None if the notation cannot be parsed."""
+    from bs4 import BeautifulSoup
+    from latex2mathml.converter import convert
+
+    latex = latex.strip().strip("$")
+    if (not latex or latex.count("{") != latex.count("}")
+            or re.search(r"formula not|not decoded|unrecognized formula|не распознан|\ufffd", latex, re.I)):
+        return None
+    try:
+        node = BeautifulSoup(convert(latex, display=display), "html.parser").math
+        if node is None:
+            return None
+        node["data-latex"] = latex
+        return str(node)
+    except Exception:
+        return None
+
+
 def formula_image_candidate(metadata):
     """Use original pixels and placement, not the displayed size of a thumbnail."""
     if metadata.get('formula_item'):

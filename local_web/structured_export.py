@@ -16,8 +16,10 @@ from pathlib import Path
 from bs4 import BeautifulSoup, Comment, NavigableString
 
 if __package__:
+    from .fast_resources import FORMULA_CROP_ATTR, FORMULA_CROP_PATH
     from .table_star_notes import referenced_star_footer
 else:
+    from fast_resources import FORMULA_CROP_ATTR, FORMULA_CROP_PATH
     from table_star_notes import referenced_star_footer
 
 
@@ -152,7 +154,9 @@ def _formula(node):
         result['latex'] = math_to_latex(node)
     except UnsupportedMath as error:
         result.update(representation='mathml_tree', tree=_math_tree(node), warning=str(error))
-    return result
+    if crop := _formula_crop_path(node):
+        result['source_crop'] = crop
+    return _source_metadata(node, result)
 
 
 def _math_tree(node):
@@ -282,18 +286,40 @@ def normalize_table_notes(soup):
         try:
             math_to_latex(math)
         except UnsupportedMath as error:
-            warning = 'Экспорт LaTeX: ' + str(error) + '; исходная формула доступна в HTML-предпросмотре.'
+            warning = 'Экспорт LaTeX: ' + str(error) + '. Сохранена исходная формула.'
             if warning not in warnings:
                 warnings.append(warning)
     return warnings
 
 
-def _latex_markdown(node):
+def _formula_crop_path(node):
+    path = node.get(FORMULA_CROP_ATTR, '')
+    return path if FORMULA_CROP_PATH.fullmatch(path) else None
+
+
+def _formula_crop_tag(doc, formula):
+    path = _formula_crop_path(formula)
+    if path is None:
+        return None
+    image = doc.new_tag('img', src=path, alt='Формула из PDF')
+    for field in ('data-source-page', 'data-source-bbox'):
+        if formula.has_attr(field):
+            image[field] = formula[field]
+    return image
+
+
+def _latex_markdown(node, *, display=False):
     try:
         latex = math_to_latex(node)
-    except UnsupportedMath as error:
-        return '[Формула требует проверки: ' + str(error) + ']'
-    return ('$$\n' + latex + '\n$$') if node.get('display') == 'block' else '$' + latex + '$'
+        if not latex:
+            raise UnsupportedMath('Пустое выражение')
+    except UnsupportedMath:
+        if crop := _formula_crop_path(node):
+            return '![Формула из PDF](<' + crop + '>)'
+        return str(node)
+    if display:
+        return '$$\n' + latex + '\n$$'
+    return '$' + re.sub(r'\s*[\r\n]+\s*', ' ', latex) + '$'
 
 
 def _list_marker(number, kind):
@@ -419,8 +445,8 @@ def _inline_md(node):
     if node.name == 'math':
         return _latex_markdown(node)
     if node.name in {'span', 'div'} and node.get('data-formula') and not node.find('math'):
-        tex = node.get('data-latex') or node.get_text().strip()
-        return '$' + tex + '$'
+        tex = _without_math_delimiters(node.get('data-latex') or node.get_text().strip())
+        return '$' + tex + '$' if tex else str(node)
     if node.name == 'img':
         alt = _escape_markdown(node.get('alt', ''))
         path = str(node.get('src', '')).replace('>', '%3E').replace('<', '%3C')
@@ -453,21 +479,100 @@ def _inline_md(node):
     return text
 
 
+def _display_equation(node):
+    return (getattr(node, 'name', None) == 'math' and node.get('display') == 'block'
+            or getattr(node, 'name', None) in {'span', 'div'} and node.get('data-formula') == 'display')
+
+
+def _display_parts(node):
+    """Split mixed prose at display math, keeping inline formatting on each side."""
+    if _display_equation(node):
+        yield True, node
+    elif not getattr(node, 'name', None) or node.name == 'table' or node.find(_display_equation) is None:
+        yield False, node
+    else:
+        doc = BeautifulSoup('', 'html.parser')
+        fragment = doc.new_tag(node.name, attrs=node.attrs.copy())
+        for child in node.children:
+            for is_display, part in _display_parts(child):
+                if not is_display:
+                    fragment.append(copy(part))
+                    continue
+                if fragment.contents:
+                    yield False, fragment
+                    fragment = doc.new_tag(node.name, attrs=node.attrs.copy())
+                yield True, part
+        if fragment.contents:
+            yield False, fragment
+
+
+def _markdown_flow(nodes):
+    chunks, inline = [], []
+    equation_number = None
+
+    def flush():
+        nonlocal equation_number
+        text = ''.join(inline).strip().removesuffix('<br>').rstrip()
+        inline.clear()
+        if equation_number is not None:
+            match = re.match(r'^\(' + re.escape(equation_number) + r'\)(?=$|[\s.,;])', text)
+            if match:
+                text = text[match.end():].lstrip()
+        equation_number = None
+        if text:
+            chunks.append(text)
+
+    for node in nodes:
+        for display, part in _display_parts(node):
+            if not display:
+                inline.append(_inline_md(part))
+                continue
+            flush()
+            math = part if part.name == 'math' else part.find('math')
+            if math is not None:
+                rendered = _latex_markdown(math, display=True)
+            else:
+                tex = _without_math_delimiters(part.get('data-latex') or part.get_text().strip())
+                rendered = '$$\n' + tex + '\n$$' if tex else str(part)
+            chunks.append(rendered)
+            number = re.search(r'\\tag\*?\{([\dА-Яа-яA-Za-z.\-]+)\}', rendered)
+            equation_number = number[1] if number else None
+    flush()
+    return '\n\n'.join(chunks)
+
+
 def _table_md(table):
     rows, entries, width = _grid(table)
     caption = table.find('caption', recursive=False)
     prefix = _inline_md(caption).strip() + '\n\n' if caption else ''
+    has_header = any(entry['row'] == 0 and entry['node'].name == 'th' for entry in entries)
     # Nested tables have their own layout; a pipe cell cannot represent it.
     complex_table = (table_is_complex(table) or table.find('table') is not None
                      or table.find('details', attrs={'data-ocr-cell-transcription': True}) is not None
-                     or any(INDENT_STYLE.search(node['style']) for node in table.find_all(style=True)))
+                     or any(INDENT_STYLE.search(node['style']) for node in table.find_all(style=True))
+                     or table.has_attr('data-source-page') and not has_header
+                     or table.find(_display_equation) is not None)
+    if not complex_table:
+        for formula in table.find_all('math'):
+            try:
+                latex = math_to_latex(formula)
+            except UnsupportedMath:
+                complex_table = True
+                break
+            if not latex or '|' in latex:
+                complex_table = True
+                break
     if complex_table:
-        clone = BeautifulSoup(str(table), 'html.parser').find('table')
+        doc = BeautifulSoup(str(table), 'html.parser')
+        clone = doc.find('table')
         for math in list(clone.find_all('math')):
-            math.replace_with(_latex_markdown(math))
+            image = _formula_crop_tag(doc, math)
+            if image is not None:
+                math.replace_with(image)
         for formula in clone.find_all(['span', 'div'], attrs={'data-formula': True}):
-            if not formula.find('math'):
-                formula.string = '$' + (formula.get('data-latex') or formula.get_text().strip()) + '$'
+            if not formula.find(['math', 'img']):
+                original = formula.get('data-latex') or formula.get_text().strip()
+                formula.string = _without_math_delimiters(original)
         # Caption remains part of the HTML table, not duplicated before it.
         return str(clone)
     if not rows or not width:
@@ -480,7 +585,6 @@ def _table_md(table):
         matrix[entry['row']][entry['col']] = value
     # GFM always has a header separator. An empty header preserves a source table
     # whose first row consists entirely of data cells, rather than inventing roles.
-    has_header = any(entry['row'] == 0 and entry['node'].name == 'th' for entry in entries)
     header = matrix.pop(0) if has_header else [''] * width
     line = lambda values: '| ' + ' | '.join(values) + ' |'
     return prefix + '\n'.join([line(header), line(['---'] * width), *(line(row) for row in matrix)])
@@ -499,6 +603,8 @@ def _markdown_blocks(container, indent=''):
             continue
         if node.name == 'details' and node.has_attr('data-pdf-formula-transcript'):
             output.append(str(node))
+        elif _display_equation(node):
+            output.append(_markdown_flow([node]))
         elif node.name in BLOCK_TAGS and INDENT_STYLE.search(node.get('style', '')):
             output.append(str(node))
         elif node.name == 'table':
@@ -509,13 +615,19 @@ def _markdown_blocks(container, indent=''):
             lines = []
             for item, number, marker in _list_entries(node):
                 nested = []
-                inline = []
+                content = []
                 for child in item.children:
                     if getattr(child, 'name', None) in {'ul', 'ol'}:
                         nested.append(_markdown_blocks(BeautifulSoup(str(child), 'html.parser'), indent + '    '))
                     else:
-                        inline.append(_inline_md(child))
-                lines.append(indent + marker + ' ' + ''.join(inline).strip())
+                        content.append(child)
+                first, *rest = _markdown_flow(content).split('\n')
+                continuation = indent + ' ' * max(4, len(marker) + 1)
+                if first == '$$':
+                    lines.extend([indent + marker, continuation + first])
+                else:
+                    lines.append(indent + marker + ' ' + first)
+                lines.extend(continuation + line if line else '' for line in rest)
                 lines.extend(nested)
             output.append('\n'.join(lines))
         elif node.name == 'pre':
@@ -525,11 +637,15 @@ def _markdown_blocks(container, indent=''):
         elif node.name == 'blockquote':
             output.append('\n'.join('> ' + line for line in _markdown_blocks(node).splitlines()))
         elif node.name in BLOCK_TAGS - {'p'} or node.name in {'figure', 'figcaption', 'li'}:
+            if node.name == 'section' and node.get('data-text-method') in {'native', 'ocr', 'blank'}:
+                page = node.get('data-source-page', '')
+                if re.fullmatch(r'[1-9][0-9]*', page) and node.get('id') == 'page-' + page:
+                    output.append(f'<!-- pdf-page: {page} -->')
             output.append(_markdown_blocks(node, indent))
         elif node.name == 'hr':
             output.append('---')
         elif node.name == 'p':
-            output.append(_inline_md(node).removesuffix('<br>').strip(' \t\r\n'))
+            output.append(_markdown_flow(node.children))
         else:
             output.append(_inline_md(node).strip())
     return '\n\n'.join(item for item in output if item).strip('\n')
@@ -547,8 +663,8 @@ def _rich(node):
     if node.name == 'math':
         return _formula(node)
     if node.get('data-formula') and not node.find('math'):
-        return {'type': 'formula', 'latex': node.get('data-latex') or node.get_text().strip(),
-                'display': node.get('data-formula') == 'display'}
+        return _source_metadata(node, {'type': 'formula', 'latex': node.get('data-latex') or node.get_text().strip(),
+                                       'display': node.get('data-formula') == 'display'})
     if node.name == 'img':
         item = {'type': 'image', 'src': node.get('src', ''), 'alt': node.get('alt', '')}
         if node.get('data-original-src'):
@@ -603,6 +719,8 @@ def _table_json(table):
         if not text and not cell.find(['img', 'math', 'table']) and cell.name != 'th' and entry['rowspan'] == entry['colspan'] == 1 and not cell.get('data-spreadsheet-formula'):
             continue
         item = {'row': entry['row'], 'col': entry['col'], 'value': text}
+        if table.has_attr('data-balanced-grid'):
+            _source_metadata(cell, item)
         source_type, raw_value = cell.get('data-cell-type'), cell.get('data-raw-value')
         if raw_value is not None:
             if source_type == 'b' and raw_value in {'0', '1'}:
@@ -664,7 +782,7 @@ def _source_metadata(node, item):
             item[prop.lower().replace('-', '_')] = value.strip()
     if node.get('data-page-furniture') == 'true':
         item['page_furniture'] = True
-    if node.name == 'img' or item.get('page_furniture'):
+    if node.has_attr('data-source-bbox') and node.has_attr('data-source-page'):
         try:
             page = int(node.get('data-source-page', ''))
             bounds = [float(value) for value in node.get('data-source-bbox', '').split(',')]
@@ -696,8 +814,8 @@ def _json_blocks(container):
             continue
         if node.name == 'table':
             output.append(_table_json(node))
-        elif node.name == 'math':
-            output.append(_formula(node))
+        elif node.name == 'math' or (node.get('data-formula') and not node.find('math')):
+            output.append(_rich(node))
         elif node.name == 'img':
             output.append(_rich(node))
         elif node.name in {'ul', 'ol'}:

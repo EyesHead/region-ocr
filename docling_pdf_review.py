@@ -82,13 +82,15 @@ def write_quality_report(output, source, quality, api):
     reviews = quality.get('source_grid_reviews', [])
     warnings = quality.get('table_quality_warnings', quality.get('table_content_issues', []))
     formula_warnings = quality.get('formula_source_reviews', [])
-    review_required = bool(reviews or warnings or formula_warnings)
+    page_images = quality.get('recovered_source_page_images', [])
+    review_required = bool(reviews or warnings or formula_warnings or page_images)
     status = 'REVIEW' if review_required else 'OK'
     report = output.with_suffix('.report.md')
     machine = output.with_suffix('.report.json')
     clean = [{k: v for k, v in review.items() if k != 'source_preview_html'} for review in reviews]
     data = dict(status=status, source=str(source), output=str(output), review_required=review_required,
                 source_grid_reviews=clean, table_warnings=warnings, formula_warnings=formula_warnings,
+                recovered_source_page_images=page_images,
                 blocking_issues=[],
                 table_checks_policy='diagnostic_only', primary_ocr_only=quality.get('primary_ocr_only'),
                 table_cell_schema=quality.get('table_cell_schema'))
@@ -117,9 +119,12 @@ def write_quality_report(output, source, quality, api):
         for warning in formula_warnings:
             message = warning.get('message') or 'Проверьте запись по исходной странице.'
             lines.append(f'- Страница PDF {warning["page"]}. {message}')
+    if page_images:
+        lines += ['', '## Страницы, сохранённые изображениями', '']
+        lines.extend(f'- Страница PDF {entry["page"]}' for entry in page_images)
     if not review_required:
         lines += ['Предупреждений таблиц не найдено. Это не посимвольная проверка точности первичного OCR.']
     api.write_atomic(report, '\n'.join(lines)+'\n')
     api.write_atomic(machine, json.dumps(data, ensure_ascii=False, indent=2))
-    fragments = {(r.get('page'), r.get('ref', r.get('element'))) for r in [*reviews, *warnings]}
+    fragments = {(r.get('page'), r.get('ref', r.get('element'))) for r in [*reviews, *warnings, *page_images]}
     return dict(status=status, report=str(report), quality_report=str(machine), review_fragments=len(fragments))

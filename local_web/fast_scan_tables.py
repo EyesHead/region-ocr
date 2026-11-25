@@ -1,7 +1,6 @@
-"""Recognize only complete, text-filled rectangular grids in the fast raster path."""
+"""Detect closed rectangular grids in the fast raster path."""
 from __future__ import annotations
 
-from statistics import median
 from typing import NamedTuple
 
 import cv2
@@ -38,7 +37,7 @@ def _closed_grid(horizontal, vertical, xs, ys):
     return True
 
 
-def find_grids(image):
+def find_grids(image, candidates=None):
     factor = min(1.0, 1400 / max(image.size))
     with image.convert("L") as gray:
         pixels = np.asarray(gray)
@@ -61,6 +60,9 @@ def find_grids(image):
             continue
         xs = tuple(x+i for i in _centers(np.count_nonzero(vertical[y:y+h, x:x+w], axis=0) > .55*h))
         ys = tuple(y+i for i in _centers(np.count_nonzero(horizontal[y:y+h, x:x+w], axis=1) > .55*w))
+        if candidates is not None and len(xs) >= 2 and len(ys) >= 3:
+            sx, sy = width/image.width, height/image.height
+            candidates.append((int(x/sx), int(y/sy), int(np.ceil((x+w)/sx)), int(np.ceil((y+h)/sy))))
         # At least a header and two separately ruled data bands. A merge or a
         # partial separator leaves that region for the ordinary text route.
         if len(xs) < 3 or len(ys) < 4:
@@ -74,109 +76,16 @@ def find_grids(image):
     return grids
 
 
-def _cell_fragments(source_line, positioned):
-    """Align recognition boxes to the original text without inventing word breaks."""
-    fragments = []
-    cursor = 0
-    for text, row, col in positioned:
-        start = cursor
-        while start < len(source_line) and source_line[start].isspace():
-            start += 1
-        if not text or not source_line.startswith(text, start):
-            return None
-        end = start + len(text)
-        if fragments and fragments[-1][:2] == [row, col]:
-            fragments[-1][2] += source_line[cursor:end]
-        else:
-            if fragments and (start == cursor or row != fragments[-1][0] or col < fragments[-1][1]):
-                return None
-            fragments.append([row, col, source_line[start:end]])
-        cursor = end
-    return None if source_line[cursor:].strip() else fragments
+def grid_bbox(grid):
+    return (grid.xs[0]/grid.scale_x, grid.ys[0]/grid.scale_y,
+            grid.xs[-1]/grid.scale_x, grid.ys[-1]/grid.scale_y)
 
 
-def _region_rows(grid, lines, word_rows):
-    xs, ys, ink, sx, sy = grid
-    cells = [[[] for _ in xs[1:]] for _ in ys[1:]]
-    residual = ink[ys[0]:ys[-1]+1, xs[0]:xs[-1]+1].copy()
-    heights = []
-    owned = set()
-    for index, (source_line, words) in enumerate(zip(lines, word_rows, strict=True)):
-        found = []
-        for text, x, y, w, h in words:
-            left, top = x*sx, y*sy
-            right, bottom = left+w*sx, top+h*sy
-            if right <= xs[0] or bottom <= ys[0] or left >= xs[-1] or top >= ys[-1]:
-                continue
-            col = int(np.searchsorted(xs, (left+right)/2)-1)
-            row = int(np.searchsorted(ys, (top+bottom)/2)-1)
-            if not (0 <= col < len(xs)-1 and 0 <= row < len(ys)-1):
-                return None
-            inside = max(0, min(right, xs[col+1])-max(left, xs[col])) * max(0, min(bottom, ys[row+1])-max(top, ys[row]))
-            if inside < .9*(right-left)*(bottom-top):
-                return None
-            found.append((text, row, col))
-            heights.append(bottom-top)
-            l = max(0, int(left)-xs[0]-1)
-            t = max(0, int(top)-ys[0]-1)
-            residual[t:int(np.ceil(bottom))-ys[0]+2, l:int(np.ceil(right))-xs[0]+2] = 0
-
-        if not found:
-            continue
-        if len(found) != len(words):
-            return None
-        fragments = _cell_fragments(source_line, found)
-        if fragments is None:
-            return None
-        owned.add(index)
-        for row, col, text in fragments:
-            cells[row][col].append(text)
-
-    if not owned:
+def table_blocks(lines, word_rows, grids, *, line_boxes=None, physical_grids=None):
+    if not grids and not physical_grids:
         return None
-    # A column-first OCR pass can read a footer between table columns. The
-    # table is emitted at its first owned line, ahead of this measured footer.
-    for index in range(min(owned), max(owned)+1):
-        if index not in owned and (not word_rows[index] or any(y*sy < ys[-1] for _, _, y, _, _ in word_rows[index])):
-            return None
-    if not all(any(c for c in row) for row in cells):
-        return None
-    glyph = max(2, median(heights))
-    for row, (top, bottom) in enumerate(zip(ys, ys[1:])):
-        for col, (left, right) in enumerate(zip(xs, xs[1:])):
-            # Exclude grid-rule ink. Substantial remaining objects outside the
-            # OCR word rectangles can be unrecognized symbols or missing text.
-            patch = residual[top-ys[0]+3:bottom-ys[0]-2, left-xs[0]+3:right-xs[0]-2]
-            if patch.size == 0:
-                return None
-            if not cells[row][col] and np.count_nonzero(patch) > max(3, .15*glyph**2):
-                return None
-            _, _, components, _ = cv2.connectedComponentsWithStats(patch, connectivity=8)
-            if any(area > .32*glyph**2 or max(w, h) > 1.8*glyph for _, _, w, h, area in components[1:]):
-                return None
-    return owned, [[" ".join(cell) for cell in row] for row in cells]
+    from local_web.fast_ruled_tables import _covered, _outer_grids, _simple_grid, scan_grid_blocks
 
-
-def table_blocks(lines, word_rows, grids):
-    if len(lines) != len(word_rows):
-        return None
-    owned_indices = set()
-    starts = {}
-    for grid in grids:
-        result = _region_rows(grid, lines, word_rows)
-        if result is None:
-            continue
-        owned, rows = result
-        if owned_indices & owned:
-            return None
-        owned_indices.update(owned)
-        starts[min(owned)] = rows
-    if not starts:
-        return None
-    blocks = []
-    for index, line in enumerate(lines):
-        if index in starts:
-            blocks.append({"rows": starts[index]})
-        elif index not in owned_indices and line.strip():
-            blocks.append({"text": line})
-    return {"blocks": blocks}
+    bounds = [grid.bbox for grid in physical_grids or ()]
+    tables = _outer_grids([_simple_grid(grid) for grid in grids if not _covered(grid_bbox(grid), bounds)])
+    return {'blocks': scan_grid_blocks(lines, word_rows, line_boxes or {}, physical_grids or (), tables)}

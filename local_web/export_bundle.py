@@ -10,15 +10,17 @@ import uuid
 if __package__:
     from . import formula_preview
     from .file_paths import native_path, normal_path
-    from .fast_resources import FAST_PATH, exact_record
+    from .fast_resources import FAST_PATH, FORMULA_CROP_ATTR, exact_record, formula_crop_paths
 else:
     import formula_preview
     from file_paths import native_path, normal_path
-    from fast_resources import FAST_PATH, exact_record
+    from fast_resources import FAST_PATH, FORMULA_CROP_ATTR, exact_record, formula_crop_paths
 
 EXPORT_SCHEMA = 14
 CANONICAL_MANIFEST_SCHEMA = 1
-FAST_PDF_STAT_KEYS = ('native_pages', 'ocr_pages', 'blank_pages', 'image_fallback_pages', 'vector_tables', 'scan_tables')
+FAST_PDF_STAT_KEYS = ('native_pages', 'ocr_pages', 'blank_pages', 'image_fallback_pages', 'ocr_error_pages',
+                      'orientation_corrected_pages',
+                      'vector_tables', 'scan_tables', 'formula_crops', 'formulas_mathml', 'formulas_latex', 'formulas_text')
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}
 FOLDER_SUFFIXES = {'html': 'html', 'markdown': 'md', 'json': 'json', 'plaintext': 'text'}
 
@@ -68,6 +70,7 @@ def _fast_references(soup):
                      *image.get('data-original-srcs', '').split()):
             if FAST_PATH.fullmatch(path):
                 yield path
+    yield from formula_crop_paths(soup)
 
 
 def _replay_fast_assets(canonical, soup):
@@ -138,6 +141,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         else:
             marker = soup.find('meta', attrs={'name': 'document-export-schema'})
             embedded = any(str(image.get('src', '')).lower().startswith('data:') for image in soup.find_all('img'))
+            embedded = embedded or any(formula[FORMULA_CROP_ATTR].lower().startswith('data:')
+                                       for formula in soup.find_all('math', attrs={FORMULA_CROP_ATTR: True}))
             if marker is None or marker.get('content') != str(EXPORT_SCHEMA) or embedded:
                 # Old published HTML is input to a new canonical stage. Keep
                 # that historical HTML intact; sanitize/migrate it only once.
@@ -192,7 +197,8 @@ def build_exports(content, source, destination, *, pages=None, output_format='ht
         soup = BeautifulSoup(content, 'html.parser')
         if soup.body is None:
             raise ValueError('Документ не содержит body после нормализации HTML')
-        comparisons = formula_preview.FormulaComparisons(soup) if pdf_engine_output else None
+        comparisons = (formula_preview.FormulaComparisons(soup)
+                       if pdf_engine_output and not (fast_pdf_stats and 'native_pages' in fast_pdf_stats) else None)
         structured.strip_review_annotations(soup)
         if pdf_engine_output:
             remove_published_table_rasters(soup)

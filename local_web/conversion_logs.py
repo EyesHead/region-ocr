@@ -13,7 +13,8 @@ if __package__:
 else:
     from file_paths import native_path, normal_path
 
-_LOCK = threading.RLock()
+_APPEND_LOCK = threading.Lock()
+_ARCHIVE_LOCK = threading.Lock()
 
 
 def _root(value):
@@ -50,7 +51,7 @@ def append_job_log(job_root: Path, message: str) -> None:
     """Append an application event in UTF-8; never dump the job or environment."""
     root = _root(job_root)
     timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
-    with _LOCK:
+    with _APPEND_LOCK:
         native_path(root).mkdir(parents=True, exist_ok=True)
         target = root / 'conversion.log'
         if normal_path(target).resolve().parent != root:
@@ -66,7 +67,7 @@ def archive_engine_logs(job_root: Path) -> str | None:
     current engine output, canonical HTML, sources and OCR cache stay intact.
     """
     root = _root(job_root)
-    with _LOCK:
+    with _ARCHIVE_LOCK:
         files = _engine_files(root)
         if not files:
             return None
@@ -112,7 +113,7 @@ def assemble_conversion_log(job: dict, job_root: Path) -> str:
         sections.append('Статистика: ' + json.dumps(job['stats'], ensure_ascii=False, sort_keys=True) + '\n')
     for warning in job.get('warnings') or []:
         sections.append('Предупреждение: ' + str(warning) + '\n')
-    with _LOCK:
+    with _ARCHIVE_LOCK:
         files = []
         application = root / 'conversion.log'
         if _owned(root, application):
@@ -125,7 +126,17 @@ def assemble_conversion_log(job: dict, job_root: Path) -> str:
             try:
                 # read_text has no byte/line limit. This is the user's complete
                 # log rather than the short engine-error tail used in the UI.
-                value = native_path(path).read_text(encoding='utf-8-sig', errors='replace')
+                if path == application:
+                    # Capture a complete append, then allow progress events while
+                    # a large log is read. The application log is append-only.
+                    with native_path(path).open('rb') as stream:
+                        with _APPEND_LOCK:
+                            end = stream.seek(0, 2)
+                        stream.seek(0)
+                        value = stream.read(end).decode('utf-8-sig', errors='replace')
+                        value = value.replace('\r\n', '\n').replace('\r', '\n')
+                else:
+                    value = native_path(path).read_text(encoding='utf-8-sig', errors='replace')
                 sections.append(value)
                 if not value.endswith('\n'):
                     sections.append('\n')

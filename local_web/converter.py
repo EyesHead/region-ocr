@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Callable
 
@@ -37,11 +38,11 @@ ASSET_MARKER = 'LOCAL_WEB_FAST_ASSET '
 ASSET_CHUNK_BYTES = 192 * 1024
 ERROR_MARKER = 'LOCAL_WEB_ERROR '
 PROGRESS_MARKER = 'LOCAL_WEB_PROGRESS '
-PDF_MODES = ('quality', 'fast')
+PDF_MODES = ('quality', 'balanced', 'fast')
 
 _FAILURES = {
     'fast_ocr': ('RapidOCR не смог прочитать страницу.',
-        'Проверьте наличие локальных моделей быстрого режима или выберите качественный режим.', True),
+        'Проверьте наличие локальных моделей быстрого режима или выберите точный режим.', True),
     'quality_match': ('Не удалось однозначно сопоставить распознанный текст таблицы.',
         'Результат не опубликован, чтобы не потерять текст. OCR сохранён; повторная сборка без исправления причины может дать ту же ошибку. Скопируйте журнал для разбора.', False),
     'quality_integrity': ('Проверка целостности таблицы или формулы не пройдена.',
@@ -189,7 +190,7 @@ def describe_conversion_failure(error, destination=None, *, since=None):
     return _public_failure(kind, location)
 
 
-class ConversionCancelled(RuntimeError):
+class ConversionCancelled(CancelledError, RuntimeError):
     """The user cancelled this conversion; partial files are not published."""
 
 
@@ -264,6 +265,10 @@ def _decode_html(path: Path) -> str:
 
 def _safe_html(content: str):
     from bs4 import BeautifulSoup
+    if __package__:
+        from .fast_resources import FORMULA_CROP_ATTR, FORMULA_CROP_PATH
+    else:
+        from fast_resources import FORMULA_CROP_ATTR, FORMULA_CROP_PATH
     soup = BeautifulSoup(content, 'html.parser')
     removed = 0
     for tag in list(soup.find_all(['script', 'iframe', 'object', 'embed', 'applet', 'base', 'link', 'form'])):
@@ -274,6 +279,14 @@ def _safe_html(content: str):
             meta.decompose()
             removed += 1
     for tag in soup.find_all(True):
+        if tag.has_attr(FORMULA_CROP_ATTR):
+            crop = str(tag[FORMULA_CROP_ATTR]).strip()
+            if tag.name == 'math' and (FORMULA_CROP_PATH.fullmatch(crop)
+                                       or crop.lower().startswith('data:image/png;base64,')):
+                tag[FORMULA_CROP_ATTR] = crop
+            else:
+                del tag[FORMULA_CROP_ATTR]
+                removed += 1
         for attr in list(tag.attrs):
             if attr.lower().startswith('on') or attr.lower() in {'srcdoc', 'action', 'formaction', 'ping', 'srcset', 'poster'}:
                 del tag[attr]
@@ -408,16 +421,34 @@ def _write_fast_asset(path, data):
         print(f'{ASSET_MARKER}{path}\t{int(stop == len(data))}\t{encoded}', flush=True)
 
 
+def _report_engine_progress(line, on_progress):
+    if on_progress is None:
+        return
+    if line.startswith(PROGRESS_MARKER):
+        progress = json.loads(line[len(PROGRESS_MARKER):])
+        on_progress(min(90, max(3, int(progress['percent']))), progress['stage'])
+        return
+    match = re.search(r'сконвертировано страниц:\s*(\d+) из (\d+)', line)
+    if match:
+        completed, total = int(match[1]), max(1, int(match[2]))
+        on_progress(min(85, 10 + int(75 * completed / total)), f'Распознано страниц: {completed} из {total}')
+    elif line.strip() == 'Оцениваем угол наклона каждой страницы':
+        on_progress(6, 'Оцениваем угол наклона каждой страницы')
+    elif 'Подготовка HTML:' in line:
+        on_progress(88, 'Восстановление таблиц и формул')
+
+
 def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel_event, engine_host=None,
                 *, pdf_mode='quality') -> dict:
-    if engine_host is not None and pdf_mode == 'quality':
-        return engine_host.run(source, destination, pages, on_progress, cancel_event)
+    if engine_host is not None and pdf_mode != 'fast':
+        mode_options = {'pdf_mode': pdf_mode} if pdf_mode != 'quality' else {}
+        return engine_host.run(source, destination, pages, on_progress, cancel_event, **mode_options)
     engine_destination = destination / 'engine'
     if pdf_mode == 'quality':
         engine_destination.mkdir(parents=True, exist_ok=True)
     command = [_runtime_python(), '-B', '-u', str(Path(__file__).resolve()), '--worker', str(source), str(engine_destination)]
-    if pdf_mode == 'fast':
-        command += ['--pdf-mode', 'fast']
+    if pdf_mode != 'quality':
+        command += ['--pdf-mode', pdf_mode]
     if pages:
         command += ['--pages', pages]
     environment = os.environ.copy()
@@ -438,7 +469,7 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
     started, result, read_complete = time.monotonic(), None, False
-    resource_stream = _FastAssetStream() if pdf_mode == 'fast' else None
+    resource_stream = _FastAssetStream() if pdf_mode != 'quality' else None
     last_error, error_detail, failure = '', '', None
     deadline = max(60, int(os.environ.get('DOCUMENT_CONVERTER_TIMEOUT_SECONDS', '7200')))
     try:
@@ -462,16 +493,12 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
                     result['fast_assets'] = resource_stream.finish(result.pop('asset_count', 0))
                     # This message carries the HTML to the normal publisher. The log
                     # stores only the counts and never duplicates the document.
-                    log.write('Fast PDF: ' + json.dumps(result['stats'], ensure_ascii=False) + '\n')
+                    log.write(f'PDF {pdf_mode}: ' + json.dumps(result['stats'], ensure_ascii=False) + '\n')
                     log.flush()
                     continue
                 log.write(line)
                 log.flush()
-                if line.startswith(PROGRESS_MARKER):
-                    progress = json.loads(line[len(PROGRESS_MARKER):])
-                    if on_progress:
-                        on_progress(min(90, max(3, int(progress['percent']))), progress['stage'])
-                    continue
+                _report_engine_progress(line, on_progress)
                 if re.search(r'error:', line, re.I):
                     message = line.strip()
                     last_error = message[-800:]
@@ -483,12 +510,6 @@ def _run_engine(source: Path, destination: Path, pages: str, on_progress, cancel
                     result = json.loads(line[len(RESULT_MARKER):])
                 if line.startswith(ERROR_MARKER):
                     failure = json.loads(line[len(ERROR_MARKER):])
-                match = re.search(r'сконвертировано страниц:\s*(\d+) из (\d+)', line)
-                if match and on_progress:
-                    completed, total = int(match[1]), max(1, int(match[2]))
-                    on_progress(min(85, 10 + int(75 * completed / total)), f'Распознано страниц: {completed} из {total}')
-                elif 'Подготовка HTML:' in line and on_progress:
-                    on_progress(88, 'Восстановление таблиц и формул')
             code = process.wait()
             _check_cancel(cancel_event)
             if code or not result:
@@ -513,6 +534,8 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         raise ValueError('Неизвестный режим обработки PDF')
     if pdf_mode == 'fast' and source.suffix.lower() != '.pdf':
         raise ValueError('Быстрый режим доступен только для PDF')
+    if pdf_mode == 'balanced' and source.suffix.lower() != '.pdf':
+        raise ValueError('Сбалансированный режим доступен только для PDF')
     _check_cancel(cancel_event)
     if not source.is_file():
         raise FileNotFoundError('Исходный файл не найден')
@@ -566,14 +589,16 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         content, xlsx_warnings, page_count = export_xlsx(source, check_cancel=lambda: _check_cancel(cancel_event),
                                                        assets_dir=resource_root / 'src')
         warnings.extend(xlsx_warnings)
-    elif source.suffix.lower() == '.pdf' and pdf_mode == 'fast':
-        engine = _run_engine(source, destination, pages, on_progress, cancel_event, pdf_mode='fast')
+    elif source.suffix.lower() == '.pdf' and pdf_mode != 'quality':
+        engine = _run_engine(source, destination, pages, on_progress, cancel_event,
+                             engine_host=engine_host, pdf_mode=pdf_mode)
         content, fast_stats = engine['content'], engine['stats']
         fast_assets = engine.pop('fast_assets')
         page_count = fast_stats['pages']
         warnings.extend(fast_stats.pop('warnings', ()))
     else:
-        engine = _run_engine(source, destination, pages, on_progress, cancel_event, engine_host=engine_host)
+        engine = _run_engine(source, destination, pages, on_progress, cancel_event,
+                             engine_host=engine_host, pdf_mode=pdf_mode)
         content = Path(engine['html']).read_text(encoding='utf-8')
         resource_root = Path(engine['html']).parent
         page_count = engine.get('pages')
@@ -594,7 +619,7 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
     return result
 
 
-def _fast_worker(source: Path, pages: str):
+def _fast_worker(source: Path, pages: str, *, pdf_mode='fast', formula_reader=None, manager_provider=None):
     """Send content-addressed image resources and HTML over the private worker pipe."""
     # The worker is also launched as a script by system Python. Shared caption
     # rules live at the project root, alongside the local_web package.
@@ -602,12 +627,17 @@ def _fast_worker(source: Path, pages: str):
         sys.path.insert(0, str(ENGINE_DIR))
     from local_web.fast_pdf import convert_fast_pdf
 
-    def recognize(image, page_no):
-        try:
-            from local_web.fast_ocr import recognize_page_with_layout
-            return recognize_page_with_layout(image, page_no)
-        except Exception as error:
-            raise ConversionFailure(str(error), _public_failure('fast_ocr', {'page': page_no})) from error
+    if pdf_mode == 'balanced' and formula_reader is None:
+        from docling_pdf_balanced_math import local_formula_reader
+        if manager_provider is None:
+            from local_web.engine_process import prepare_runtime
+            manager_provider = prepare_runtime
+
+        def formula_event(name, **fields):
+            from convert_docling import diagnostic_event
+            diagnostic_event(name, **fields)
+
+        formula_reader = local_formula_reader(manager_provider, diagnostic=formula_event)
 
     def publish_progress(percent, stage):
         print(PROGRESS_MARKER + json.dumps(dict(percent=percent, stage=stage), ensure_ascii=False), flush=True)
@@ -621,8 +651,8 @@ def _fast_worker(source: Path, pages: str):
     try:
         if source.suffix.lower() != '.pdf':
             raise ValueError('Быстрый режим доступен только для PDF')
-        content, stats = convert_fast_pdf(source, pages, ocr_page=recognize, on_progress=publish_progress,
-                                          image_assets=publish_asset)
+        content, stats = convert_fast_pdf(source, pages, mode=pdf_mode, on_progress=publish_progress,
+                                          image_assets=publish_asset, formula_reader=formula_reader)
     except Exception as error:
         failure = describe_conversion_failure(error)
         print(ERROR_MARKER + json.dumps(failure, ensure_ascii=False), flush=True)
@@ -702,7 +732,7 @@ if __name__ == '__main__':
     arguments = parser.parse_args()
     if not arguments.worker:
         parser.error('Internal conversion worker; start the application server instead')
-    if arguments.pdf_mode == 'fast':
-        _fast_worker(arguments.source.resolve(), _validate_pages(arguments.pages))
+    if arguments.pdf_mode != 'quality':
+        _fast_worker(arguments.source.resolve(), _validate_pages(arguments.pages), pdf_mode=arguments.pdf_mode)
     else:
         _worker(arguments.source.resolve(), arguments.destination.resolve(), _validate_pages(arguments.pages))

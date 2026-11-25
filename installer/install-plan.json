@@ -650,6 +650,14 @@
       "sha256": "718bac64c73c10c16073a199402657283d9b64c04188b694f6d3e9b0d85440f4"
     },
     {
+      "name": "PyMuPDF",
+      "version": "1.28.2",
+      "url": "https://files.pythonhosted.org/packages/4a/61/d563bbccba262f9dd6d2d35ccb72593648184d886188efb12d9ce8f34dd6/pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
+      "filename": "pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
+      "bytes": 19826532,
+      "sha256": "ebd244918798502d7b4504c90410d1711a4d7675a32584ca30f1bab419ecbffe"
+    },
+    {
       "name": "pypdfium2",
       "version": "5.10.1",
       "url": "https://files.pythonhosted.org/packages/16/1d/c62bd59dd8345cc4b640f942f465633f6b07b859d01ddb648610a7bf5c7c/pypdfium2-5.10.1-py3-none-win_amd64.whl",
@@ -1076,12 +1084,12 @@
   },
   "models": [
     {
-      "path": "models/rapidocr/eslav_PP-OCRv5_rec_mobile.onnx",
-      "bytes": 7911802,
-      "sha256": "08705d6721849b1347d26187f15a5e362c431963a2a62bfff4feac578c489aab",
-      "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/eslav_PP-OCRv5_rec_mobile.onnx",
+      "path": "models/rapidocr/PP-OCRv6_medium_rec_cyrillic.onnx",
+      "bytes": 62764959,
+      "sha256": "997e543cc73c2f99935fce99a79a74a5165602c816e15cf2b3e923e5a3420ac0",
+      "url": "https://huggingface.co/metrika-labs/PP-OCRv6_medium_rec_cyrillic_onnx/resolve/4f35024ef590b24c12101abfa5184c7fbb5f7299/inference.onnx",
       "license": "Apache-2.0",
-      "upstream": "https://huggingface.co/PaddlePaddle/eslav_PP-OCRv5_mobile_rec"
+      "upstream": "https://huggingface.co/metrika-labs/PP-OCRv6_medium_rec_cyrillic_onnx"
     },
     {
       "path": "models/orientation/PP-LCNet_x1_0_doc_ori.onnx",

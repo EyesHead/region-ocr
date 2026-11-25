@@ -303,6 +303,7 @@ def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api, 
     needs a literal footnote/notes marker in a real full-width source cell.
     """
     from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel, ProvenanceItem
+    from docling_pdf_cell_pipeline import owns_grid
 
     note_routes = {}
     native_candidates = {}
@@ -318,7 +319,7 @@ def repair_source_tables(doc, reader, regions, routes, excluded, manifest, api, 
         for source_table in source_tables:
             box = list(source_table.bbox)
             from docling_pdf_forms import form_owns_region
-            if form_owns_region(manifest, page_no, box):
+            if owns_grid(manifest, page_no, box) or form_owns_region(manifest, page_no, box):
                 continue
             matched = []
             for item in doc.tables:
@@ -971,6 +972,8 @@ def compact_table_routes(doc, routes, manifest, api):
     from docling_core.types.doc import TableCell, TableData
     entries = {e['ref']: e for e in manifest['tables']}
     for item in doc.tables:
+        if entries.get(item.self_ref, {}).get('method') == 'raster_cell_atlas':
+            continue
         fragment = routes.get(item.self_ref, '')
         if '<table' not in fragment:
             continue

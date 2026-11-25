@@ -74,7 +74,7 @@ class PersistentEngine:
             env = os.environ.copy()
             env['PYTHONIOENCODING'] = 'utf-8'
             env['PYTHONFAULTHANDLER'] = '1'
-            command = self.command or [self.python, '-u', str(Path(__file__).with_name('engine_process.py'))]
+            command = self.command or [self.python, '-B', '-u', str(Path(__file__).with_name('engine_process.py'))]
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, encoding='utf-8', errors='replace', bufsize=1,
@@ -173,16 +173,18 @@ class PersistentEngine:
                     if self.active is not None:
                         self.active.put((None, None))
 
-    def run(self, source, destination, pages, on_progress=None, cancel_event=None):
+    def run(self, source, destination, pages, on_progress=None, cancel_event=None, *, pdf_mode='quality'):
         # Import lazily: converter imports this lifecycle class only for a real app.
         if __package__:
-            from .converter import ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER, _check_cancel
+            from .converter import (ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER,
+                                    ASSET_MARKER, _FastAssetStream, _check_cancel, _report_engine_progress)
         else:
-            from converter import ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER, _check_cancel
+            from converter import (ConversionCancelled, ConversionFailure, RESULT_MARKER, ERROR_MARKER,
+                                   ASSET_MARKER, _FastAssetStream, _check_cancel, _report_engine_progress)
         import re
         with self.run_lock:
             _check_cancel(cancel_event)
-            # warm_runtime imports core once. Refresh only between jobs: the
+            # The worker imports core once. Refresh only between jobs: the
             # run lock protects an active document from a source-code update.
             source_revision = _source_revision()
             with self.lock:
@@ -198,6 +200,7 @@ class PersistentEngine:
             output = queue.Queue()
             ident = uuid.uuid4().hex
             result, failure = None, None
+            resources = _FastAssetStream() if pdf_mode == 'balanced' else None
             error_detail = last_error = ''
             try:
                 if on_progress:
@@ -213,7 +216,7 @@ class PersistentEngine:
                     process = self.process
                     self.active = output
                     command = dict(operation='convert', id=ident, source=str(source),
-                                   destination=str(Path(destination) / 'engine'), pages=pages)
+                                   destination=str(Path(destination) / 'engine'), pages=pages, pdf_mode=pdf_mode)
                     process.stdin.write(json.dumps(command, ensure_ascii=True) + '\n')
                     process.stdin.flush()
                 with log_path.open('w', encoding='utf-8') as log:
@@ -232,6 +235,15 @@ class PersistentEngine:
                             log.flush()
                             self._terminate()
                             raise RuntimeError(message + ' Журнал: engine.log')
+                        if resources is not None and line.startswith(ASSET_MARKER):
+                            resources.receive(line[len(ASSET_MARKER):])
+                            continue
+                        if resources is not None and line.startswith(RESULT_MARKER):
+                            result = json.loads(line[len(RESULT_MARKER):])
+                            result['fast_assets'] = resources.finish(result.pop('asset_count', 0))
+                            log.write('PDF balanced: ' + json.dumps(result['stats'], ensure_ascii=False) + '\n')
+                            log.flush()
+                            continue
                         log.write(line)
                         log.flush()
                         if event and event.get('event') == 'complete' and event.get('id') == ident:
@@ -248,12 +260,7 @@ class PersistentEngine:
                             result = json.loads(line[len(RESULT_MARKER):])
                         if line.startswith(ERROR_MARKER):
                             failure = json.loads(line[len(ERROR_MARKER):])
-                        match = re.search(r'сконвертировано страниц:\s*(\d+) из (\d+)', line)
-                        if match and on_progress:
-                            n, total = int(match[1]), max(1, int(match[2]))
-                            on_progress(min(85, 10 + int(75*n/total)), f'Распознано страниц: {n} из {total}')
-                        elif 'Подготовка HTML:' in line and on_progress:
-                            on_progress(88, 'Восстановление таблиц и формул')
+                        _report_engine_progress(line, on_progress)
             except (ConversionCancelled, TimeoutError, BrokenPipeError):
                 self._terminate()
                 raise

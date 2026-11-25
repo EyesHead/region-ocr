@@ -16,9 +16,11 @@ from urllib.parse import unquote, urlsplit
 
 
 if __package__:
-    from .fast_resources import FAST_PATH, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, exact_record
+    from .fast_resources import (FAST_PATH, FORMULA_CROP_ATTR, FORMULA_CROP_PATH, MAX_IMAGE_BYTES,
+                                 MAX_IMAGE_PIXELS, exact_record, register_image)
 else:
-    from fast_resources import FAST_PATH, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, exact_record
+    from fast_resources import (FAST_PATH, FORMULA_CROP_ATTR, FORMULA_CROP_PATH, MAX_IMAGE_BYTES,
+                                MAX_IMAGE_PIXELS, exact_record, register_image)
 RASTER_MIMES = frozenset({'image/png', 'image/jpeg', 'image/jpg', 'image/gif',
                           'image/webp', 'image/bmp', 'image/tiff', 'image/x-icon'})
 
@@ -218,11 +220,15 @@ def externalize_images(soup, source: Path, assets_dir: Path, *, resource_root: P
                        fast_assets=None) -> dict:
     """Replace document image sources with deterministic relative asset paths."""
     assets, warnings, seen = [], [], set()
-    def save_exact(path):
-        if not FAST_PATH.fullmatch(path) or path not in fast_assets:
-            raise ValueError('В быстром результате отсутствует ресурс PDF')
+
+    def save_exact(path, data=None):
+        if not FAST_PATH.fullmatch(path):
+            raise ValueError('В результате указан недопустимый путь к ресурсу PDF')
         if path not in seen:
-            data = fast_assets[path]
+            if data is None:
+                if fast_assets is None or path not in fast_assets:
+                    raise ValueError('В результате отсутствует ресурс PDF')
+                data = fast_assets[path]
             record = exact_record(path, data)
             (assets_dir / Path(path).name).write_bytes(data)
             seen.add(path)
@@ -282,4 +288,17 @@ def externalize_images(soup, source: Path, assets_dir: Path, *, resource_root: P
             if not image.get('alt'):
                 image['alt'] = 'Изображение недоступно'
             warnings.append(str(exc))
+    for math in soup.find_all('math', attrs={FORMULA_CROP_ATTR: True}):
+        value = math[FORMULA_CROP_ATTR]
+        if value.lower().startswith('data:image/png;base64,'):
+            data = _read_reference(value, source, resource_root)
+            path = register_image({}, 'image/png', data)
+            save_exact(path, data)
+            math[FORMULA_CROP_ATTR] = path
+        elif FORMULA_CROP_PATH.fullmatch(value):
+            if value not in seen:
+                data = None if fast_assets is not None else _read_reference(value, source, resource_root)
+                save_exact(value, data)
+        else:
+            del math[FORMULA_CROP_ATTR]
     return dict(assets=assets, warnings=list(dict.fromkeys(warnings)))

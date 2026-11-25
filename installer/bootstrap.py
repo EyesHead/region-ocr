@@ -212,7 +212,7 @@ class Installer:
             check = (
                 "import sys; from pathlib import Path; import portable_runtime; portable_runtime.configure_runtime(); "
                 "from importlib.metadata import version; assert version('surya-ocr') == '0.24.0'; "
-                "import torch,docling,numpy,PIL,pypdfium2,onnxruntime; "
+                "import torch,docling,numpy,PIL,pymupdf,pypdfium2,onnxruntime; "
                 "from local_web.desktop import prepare_runtime; prepare_runtime(); import webview; "
                 "from huggingface_hub import snapshot_download; "
                 "assert Path(snapshot_download('docling-project/docling-layout-heron',local_files_only=True)).is_dir(); "

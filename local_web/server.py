@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 import importlib
 import json
@@ -24,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import uuid
 import webbrowser
+from weakref import WeakValueDictionary
 import zipfile
 import tempfile
 
@@ -111,7 +113,13 @@ class JobStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest = self.root / "jobs.json"
         self.saved = ResultStorage(self.root, output_dir or self.root / 'ocr_output', application_root=HERE.parent)
+        # If nested, acquire the private folder lock, then storage, then queue.
+        self.storage_lock = threading.RLock()
         self.lock = threading.RLock()
+        self._folder_locks = WeakValueDictionary()
+        self._file_operations = set()
+        self._saved_ids = set()
+        self._storage_settings = self.saved.settings()
         self.jobs = {}
         self.events = {}
         self.scheduled = set()
@@ -190,19 +198,24 @@ class JobStore:
                     job.update(status="error", stage="Обработка прервана", error="Приложение было закрыто. Повторите обработку файла.")
                 if job.get("status") == "done" and not clean:
                     job.update(status="error", error="Файлы результата не найдены. Повторите обработку.")
+                if job.get("status") == "error":
+                    job.update(self._diagnose_failure(job))
                 self.jobs[ident] = job
         except (OSError, ValueError, TypeError, KeyError):
             LOG.exception("Cannot load saved queue; the manifest has been retained")
 
     def _save(self):
-        temporary = self.manifest.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"version": VERSION, "jobs": list(self.jobs.values())}, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.manifest)
+        temporary = self.manifest.with_name('.jobs-' + uuid.uuid4().hex + '.tmp')
+        try:
+            temporary.write_text(json.dumps({"version": VERSION, "jobs": list(self.jobs.values())}, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.manifest)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _backfill_saved_html(self):
         # Old installed deliveries can outlive their queue history. Only the
         # still-recorded exact package can establish their HTML provenance.
-        for record in self.saved.list():
+        for record in self.saved_call('list'):
             job = self.jobs.get(record['job_id'])
             if not job or job.get('name') != record['name'] or job.get('format') != record['format']:
                 continue
@@ -228,7 +241,8 @@ class JobStore:
 
     def public(self, job):
         editable = (job.get('status') in {'queued', 'error', 'cancelled'}
-                    and job['id'] not in self.scheduled and Path(job['name']).suffix.lower() == '.pdf'
+                    and job['id'] not in self.scheduled and job['id'] not in self._file_operations
+                    and Path(job['name']).suffix.lower() == '.pdf'
                     and type(job.get('source_page_count')) is int and job['source_page_count'] > 0)
         result = {key: value for key, value in job.items()
                   if key not in {"source", "source_pdf", "artifacts", "packages", "replay_html", "attempt_id", "review_count", "reviewed_count", "review_error_count"}
@@ -239,8 +253,7 @@ class JobStore:
                                      'Проверьте строки, столбцы и значения таблицы: её сетка',
                                      'Движок пометил результат для визуальной проверки таблиц')))]
         if job.get('status') == 'error':
-            result.update(self._diagnose_failure(job))
-            result['error'] = result['user_error']
+            result['error'] = job['user_error']
         if job['id'] in self.scheduled and job.get('status') in {'done', 'error'}:
             # A completed conversion may still be finalizing its durable local
             # artifacts. Do not expose a restartable terminal state before the
@@ -251,66 +264,114 @@ class JobStore:
 
     def snapshot(self):
         with self.lock:
-            saved_ids = {item['id'] for item in self.saved.list() if item.get('exists', True)}
             jobs = []
             for job in self.jobs.values():
                 if job.get('hidden'):
                     continue
                 public = self.public(job)
-                if public.get('saved_result_id') not in saved_ids:
+                if public.get('saved_result_id') not in self._saved_ids:
                     public['saved_result_id'] = None
                 jobs.append(public)
-            runtime = self.engine_host.snapshot() if self.engine_host is not None else None
-            idle_ready = bool(runtime and runtime.get('phase') == 'stopped' and self.engine.get('available'))
-            return {"version": VERSION, "session_id": self.session_id, "pdf_modes": PDF_MODES,
-                    "engine": "convert_docling · local", "engine_ready": idle_ready or runtime.get('phase') == 'ready' if runtime else bool(self.engine.get("available")),
-                    "engine_message": 'Готов к обработке' if idle_ready else runtime['message'] if runtime else self.engine.get("message", ""),
-                    "engine_runtime": runtime,
-                    "jobs": jobs, "output_dir": str(self.saved.root), "storage_error": self.saved.storage_error}
+            host, engine, settings = self.engine_host, self.engine, self._storage_settings
+        runtime = host.snapshot() if host is not None else None
+        idle_ready = bool(runtime and runtime.get('phase') == 'stopped' and engine.get('available'))
+        return {"version": VERSION, "session_id": self.session_id, "pdf_modes": PDF_MODES,
+                "engine": "convert_docling · local", "engine_ready": idle_ready or runtime.get('phase') == 'ready' if runtime else bool(engine.get("available")),
+                "engine_message": 'Готов к обработке' if idle_ready else runtime['message'] if runtime else engine.get("message", ""),
+                "engine_runtime": runtime, "jobs": jobs, **settings}
 
     def history(self):
         """Saved deliveries and retained uploads share a recoverable history."""
-        with self.lock:
+        with self.storage_lock:
             saved = [dict(item, kind='saved') for item in self.saved_call('list')]
-            saved_ids = {item['id'] for item in saved if item.get('exists', True)}
+            removed_ids = self.saved.removed_result_ids
             unsaved = []
-            for job in self.jobs.values():
-                if job.get('saved_result_id') in saved_ids:
-                    continue
-                if (job.get('saved_result_id') in self.saved.removed_result_ids
-                        and job.get('status') != 'running' and job['id'] not in self.scheduled):
-                    continue  # An externally removed delivery is not an unsaved upload.
-                item = self.public(job)
-                item.update(id='job:' + job['id'], job_id=job['id'], kind='job',
-                            format=job.get('format', 'html'), exists=native_path(self.root / job['id']).is_dir(),
-                            path=str(self.root / job['id']))
-                unsaved.append(item)
+            with self.lock:
+                for job in self.jobs.values():
+                    if job.get('saved_result_id') in self._saved_ids:
+                        continue
+                    if (job.get('saved_result_id') in removed_ids
+                            and job.get('status') != 'running' and job['id'] not in self.scheduled):
+                        continue  # An externally removed delivery is not an unsaved upload.
+                    item = self.public(job)
+                    item.update(id='job:' + job['id'], job_id=job['id'], kind='job',
+                                format=job.get('format', 'html'), path=str(self.root / job['id']))
+                    unsaved.append(item)
+            for item in unsaved:
+                item['exists'] = native_path(item['path']).is_dir()
             return sorted(saved + unsaved, key=lambda item: item.get('created_at', ''), reverse=True)
 
     def refresh_history(self):
         """Reconcile external folder deletion without touching active work."""
-        with self.lock:
-            protected = self.scheduled | {job['id'] for job in self.jobs.values() if job.get('status') == 'running'}
-            removed = self.saved_call('prune_missing', protected_job_ids=protected)
+        with self.storage_lock:
+            indexed_jobs = {record['job_id'] for record in self.saved.records.values()}
+            with self.lock:
+                protected = self._file_operations | self.scheduled | {job['id'] for job in self.jobs.values() if job.get('status') == 'running'}
+                idle = self.jobs.keys() - protected
+                if not self.saved.unavailable_roots:
+                    idle.intersection_update(indexed_jobs)
+                self._file_operations.update(idle)
+            try:
+                removed = self.saved_call('prune_missing', protected_job_ids=protected)
+            finally:
+                with self.lock:
+                    self._file_operations.difference_update(idle)
             return {'items': self.history(), 'output_dir': str(self.saved.root), 'removed': len(removed)}
 
     def settings(self):
         with self.lock:
-            return self.saved.settings()
+            return dict(self._storage_settings)
 
     def change_output_dir(self, value):
-        with self.lock:
+        with self.storage_lock:
             try:
-                return self.saved.change_root(value)
+                settings = self.saved.change_root(value)
             except ValueError as error:
                 raise APIError(str(error)) from None
             except OSError as error:
                 raise APIError('Не удалось выбрать папку сохранения. Проверьте путь и права доступа: ' + str(error), 409) from None
+            with self.lock:
+                self._storage_settings = settings
+            try:
+                self.saved_call('list')
+            except APIError as error:
+                LOG.warning('Не удалось обновить список результатов после смены папки: %s', error)
+            return settings
+
+    def _check_file_operation(self, ident):
+        if ident in self._file_operations:
+            raise APIError('Дождитесь завершения операции с файлами документа.', 409)
+
+    def _folder_lock(self, ident):
+        with self.lock:
+            lock = self._folder_locks.get(ident)
+            if lock is None:
+                lock = threading.RLock()
+                self._folder_locks[ident] = lock
+            return lock
+
+    @contextmanager
+    def _reserve_files(self, ids, validate=None):
+        """Keep the same job generation and files until the operation commits."""
+        with self.lock:
+            if validate is not None:
+                validate()
+            for ident in ids:
+                self._check_file_operation(ident)
+                if ident in self.scheduled or self.jobs.get(ident, {}).get('status') == 'running':
+                    raise APIError('Сначала остановите обработку файла.', 409)
+            self._file_operations.update(ids)
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._file_operations.difference_update(ids)
 
     def hide(self, ident):
         """Remove only a queue row; files, logs and history remain available."""
         with self.lock:
             job = self._get(ident)
+            self._check_file_operation(ident)
             if job['status'] == 'running':
                 raise APIError('Сначала остановите обработку файла.', 409)
             job['hidden'] = True
@@ -318,14 +379,15 @@ class JobStore:
         return self.snapshot()
 
     def job_log(self, ident):
-        with self.lock:
-            job = self._get(ident)
-            self._owned_job_folder(ident)
-            return assemble_conversion_log(job, self.root / ident)
+        with self._folder_lock(ident):
+            with self.lock:
+                job = copy.deepcopy(self._get(ident))
+            return assemble_conversion_log(job, self._owned_job_folder(ident))
 
     def open_job(self, ident, target):
-        with self.lock:
-            job = self._get(ident)
+        with self._folder_lock(ident):
+            with self.lock:
+                job = self._get(ident).copy()
             folder = self._owned_job_folder(ident)
             if target == 'source':
                 path = folder / 'input' / safe_filename(job['name'])
@@ -372,34 +434,35 @@ class JobStore:
 
     def upload_check(self, name):
         name = safe_filename(name)
-        with self.lock:
+        with self.storage_lock:
             return self._upload_duplicates().check(name)
 
     def upload_existing(self, token):
-        with self.lock:
+        with self.storage_lock:
             return self._upload_duplicates().reuse(token)
 
     def upload(self, stream, name, size, *, replace_token=None):
         name = safe_filename(name)
         if size <= 0 or size > MAX_UPLOAD:
             raise APIError("Файл пустой или превышает 512 МБ.", 413)
-        with self.lock:
+        with self.storage_lock:
             guard = self._upload_duplicates()
             ticket = guard.begin(name, replace_token)
-            if sum(not job.get('hidden') for job in self.jobs.values()) >= MAX_JOBS and not ticket['groups']:
-                guard.finish(ticket)
-                raise APIError("В очереди уже 200 файлов. Удалите ненужные записи.", 409)
-            ident = uuid.uuid4().hex
-            folder = self.root / ident / "input"
             try:
-                folder.mkdir(parents=True)
+                with self.lock:
+                    self._check_upload_capacity(ticket['groups'])
             except Exception:
                 guard.finish(ticket)
                 raise
-        path = folder / name
+        ident = uuid.uuid4().hex
+        folder = self.root / ident
+        path = folder / 'input' / name
         remaining = size
-        committed = False
+        created = committed = False
         try:
+            folder.mkdir()
+            created = True
+            path.parent.mkdir()
             with native_path(path).open("wb") as target:
                 while remaining:
                     block = stream.read(min(1024 * 1024, remaining))
@@ -411,45 +474,62 @@ class JobStore:
                    "status": "queued", "progress": 0, "stage": "Ожидает запуска", "error": "",
                    "stats": {}, "warnings": [], "artifacts": {}, "created_at": utc_now(),
                    'pages': '', 'pdf_mode': 'quality', 'source_available': True, **source_page_metadata(path)}
-            with self.lock:
-                previous = guard.validate_commit(ticket)
-                self.jobs[ident] = job
-                append_job_log(self.root / ident, f'Загружен файл: {name}; размер: {size} байт.')
-                self._save()
-                committed = True
-                # The new source and manifest are durable before old results
-                # are removed. Interrupted uploads can never delete old data.
+            append_job_log(folder, f'Загружен файл: {name}; размер: {size} байт.')
+            with ExitStack() as reservation:
+                with self.storage_lock:
+                    previous = guard.groups(name)
+                    reserved = [ident, *(group['job_id'] for group in previous)]
+                    reservation.enter_context(self._reserve_files(reserved, lambda: guard.validate_commit(ticket, previous)))
+                for group in previous:
+                    old_id = group['job_id']
+                    if group['job'] or re.fullmatch(r'[0-9a-f]{32}', old_id):
+                        self._owned_job_folder(old_id)
+                    self.saved_call('validate_delete_job', old_id)
+                with self.storage_lock, self.lock:
+                    self._check_upload_capacity(previous)
+                    if ident in self.jobs:
+                        raise APIError('Идентификатор загрузки уже занят. Повторите загрузку.', 409)
+                    old_jobs = {old_id: self.jobs[old_id] for old_id in reserved[1:] if old_id in self.jobs}
+                    self.jobs.update({old_id: dict(old_job, hidden=True) for old_id, old_job in old_jobs.items()})
+                    self.jobs[ident] = job
+                    try:
+                        self._save()
+                    except Exception:
+                        del self.jobs[ident]
+                        self.jobs.update(old_jobs)
+                        raise
+                    committed = True
+                # Keep the prior upload until the new source and queue entry are durable.
                 for group in previous:
                     try:
-                        if group['job']:
-                            self.delete(group['job_id'])
-                        else:
-                            self._delete_orphaned_document(group['job_id'])
+                        self._delete_document(group['job_id'])
                     except (APIError, OSError) as error:
                         message = ('Новый файл загружен, но прежнюю копию не удалось полностью удалить. '
                                    'Закройте открытые файлы и удалите прежнюю запись в Истории: ' + str(error))
-                        job['warnings'].append(message)
-                        if group['job_id'] in self.jobs:
-                            self.jobs[group['job_id']]['hidden'] = True
+                        with self.lock:
+                            job['warnings'].append(message)
                         LOG.warning('Old upload cleanup after replacement failed: %s', error)
-                if job['warnings']:
-                    self._save()
-                if replace_token:
-                    guard.decisions.pop(replace_token, None)
-            return self.public(job)
+                with self.storage_lock, self.lock:
+                    if job['warnings']:
+                        self._save()
+                    if replace_token:
+                        guard.decisions.pop(replace_token, None)
+            with self.lock:
+                return self.public(job)
         except Exception:
-            if not committed:
-                with self.lock:
-                    self.jobs.pop(ident, None)
-                    # New uploads exist only in private job storage. No saved
-                    # reservation needs cleanup, even if an old output drive
-                    # is unavailable and complete saved-result deletion blocks.
+            if created and not committed:
                 target = self._owned_job_folder(ident)
                 if native_path(target).exists():
                     shutil.rmtree(native_path(target))
             raise
         finally:
-            guard.finish(ticket)
+            with self.storage_lock:
+                guard.finish(ticket)
+
+    def _check_upload_capacity(self, previous):
+        replacing = {group['job_id'] for group in previous}
+        if sum(not job.get('hidden') and ident not in replacing for ident, job in self.jobs.items()) >= MAX_JOBS:
+            raise APIError("В очереди уже 200 файлов. Удалите ненужные записи.", 409)
 
     def _get(self, ident):
         try:
@@ -484,6 +564,7 @@ class JobStore:
     def set_pages(self, ident, pages):
         with self.lock:
             job = self._get(ident)
+            self._check_file_operation(ident)
             if job['status'] not in {'queued', 'error', 'cancelled'} or ident in self.scheduled:
                 raise APIError('Страницы можно выбрать до запуска обработки.', 409)
             job['pages'] = self._validate_job_pages(job, pages)
@@ -501,6 +582,8 @@ class JobStore:
             if self.stopping.is_set():
                 raise APIError("Приложение завершает работу.", 409)
             selected = [self._get(i) for i in dict.fromkeys(ids)]
+            for job in selected:
+                self._check_file_operation(job['id'])
             if export_only and any(not job.get("replay_html") for job in selected):
                 raise APIError("Снимок документа для нового экспорта не найден. Повторите конвертацию.", 409)
             chosen_pages = {job['id']: self._validate_job_pages(job, job.get('pages', '') if pages is None else pages,
@@ -540,6 +623,8 @@ class JobStore:
         with self.lock:
             selected = [self._get(i) for i in ids]
             for job in selected:
+                self._check_file_operation(job['id'])
+            for job in selected:
                 if job["status"] not in {"queued", "running"}:
                     continue
                 event = self.events.get(job["id"])
@@ -555,60 +640,80 @@ class JobStore:
         return self.snapshot()
 
     def delete(self, ident):
-        with self.lock:
-            job = self._get(ident)
-            if job["status"] == "running" or ident in self.scheduled:
-                raise APIError("Сначала остановите обработку файла.", 409)
-            target = self._owned_job_folder(ident)
-            # Preflight every saved version before deleting either private or
-            # downloaded files. Same-named independent uploads are unrelated.
-            self.saved_call('validate_delete_job', ident)
-            self.saved_call('delete_job', ident)
-            if native_path(target).exists():
+        with self._reserve_files([ident]):
+            with self.lock:
+                self._get(ident)
+            self._delete_document(ident)
+
+    def _delete_document(self, ident):
+        """The caller reserved this upload before changing its files or queue entry."""
+        with self._folder_lock(ident):
+            with self.lock:
+                job = self.jobs.get(ident)
+            target = self._owned_job_folder(ident) if job or re.fullmatch(r'[0-9a-f]{32}', ident) else None
+            if job is not None:
+                self.saved_call('delete_job', ident)
+            else:
+                self.saved_call('validate_delete_job', ident)
+            if target is not None and native_path(target).exists():
                 try:
                     shutil.rmtree(native_path(target))
                 except OSError as error:
                     raise APIError('Не удалось полностью удалить рабочие файлы. Закройте открытые файлы и повторите удаление: '
                                    + str(error), 409) from None
-            del self.jobs[ident]
-            self.events.pop(ident, None)
-            self._save()
+            if job is None:
+                # Without a queue row, retain the indexed delivery until private cleanup succeeds.
+                self.saved_call('delete_job', ident)
+                return
+            with self.storage_lock, self.lock:
+                del self.jobs[ident]
+                try:
+                    self._save()
+                except Exception:
+                    self.jobs[ident] = job
+                    raise
+                self.events.pop(ident, None)
 
     def artifact(self, ident, fmt):
-        with self.lock:
-            job = self._get(ident)
-            fmt = fmt or job.get("format", "html")
-            if fmt not in FORMATS:
-                raise APIError("Неизвестный формат результата.")
-            if job["status"] != "done" or fmt not in job.get("artifacts", {}):
-                raise APIError("Результат ещё не готов.", 409)
-            path = normal_path(job["artifacts"][fmt]).resolve()
-            if not path.is_relative_to(self.root / ident) or not native_path(path).is_file():
-                raise APIError("Результат не найден.", 404)
-            return native_path(path), path.name
+        with self._folder_lock(ident):
+            with self.lock:
+                job = self._get(ident).copy()
+            return self._artifact(job, fmt or job.get("format", "html"))
+
+    def _artifact(self, job, fmt):
+        if fmt not in FORMATS:
+            raise APIError("Неизвестный формат результата.")
+        if job["status"] != "done" or fmt not in job.get("artifacts", {}):
+            raise APIError("Результат ещё не готов.", 409)
+        path = normal_path(job["artifacts"][fmt]).resolve()
+        if not path.is_relative_to(self.root / job['id']) or not native_path(path).is_file():
+            raise APIError("Результат не найден.", 404)
+        return native_path(path), path.name
 
     def package(self, ident, fmt=None):
-        with self.lock:
-            job = self._get(ident)
+        with self._folder_lock(ident):
+            with self.lock:
+                job = self._get(ident).copy()
             fmt = fmt or job.get("format", "html")
             if fmt not in FORMATS:
                 raise APIError("Неизвестный формат результата.")
             if job.get("legacy_export"):
                 raise APIError("Для старого результата соберите папку заново кнопкой «Экспортировать»; OCR не повторяется.", 409)
-            self.artifact(ident, fmt)
+            self._artifact(job, fmt)
             folder = normal_path(job.get("packages", {}).get(fmt, self.root / "missing")).resolve()
             if not folder.is_relative_to(self.root / ident) or not native_path(folder).is_dir():
                 raise APIError("Папка результата не найдена.", 404)
             return folder
 
     def canonical(self, ident):
-        with self.lock:
-            job = self._get(ident)
-            if job.get('status') != 'done' or job.get('legacy_export'):
-                raise APIError('HTML-предпросмотр станет доступен после подготовки нового экспорта.', 409)
-            value = job.get('replay_html')
-            if not value:
-                raise APIError('Исходный HTML для предпросмотра не найден.', 404)
+        with self._folder_lock(ident):
+            with self.lock:
+                job = self._get(ident)
+                if job.get('status') != 'done' or job.get('legacy_export'):
+                    raise APIError('HTML-предпросмотр станет доступен после подготовки нового экспорта.', 409)
+                value = job.get('replay_html')
+                if not value:
+                    raise APIError('Исходный HTML для предпросмотра не найден.', 404)
             path = normal_path(value).resolve()
             if not path.is_relative_to(self.root / ident) or not native_path(path).is_file():
                 raise APIError('Исходный HTML для предпросмотра не найден.', 404)
@@ -634,9 +739,12 @@ class JobStore:
     def save_result(self, ident):
         if not isinstance(ident, str) or not re.fullmatch(r'[0-9a-f]{32}', ident):
             raise APIError('Не выбран документ для сохранения.')
-        with self.lock:
-            job = self._get(ident)
+        with self._reserve_files([ident]), self._folder_lock(ident):
+            with self.lock:
+                job = copy.deepcopy(self._get(ident))
+                output_dir = self._storage_settings['output_dir']
             package = self.package(ident)
+            canonical = self.canonical(ident)
             if __package__:
                 from .export_bundle import EXPORT_SCHEMA, build_exports
             else:
@@ -647,7 +755,7 @@ class JobStore:
                 try:
                     result = build_exports(None, Path(job['source']), self.root / ident / 'result',
                                            output_format=job.get('format', 'html'),
-                                           replay_html=self.canonical(ident), pages=job.get('stats', {}).get('pages'))
+                                           replay_html=canonical, pages=job.get('stats', {}).get('pages'))
                     artifacts = {fmt: str(normal_path(value).resolve()) for fmt, value in result['artifacts'].items()}
                     packages = {fmt: str(normal_path(value).resolve()) for fmt, value in result['packages'].items()}
                     replay = normal_path(result['replay_html']).resolve()
@@ -658,62 +766,59 @@ class JobStore:
                         raise ValueError('Новый пакет результата не прошёл проверку')
                 except (OSError, ValueError) as error:
                     raise APIError('Не удалось обновить папку результата из HTML: ' + str(error), 409) from None
-                job.update(artifacts=artifacts, packages=packages, replay_html=str(replay),
-                           export_schema=result.get('export_schema'), legacy_export=False,
-                           stats=result.get('stats', {}), warnings=list(dict.fromkeys(job.get('warnings', []) + result.get('warnings', []))),
-                           saved_result_id=None)
+                changes = dict(artifacts=artifacts, packages=packages, replay_html=str(replay),
+                               export_schema=result.get('export_schema'), legacy_export=False,
+                               stats=result.get('stats', {}), warnings=list(dict.fromkeys(job.get('warnings', []) + result.get('warnings', []))),
+                               saved_result_id=None)
+                self._commit_job(ident, changes)
+                job.update(changes)
                 append_job_log(self.root / ident, 'Папка результата обновлена из сохранённого HTML без повторного OCR.')
-                self._save()
                 package = self.package(ident)
-            append_job_log(self.root / ident, 'Сохранение результата в ' + str(self.saved.root) + '.')
+                canonical = self.canonical(ident)
+            append_job_log(self.root / ident, 'Сохранение результата в ' + output_dir + '.')
             content = assemble_conversion_log(job, self.root / ident)
             saved = self.saved_call('save', package, job_id=ident, name=job['name'],
-                                    format=job.get('format', 'html'), log=content, canonical=self.canonical(ident))
-            job['saved_result_id'] = saved['id']
-            self._save()
+                                    format=job.get('format', 'html'), log=content, canonical=canonical,
+                                    output_dir=output_dir)
+            self._commit_job(ident, {'saved_result_id': saved['id']})
             return saved
+
+    def _commit_job(self, ident, changes):
+        with self.lock:
+            job = self._get(ident)
+            previous = job.copy()
+            job.update(changes)
+            try:
+                self._save()
+            except Exception:
+                job.clear()
+                job.update(previous)
+                raise
 
     def delete_saved(self, ident):
         """Remove one delivered format, retaining the upload and canonical HTML."""
-        with self.lock:
+        with self.storage_lock:
             record = self.saved_call('get', ident)
-            job = self.jobs.get(record['job_id'])
-            if job and (job['status'] == 'running' or job['id'] in self.scheduled):
-                raise APIError('Сначала остановите обработку файла.', 409)
-            self.saved_call('delete', ident)
+            with self._reserve_files([record['job_id']]):
+                self.saved_call('delete', ident)
 
     def delete_saved_document(self, ident):
         """Delete the entire upload identified by one saved delivery."""
-        with self.lock:
-            job_id = self.saved_call('get', ident)['job_id']
-            if not isinstance(job_id, str) or not re.fullmatch(r'[0-9a-f]{32}', job_id):
-                raise APIError('Не удалось подтвердить принадлежность результата загрузке.', 409)
-            if job_id in self.jobs:
-                self.delete(job_id)
-                return
-            if job_id in self.scheduled:
-                raise APIError('Сначала остановите обработку файла.', 409)
-            self._delete_orphaned_document(job_id)
-
-    def _delete_orphaned_document(self, job_id):
-        """Delete an indexed upload whose queue entry is no longer present."""
-        with self.lock:
-            target = self._owned_job_folder(job_id) if re.fullmatch(r'[0-9a-f]{32}', job_id) else None
-            self.saved_call('validate_delete_job', job_id)
-            if target is not None and native_path(target).exists():
-                try:
-                    shutil.rmtree(native_path(target))
-                except OSError as error:
-                    raise APIError('Не удалось полностью удалить рабочие файлы. Закройте открытые файлы и повторите удаление: '
-                                   + str(error), 409) from None
-            self.saved_call('delete_job', job_id)
+        with ExitStack() as reservation:
+            with self.storage_lock:
+                job_id = self.saved_call('get', ident)['job_id']
+                if not isinstance(job_id, str) or not re.fullmatch(r'[0-9a-f]{32}', job_id):
+                    raise APIError('Не удалось подтвердить принадлежность результата загрузке.', 409)
+                reservation.enter_context(self._reserve_files([job_id]))
+            self._delete_document(job_id)
 
     def saved_document(self, ident, target):
-        with self.lock:
-            record = self.saved_call('get', ident)
-            job_id = record['job_id']
-            if target == 'source' and job_id in self.jobs:
-                job = self._get(job_id)
+        job_id = self.saved_call('get', ident)['job_id']
+        with self._folder_lock(job_id):
+            with self.lock:
+                job = self.jobs.get(job_id)
+            if target == 'source' and job is not None:
+                self.saved_call('get', ident)
                 folder = self._owned_job_folder(job_id)
                 path = folder / 'input' / safe_filename(job['name'])
                 if native_path(path).is_file():
@@ -733,22 +838,50 @@ class JobStore:
         return self.saved_call('open_target', ident, target)
 
     def saved_call(self, operation, *args, **kwargs):
-        try:
-            return getattr(self.saved, operation)(*args, **kwargs)
-        except KeyError:
-            raise APIError('Сохранённый результат не найден.', 404) from None
-        except FileNotFoundError as exc:
-            raise APIError(str(exc), 404) from None
-        except PermissionError:
-            raise APIError('Нет доступа к папке результата. Закройте открытые файлы и проверьте права доступа.', 409) from None
-        except ValueError as exc:
-            raise APIError(str(exc), 409) from None
-        except OSError as exc:
-            raise APIError('Операция с сохранённым результатом не выполнена: ' + str(exc), 409) from None
+        with self.storage_lock:
+            completed = False
+            try:
+                result = getattr(self.saved, operation)(*args, **kwargs)
+                completed = True
+            except KeyError:
+                raise APIError('Сохранённый результат не найден.', 404) from None
+            except FileNotFoundError as exc:
+                raise APIError(str(exc), 404) from None
+            except PermissionError:
+                raise APIError('Нет доступа к папке результата. Закройте открытые файлы и проверьте права доступа.', 409) from None
+            except ValueError as exc:
+                raise APIError(str(exc), 409) from None
+            except OSError as exc:
+                raise APIError('Операция с сохранённым результатом не выполнена: ' + str(exc), 409) from None
+            finally:
+                # Deleting several versions may remove some before another fails.
+                # Publish only IDs still present in the committed storage indices.
+                if operation in {'delete', 'delete_job', 'prune_missing'}:
+                    remaining = set(self.saved.records)
+                    if not completed:
+                        # A folder can already be gone when its index write fails.
+                        try:
+                            remaining = {item['id'] for item in self.saved.list() if item.get('exists', True)}
+                        except (OSError, ValueError):
+                            pass
+                    with self.lock:
+                        self._saved_ids.intersection_update(remaining)
+                if operation in {'validate_delete_job', 'delete_job', 'prune_missing', 'open_root'}:
+                    settings = self.saved.settings()
+                    with self.lock:
+                        self._storage_settings = settings
+            if operation == 'list':
+                existing = {item['id'] for item in result if item.get('exists', True)}
+                with self.lock:
+                    self._saved_ids = existing
+            elif operation == 'save':
+                with self.lock:
+                    self._saved_ids.add(result['id'])
+            return result
 
     def save_all(self):
+        saved_ids = {item['id'] for item in self.saved_call('list') if item.get('exists', True)}
         with self.lock:
-            saved_ids = {item['id'] for item in self.saved_call('list') if item.get('exists', True)}
             ids = [job['id'] for job in self.jobs.values() if job['status'] == 'done'
                    and not job.get('hidden') and not job.get('legacy_export')
                    and job.get('saved_result_id') not in saved_ids]
@@ -805,15 +938,16 @@ class JobStore:
                     archive_engine_logs(self.root / ident)
                 convert = self.converter or importlib.import_module("converter").convert_file
                 runtime_options = {'engine_host': self.engine_host} if self.converter is None else {}
-                if job.get('pdf_mode') == 'fast' and not job.get('_replay'):
-                    runtime_options = {'pdf_mode': 'fast'}
+                pdf_mode = job.get('pdf_mode', 'quality')
+                if pdf_mode != 'quality' and not job.get('_replay'):
+                    runtime_options['pdf_mode'] = pdf_mode
                 result = convert(Path(job["source"]), self.root / ident / "result",
                                  pages=job.get("pages", ""), on_progress=progress, cancel_event=event,
                                  output_format=job.get("format", "html"), replay_html=job.get("_replay"), **runtime_options)
                 with self.lock:
-                    if event.is_set():
+                    cancelled = event.is_set()
+                    if cancelled:
                         job.update(status="cancelled", stage="Отменено")
-                        append_job_log(self.root / ident, 'Обработка отменена.')
                     else:
                         artifacts = {fmt: str(normal_path(value).resolve()) for fmt, value in result["artifacts"].items()}
                         if set(artifacts) != {job.get("format", "html")} or any(not Path(p).is_relative_to(self.root / ident) or not native_path(p).is_file() for p in artifacts.values()):
@@ -836,22 +970,27 @@ class JobStore:
                                    stats=result.get("stats", {}), warnings=result.get("warnings", []), completed_at=utc_now())
                         if result.get('technical_status'):
                             job['technical_status'] = result['technical_status']
-                        append_job_log(self.root / ident, 'Обработка успешно завершена.')
-                        for join in result.get('table_joins', []):
-                            append_job_log(self.root / ident, 'Склейка фрагментов HTML-таблицы: ' + json.dumps(join, ensure_ascii=False))
-                        for warning in job.get('warnings', []):
-                            append_job_log(self.root / ident, 'ПРЕДУПРЕЖДЕНИЕ: ' + str(warning))
+                if cancelled:
+                    append_job_log(self.root / ident, 'Обработка отменена.')
+                else:
+                    append_job_log(self.root / ident, 'Обработка успешно завершена.')
+                    for join in result.get('table_joins', []):
+                        append_job_log(self.root / ident, 'Склейка фрагментов HTML-таблицы: ' + json.dumps(join, ensure_ascii=False))
+                    for warning in job.get('warnings', []):
+                        append_job_log(self.root / ident, 'ПРЕДУПРЕЖДЕНИЕ: ' + str(warning))
             except Exception as exc:
+                failure = None if event.is_set() else self._diagnose_failure(job, exc)
                 with self.lock:
                     if event.is_set():
                         LOG.info("Conversion cancelled for %s", ident)
                         job.update(status="cancelled", stage="Отменено")
                         append_job_log(self.root / ident, 'Обработка отменена.')
                     else:
-                        LOG.exception("Conversion failed for %s", ident)
                         job.update(status="error", stage="Ошибка обработки", error=str(exc)[:2000],
-                                   **self._diagnose_failure(job, exc))
-                        append_job_log(self.root / ident, 'ОШИБКА: ' + traceback.format_exc())
+                                   **failure)
+                if job['status'] == 'error':
+                    LOG.exception("Conversion failed for %s", ident)
+                    append_job_log(self.root / ident, 'ОШИБКА: ' + traceback.format_exc())
             finally:
                 with self.lock:
                     self.scheduled.discard(ident)
@@ -994,7 +1133,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/settings':
                 return self._json(store.settings())
             if path == '/api/installed':
-                return self._json({'items': store.history(), 'output_dir': str(store.saved.root)})
+                with store.storage_lock:
+                    history = {'items': store.history(), 'output_dir': str(store.saved.root)}
+                return self._json(history)
             match = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/log', path)
             if match:
                 return self._json({'content': store.job_log(match[1])})
@@ -1028,8 +1169,9 @@ class Handler(BaseHTTPRequestHandler):
                     file = store.preview_document(match[2])
                     selected_format, name = 'html', file.name
                 else:
-                    file, name = store.artifact(match[2], fmt)
-                    selected_format = fmt or store.jobs[match[2]].get("format", "html")
+                    with store.lock:
+                        selected_format = fmt or store._get(match[2]).get("format", "html")
+                    file, name = store.artifact(match[2], selected_format)
                 if match[1] == "document":
                     return self._file(file, FORMATS[selected_format][1], name)
                 with file.open("rb") as stream:
@@ -1072,8 +1214,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(result)
             if path == '/api/settings/open':
                 self._body()
-                with store.lock:
-                    store.saved_call('open_root')
+                store.saved_call('open_root')
                 return self._json({'ok': True})
             if path == '/api/settings':
                 return self._json(store.change_output_dir(self._body().get('output_dir')))

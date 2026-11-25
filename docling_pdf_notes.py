@@ -54,8 +54,8 @@ def join_primary_note_table_continuations(soup, manifest, records, api):
         if any(meta.get('clockwise') != 0 or len(meta.get('original_size', [])) != 2
                for meta in (info, old_info)):
             continue
-        width, height = info['original_size']
-        old_width, old_height = old_info['original_size']
+        width, height = info.get('deskewed_size', info['original_size'])
+        old_width, old_height = old_info.get('deskewed_size', old_info['original_size'])
         profile = api.table_profile(str(table))
         if (profile['issues'] or profile['columns'] != 1 or profile['rows'] < 2
                 or api.table_profile(str(previous))['columns'] < 2

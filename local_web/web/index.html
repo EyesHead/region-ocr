@@ -77,10 +77,12 @@
       <fieldset class="pdf-mode-options">
         <legend>Режим обработки PDF</legend>
         <label><input type="radio" name="pdf-mode" value="quality" checked aria-labelledby="quality-mode-title" aria-describedby="quality-mode-help">
-          <span><strong id="quality-mode-title">Точный</strong><small id="quality-mode-help">Восстанавливает ячейки таблиц, формулы и схемы.</small></span></label>
+          <span><strong id="quality-mode-title">Точный</strong><small id="quality-mode-help">Для сложных сканов, таблиц и формул, где важна точность.</small></span></label>
+        <label><input type="radio" name="pdf-mode" value="balanced" disabled aria-labelledby="balanced-mode-title" aria-describedby="balanced-mode-help">
+          <span><strong id="balanced-mode-title">Сбалансированный</strong><small id="balanced-mode-help">Для книг и стандартов со сложными таблицами и формулами. Читает текст из PDF, распознаёт сканы через RapidOCR и формулы через Surya. Восстанавливает ячейки и продолжения таблиц.</small></span></label>
         <label><input type="radio" name="pdf-mode" value="fast" disabled aria-labelledby="fast-mode-title" aria-describedby="fast-mode-help">
-          <span><strong id="fast-mode-title">Быстрый</strong><small id="fast-mode-help">Извлекает текст и простые таблицы. Сохраняет рисунки и фрагменты формул.</small></span></label>
-        <p id="pdf-mode-restart" class="format-note" hidden>Для быстрого режима перезапустите конвертер.</p>
+          <span><strong id="fast-mode-title">Быстрый</strong><small id="fast-mode-help">Для PDF с текстовым слоем и простыми таблицами. Читает готовый текст, сканы и страницы с повреждённым слоем распознаёт через RapidOCR. Формулы сохраняет картинками.</small></span></label>
+        <p id="pdf-mode-restart" class="format-note" hidden>Чтобы открыть все режимы, перезапустите конвертер.</p>
       </fieldset>
       <section class="format-section" aria-labelledby="format-title">
         <h2 id="format-title">Формат результата</h2>

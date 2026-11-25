@@ -4,12 +4,8 @@ import logging
 import math
 from pathlib import Path
 
-if __package__:
-    from .assets import MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS
-    from .fast_pdf import _page_box
-else:
-    from assets import MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS
-    from fast_pdf import _page_box
+from local_web.fast_resources import MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS
+from local_web.fast_pdf_geometry import _page_box
 
 
 def crop_png(page, box, scale=2.0):

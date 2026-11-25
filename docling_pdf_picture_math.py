@@ -706,4 +706,4 @@ def _recover_picture_math(doc, records, regions, args, picture_routes, excluded,
                 message='Многоэтажная дробная запись сохранена буквально. Алфавит обозначений взят '
                         'из первичного OCR; возможна путаница кириллицы и латиницы.'))
         api.diagnostic_event('SOURCE_PICTURE_MATH_RECOVERED', page=page, picture=picture.self_ref,
-                             ref=target.self_ref, literal_stack=proof['literal_stack'])
+                             ref=target.self_ref, literal_stack=proof.get('literal_stack', False))

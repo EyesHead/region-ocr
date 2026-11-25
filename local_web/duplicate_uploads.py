@@ -1,7 +1,6 @@
 """Explicit duplicate decisions; filenames are compared without reading OCR data."""
 import hashlib
 import json
-import re
 import secrets
 import time
 import unicodedata
@@ -22,12 +21,13 @@ class DuplicateUploads:
         self.decisions = {}
         self.inflight = set()
 
-    def _groups(self, name):
+    def groups(self, name):
         store, key = self.store, filename_key(name)
         groups = {}
-        for job in store.jobs.values():
-            if filename_key(job['name']) != key:
-                continue
+        # The caller holds storage_lock, so uploads cannot be added or removed.
+        with store.lock:
+            candidates = [job for job in store.jobs.values() if filename_key(job['name']) == key]
+        for job in candidates:
             source = native_path(store.root / job['id'] / 'input' / job['name'])
             try:
                 if not source.is_file():
@@ -49,12 +49,14 @@ class DuplicateUploads:
         data = [[g['job_id'], g['source_identity'], sorted(r['id'] for r in g['records']),
                  (g['job'] or {}).get('format'), (g['job'] or {}).get('saved_result_id'),
                  (g['job'] or {}).get('started_at'), (g['job'] or {}).get('completed_at'),
-                 (g['job'] or {}).get('replay_html'), (g['job'] or {}).get('pages')]
+                 (g['job'] or {}).get('replay_html'), (g['job'] or {}).get('pages'),
+                 (g['job'] or {}).get('attempt_id')]
                 for g in groups]
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def _busy(self, groups):
-        return any(g['job'] and (g['job']['status'] == 'running' or g['job_id'] in self.store.scheduled)
+        return any(g['job_id'] in self.store._file_operations or g['job_id'] in self.store.scheduled
+                   or (g['job'] or {}).get('status') == 'running'
                    for g in groups)
 
     def _existing(self, groups):
@@ -70,80 +72,77 @@ class DuplicateUploads:
             value = dict(max(group['records'], key=lambda r: r.get('created_at', '')), kind='saved')
         return value
 
-    def check(self, name):
+    def check(self, name, groups=None):
+        if groups is None:
+            groups = [] if filename_key(name) in self.inflight else self.groups(name)
         with self.store.lock:
             now = time.monotonic()
             self.decisions = {k: v for k, v in self.decisions.items() if v['expires'] > now}
-            groups = self._groups(name)
             if filename_key(name) in self.inflight:
                 return dict(duplicate=True, busy=True, can_replace=False, can_use_existing=False,
                             reason='Файл с этим именем уже загружается. Дождитесь завершения загрузки.')
+            if any(g['job_id'] in self.store._file_operations for g in groups):
+                return dict(duplicate=True, busy=True, can_replace=False, can_use_existing=False,
+                            reason='Дождитесь завершения операции с файлами документа.')
             if not groups:
                 return dict(duplicate=False)
             token = secrets.token_urlsafe(24)
             if len(self.decisions) >= 1024:
                 self.decisions.pop(next(iter(self.decisions)))
-            self.decisions[token] = dict(key=filename_key(name), fingerprint=self._fingerprint(groups),
+            self.decisions[token] = dict(key=filename_key(name), name=name, fingerprint=self._fingerprint(groups),
                                          expires=now + 600)
             busy = self._busy(groups)
             return dict(duplicate=True, token=token, existing=self._existing(groups), count=len(groups),
                         can_use_existing=True, can_replace=not busy,
                         reason='Файл обрабатывается. Его можно использовать, но пока нельзя заменить.' if busy else '')
 
-    def conflict(self, name, message='Файл с таким именем уже был загружен. Выберите действие.'):
+    def conflict(self, name, groups, message='Файл с таким именем уже был загружен. Выберите действие.'):
         error = self.error_type(message, 409)
-        error.details = {'duplicate': self.check(name)}
+        error.details = {'duplicate': self.check(name, groups)}
         return error
 
-    def _decision(self, name, token):
+    def _decision(self, name, token, groups):
         decision = self.decisions.get(token) if isinstance(token, str) else None
         if not decision or decision['expires'] <= time.monotonic() or decision['key'] != filename_key(name):
-            raise self.conflict(name, 'Выбор устарел. Проверьте загруженный файл ещё раз.')
+            raise self.conflict(name, groups, 'Выбор устарел. Проверьте загруженный файл ещё раз.')
         return decision
 
     def begin(self, name, token):
+        key = filename_key(name)
+        if key in self.inflight:
+            raise self.conflict(name, [])
+        groups = self.groups(name)
         with self.store.lock:
-            key = filename_key(name)
-            if key in self.inflight:
-                raise self.conflict(name)
-            groups = self._groups(name)
             if groups:
-                decision = self._decision(name, token) if token else None
+                decision = self._decision(name, token, groups) if token else None
                 if (decision is None or decision['fingerprint'] != self._fingerprint(groups)
                         or self._busy(groups)):
-                    raise self.conflict(name)
+                    raise self.conflict(name, groups)
             elif token:
-                raise self.conflict(name, 'Прежний файл уже изменился. Повторите загрузку.')
+                raise self.conflict(name, groups, 'Прежний файл уже изменился. Повторите загрузку.')
             self.inflight.add(key)
             return dict(name=name, key=key, groups=groups, fingerprint=self._fingerprint(groups), token=token)
 
-    def validate_commit(self, ticket):
-        groups = self._groups(ticket['name'])
+    def validate_commit(self, ticket, groups):
         if self._fingerprint(groups) != ticket['fingerprint'] or self._busy(groups):
-            raise self.conflict(ticket['name'], 'Прежний файл изменился или начал обрабатываться. Замена отменена.')
-        for group in groups:
-            if group['job'] or re.fullmatch(r'[0-9a-f]{32}', group['job_id']):
-                self.store._owned_job_folder(group['job_id'])
-            self.store.saved_call('validate_delete_job', group['job_id'])
-        return groups
+            raise self.conflict(ticket['name'], groups, 'Прежний файл изменился или начал обрабатываться. Замена отменена.')
 
     def finish(self, ticket):
-        with self.store.lock:
-            self.inflight.discard(ticket['key'])
+        self.inflight.discard(ticket['key'])
 
     def reuse(self, token):
+        decision = self.decisions.get(token) if isinstance(token, str) else None
+        if not decision or decision['expires'] <= time.monotonic():
+            raise self.error_type('Выбор устарел. Повторите загрузку файла.', 409)
+        if decision['key'] in self.inflight:
+            raise self.conflict(decision['name'], [])
+        groups = self.groups(decision['name'])
         with self.store.lock:
-            decision = self.decisions.get(token) if isinstance(token, str) else None
-            if not decision or decision['expires'] <= time.monotonic():
-                raise self.error_type('Выбор устарел. Повторите загрузку файла.', 409)
-            # Use the exact filename key recorded at preflight, not a client path.
-            candidates = [j['name'] for j in self.store.jobs.values() if filename_key(j['name']) == decision['key']]
-            candidates += [r['name'] for r in self.store.saved_call('list') if filename_key(r['name']) == decision['key']]
-            groups = self._groups(candidates[0]) if candidates else []
             if not groups:
                 raise self.error_type('Прежний файл больше недоступен. Загрузите его заново.', 409)
-            if self._fingerprint(groups) != decision['fingerprint']:
-                raise self.conflict(candidates[0], 'Прежний файл изменился. Выберите действие ещё раз.')
+            if (self._fingerprint(groups) != decision['fingerprint']
+                    or any(g['job_id'] in self.store._file_operations for g in groups)):
+                raise self.conflict(decision['name'], groups, 'Прежний файл изменился. Выберите действие ещё раз.')
             existing = self._existing(groups)
             job = None
             if existing['kind'] == 'job':

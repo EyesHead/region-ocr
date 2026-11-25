@@ -2,6 +2,11 @@
   'use strict';
   const $ = (selector) => document.querySelector(selector);
   const formats = { markdown: 'Markdown', html: 'HTML', json: 'JSON', plaintext: 'Текст' };
+  const pdfModes = {
+    quality: { label: 'Точный режим', reprocess: 'Обработать в точном режиме' },
+    balanced: { label: 'Сбалансированный режим', reprocess: 'Обработать в сбалансированном режиме' },
+    fast: { label: 'Быстрый режим', reprocess: 'Обработать в быстром режиме' },
+  };
   const supported = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'webp', 'gif']);
   const state = { jobs: [], uploading: [], format: 'html', pdfMode: 'quality', busy: false, connected: false, timer: null, saving: new Set(), opening: new Set(), savingAll: false, installed: [], installedBusy: new Set(), installedToken: 0, installedSearch: '', deleting: new Set(), logRecord: null, logContent: null, logToken: 0, logTrigger: null, filter: 'all', query: '', sort: 'newest', outputDir: '', storageBusy: false, openingOutput: false };
   const lifecycleNames = { uploading: 'Загрузка файла…', ready: 'Готов к обработке', queued: 'В очереди', running: 'Обработка…', error: 'Не удалось обработать', cancelled: 'Обработка остановлена', done: 'Результат готов', export: 'Нужен новый экспорт' };
@@ -260,8 +265,7 @@
         results.push(reexport);
       }
       if (extension(job.name) === 'pdf' && (job.pdf_mode || 'quality') !== state.pdfMode) {
-        const label = state.pdfMode === 'fast' ? 'Обработать в быстром режиме' : 'Обработать в точном режиме';
-        const again = button(label, 'button button-outline', () => startJobs([job.id], true));
+        const again = button(pdfModes[state.pdfMode].reprocess, 'button button-outline', () => startJobs([job.id], true));
         again.disabled = state.busy || state.savingAll || state.saving.has(job.id) || !state.connected;
         results.push(again);
       }
@@ -496,7 +500,7 @@
     if (job.pages) meta.push(`Выбраны страницы ${job.pages.replace('-', '–')}`);
     if (job.size !== undefined) meta.push(sizeText(job.size));
     if (extension(job.name) === 'pdf' && ['queued', 'running', 'done', 'export'].includes(lifecycle)) {
-      meta.push(job.pdf_mode === 'fast' ? 'Быстрый режим' : 'Точный режим');
+      meta.push((pdfModes[job.pdf_mode] || pdfModes.quality).label);
     }
     if (status === 'done') meta.push(`→ ${formats[convertedFormat]}`);
     main.append(element('p', 'job-meta', meta.join(' · ')));
@@ -745,18 +749,20 @@
     try {
       const result = await api('/api/status');
       state.jobs = result.jobs || [];
-      const fastAvailable = Array.isArray(result.pdf_modes) && result.pdf_modes.includes('fast');
-      const fastOption = $('input[name="pdf-mode"][value="fast"]');
-      fastOption.disabled = !fastAvailable;
-      $('#pdf-mode-restart').hidden = fastAvailable;
-      if (!fastAvailable && state.pdfMode === 'fast') {
+      const availableModes = new Set(Array.isArray(result.pdf_modes) ? result.pdf_modes : []);
+      availableModes.add('quality');
+      document.querySelectorAll('input[name="pdf-mode"]').forEach(input => {
+        input.disabled = !availableModes.has(input.value);
+      });
+      $('#pdf-mode-restart').hidden = Object.keys(pdfModes).every(mode => availableModes.has(mode));
+      if (!availableModes.has(state.pdfMode)) {
         state.pdfMode = 'quality';
         $('input[name="pdf-mode"][value="quality"]').checked = true;
       }
       updateOutputDirectory(result.output_dir, result.storage_error || '');
       state.connected = true;
       $('#connection-error').hidden = true;
-      const label = result.engine_ready ? 'Точный режим готов' : ['starting', 'warming'].includes(result.engine_runtime?.phase) ? 'Подготовка точного режима…' : 'Точный режим пока недоступен';
+      const label = result.engine_ready ? 'Движок распознавания готов' : ['starting', 'warming'].includes(result.engine_runtime?.phase) ? 'Подготовка движка распознавания…' : 'Движок распознавания пока недоступен';
       $('#engine-label').textContent = label;
       $('#engine-status').className = `engine-status ${result.engine_runtime?.phase === 'warming' ? 'warming' : result.engine_ready ? 'ready' : 'unavailable'}`;
       $('#engine-status').title = label;

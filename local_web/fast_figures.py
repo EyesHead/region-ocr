@@ -1,19 +1,27 @@
 """Source graphics and their text anchors for the lightweight PDF path."""
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from html import escape
 from io import BytesIO
+from itertools import groupby
 from statistics import median
 import math
 import re
 
 from docling_pdf_forms import FIGURE_CAPTION, FORM_HEADING
 
-_EQUATION = re.compile(r'\(\s*(?:[A-ZА-ЯЁ]\s*\.\s*)?\d+(?:[.\-]\d+)*\s*\)\s*[,.;]?$')
+from local_web.fast_formulas import (EQUATION_NUMBER, FormulaCrop, attach_fraction_terms, coverage,
+                                     equation_number_words, ordinary_text, text_regions, vector_fractions)
+from local_web.fast_image_assets import crop_png, make_image_asset
+from local_web.fast_resources import FORMULA_CROP_ATTR, register_image
+
+_EQUATION = EQUATION_NUMBER
 _EMPTY_MATH = re.compile(r'^[\s;,:.()—–=+\-]*$')
 _MATH = re.compile(r'[=±≈≤≥∑√∫^_α-ω]|[A-Za-zА-Яа-я]\s*[+/×÷]\s*\w')
 _LEGEND = re.compile(r'(?:^|;)\s*(?:[A-Za-zА-Яа-яЁё]|\d{1,2})\s*[-—–−)]\s*\S')
 _FORMULA_INTRO = re.compile(r'\b(?:по формул[аеы]|по выражению|из соотношения)\s*[:.]?\s*$', re.I)
+_FORMULA_SLOT = re.compile(r'<math display="(?:inline|block)" data-formula-slot="(\d+)"></math>')
 
 
 def _union(boxes):
@@ -113,7 +121,7 @@ def _raster_bodies(image, size, lines, em):
             if w-2*radius >= 4*em*sx and h-2*radius >= 4*em*sy and area >= 12*em*sx*em*sy]
 
 
-def _equations(rows, images, em, width):
+def _equations(rows, images, em, width, row_cells=()):
     found = {}
     for i, row in enumerate(rows):
         text = ' '.join(w[4] for w in row)
@@ -121,19 +129,23 @@ def _equations(rows, images, em, width):
         if not tag or (not _EMPTY_MATH.fullmatch(text[:tag.start()]) and
                        (row[-1][0] < .56*width or tag[0][-1] in '.,;')):
             continue
-        edge = row[-1][0]
-        cy = (row[-1][1]+row[-1][3])/2
-        refs = [b for b in images if b[2] <= edge+.2*em and b[1]-.3*em <= cy <= b[3]+.3*em
+        number_words = equation_number_words(row) or row[-1:]
+        number_box = _union(number_words)
+        edge = number_box[0]
+        cy = (number_box[1]+number_box[3])/2
+        cell = row_cells[i] if row_cells else None
+        nearby = [box for box in images if _inside(box,cell)] if cell else images
+        refs = [b for b in nearby if b[2] <= edge+.2*em and b[1]-.3*em <= cy <= b[3]+.3*em
                 and b[3]-b[1] < 12*em and b[2]-b[0] > .5*em]
         if not refs and len(row) == 1 and _EQUATION.fullmatch(text):
-            above = [b for b in images if b[2] < edge and 0 < cy-b[3] < 2*em and b[3]-b[1] < 8*em]
-            below = [b for b in images if b[2] < edge and 0 < b[1]-cy < 2*em and b[3]-b[1] < 8*em]
+            above = [b for b in nearby if b[2] < edge and 0 < cy-b[3] < 2*em and b[3]-b[1] < 8*em]
+            below = [b for b in nearby if b[2] < edge and 0 < b[1]-cy < 2*em and b[3]-b[1] < 8*em]
             if above and below and _overlap(_union(above),_union(below)) >= .6:
                 refs = above + below
         if refs:
             # Keep independent prose before/after the printed formula editable.
             left,_,right,_ = _union(refs)
-            mixed = [w[:4] for w in row[:-1] if left < (w[0]+w[2])/2 < right]
+            mixed = [w[:4] for w in row[:-len(number_words)] if left < (w[0]+w[2])/2 < right]
             found[i] = _union(refs + mixed)
     return found
 
@@ -151,10 +163,6 @@ def _crop(page, image, box, size):
         with image.crop((math.floor(l*image.width/width), math.floor(t*image.height/height),
                          math.ceil(r*image.width/width), math.ceil(b*image.height/height))) as section:
             return _png(section)
-    if __package__:
-        from .fast_image_assets import crop_png
-    else:
-        from fast_image_assets import crop_png
     return crop_png(page,(l,t,r,b),scale=min(2.5,2600/max(width,height)))
 
 
@@ -162,10 +170,6 @@ def _resource(assets, mime, data):
     if assets is None:
         from base64 import b64encode
         return 'data:'+mime+';base64,'+b64encode(data).decode('ascii')
-    if __package__:
-        from .fast_resources import register_image
-    else:
-        from fast_resources import register_image
     return register_image(assets, mime, data)
 
 
@@ -186,6 +190,117 @@ def _markup(assets, parts, kind, box, page_no, originals=()):
     bounds = ','.join(f'{v:.2f}' for v in box)
     return (f'<img alt="{escape(kind, quote=True)}" data-source-page="{page_no}" '
             f'data-source-bbox="{bounds}" src="{src}"{attr}>')
+
+
+def _formula_markup(assets, markup, crop, table_boxes):
+    tag = re.match(r'<(?:math|span|code)(?=[\s>])', markup)
+    if tag is None:
+        return markup
+    bounds = ','.join(f'{v:.2f}' for v in crop.bbox)
+    source = f' data-source-page="{crop.page_no}" data-source-bbox="{bounds}"'
+    if tag[0] == '<math' and any(coverage(crop.bbox, box) >= .8 for box in table_boxes):
+        src = _resource(assets, 'image/png', crop.png)
+        source += f' {FORMULA_CROP_ATTR}="{escape(src, quote=True)}"'
+    return markup[:tag.end()] + source + markup[tag.end():]
+
+
+def _rendered_formula(assets, rendered, crop, label, table_boxes=()):
+    rendered = rendered.strip() if rendered else ''
+    if not rendered:
+        source = _markup(assets, ('image/png', crop.png, None, None), label, crop.bbox, crop.page_no)
+        return source, 'formula_crops'
+    if rendered.startswith('<math'):
+        kind = 'formulas_mathml'
+    elif rendered.startswith('<span'):
+        kind = 'formulas_latex'
+    else:
+        kind = 'formulas_text'
+    return _formula_markup(assets, rendered, crop, table_boxes), kind
+
+
+class FormulaBatches:
+    """Recognize a bounded batch and fill its source-owned HTML positions."""
+
+    _MAX_CROPS = 16
+    _MAX_BYTES = 16 * 1024 * 1024
+    _MAX_PAGES = 4
+
+    def __init__(self, reader, assets, stats, cancelled):
+        self.reader = reader
+        self.assets = assets
+        self.stats = stats
+        self.cancelled = cancelled
+        self.pending = []
+        self.pending_bytes = 0
+        self.resolved = {}
+        self.next_slot = 0
+        self.first_page = None
+        self.output_start = 0
+
+    def place(self, crop, label):
+        size = len(crop.png)
+        if len(self.pending) == self._MAX_CROPS or (
+                self.pending and self.pending_bytes + size > self._MAX_BYTES):
+            self._recognize()
+        slot = self.next_slot
+        self.next_slot += 1
+        self.pending.append((slot, crop, label))
+        self.pending_bytes += size
+        if self.first_page is None:
+            self.first_page = crop.page_no
+        display = 'inline' if crop.display in ('inline', False) else 'block'
+        return f'<math display="{display}" data-formula-slot="{slot}"></math>'
+
+    def finish_page(self, page_no, output):
+        if self.first_page is None:
+            self.output_start = len(output)
+        elif (page_no - self.first_page + 1 >= self._MAX_PAGES
+              or len(self.pending) >= self._MAX_CROPS or self.pending_bytes >= self._MAX_BYTES):
+            self.flush(output)
+
+    def _recognize(self):
+        if not self.pending:
+            return
+        if self.cancelled:
+            self.cancelled()
+        try:
+            rendered = list(self.reader([crop for _, crop, _ in self.pending]) or ())
+        except CancelledError:
+            raise
+        except Exception as error:
+            print(f'Surya: {type(error).__name__}: {error}', flush=True)
+            rendered = []
+        if self.cancelled:
+            self.cancelled()
+        for index, (slot, crop, label) in enumerate(self.pending):
+            markup = rendered[index] if index < len(rendered) else None
+            if markup and markup.strip():
+                self.resolved[slot] = _rendered_formula(self.assets, markup, crop, label)
+            else:
+                text = crop.text.strip() or '[формула не распознана]'
+                fragment = '<span>' + escape(text) + '</span>'
+                self.resolved[slot] = _formula_markup(self.assets,fragment,crop,()), 'formulas_text'
+        self.pending.clear()
+        self.pending_bytes = 0
+
+    def flush(self, output):
+        self._recognize()
+
+        def replace(match):
+            result = self.resolved.pop(int(match[1]), None)
+            if result is None:
+                return ''
+            markup, kind = result
+            self.stats[kind] = self.stats.get(kind, 0) + 1
+            return markup
+
+        if self.resolved:
+            for index in range(self.output_start, len(output)):
+                if 'data-formula-slot=' in output[index]:
+                    output[index] = _FORMULA_SLOT.sub(replace, output[index])
+        self.resolved.clear()
+        self.first_page = None
+        self.output_start = len(output)
 
 
 def _figure_name(text):
@@ -216,7 +331,7 @@ def _ink_box(image, size, band, em):
     return ((xx+a)/sx,(yy+c)/sy,(xx+d)/sx,(yy+e)/sy)
 
 
-def _raster_math(image, size, rows, scores, em, excluded):
+def _raster_math(image, size, rows, scores, em, excluded, row_cells=()):
     """Use numbered bands, source cues or low-confidence math; preserve the original OCR string."""
     width,height = size
     lines = [(' '.join(w[4] for w in row), _union(row)) for row in rows]
@@ -225,37 +340,47 @@ def _raster_math(image, size, rows, scores, em, excluded):
         if i in excluded:
             continue
         x,t,r,b = box
+        cell = row_cells[i] if row_cells else None
+        def ink(band):
+            if cell:
+                band = (max(band[0],cell[0]+1), max(band[1],cell[1]+1),
+                        min(band[2],cell[2]-1), min(band[3],cell[3]-1))
+            return _ink_box(image,size,band,em)
+
         tag = _EQUATION.search(text)
         anchor = _EQUATION.fullmatch(text.strip())
         low_math = scores is not None and min(scores[id(w)] for w in rows[i]) < .87 and _MATH.search(text)
         if tag and not anchor and _EMPTY_MATH.fullmatch(text[:tag.start()]):
-            residual = _ink_box(image,size,(0,t-.65*em,r,b+.65*em),em)
-            if residual and residual[2]-residual[0] > (len(tag[0])+1)*em*.7:
+            number = equation_number_words(rows[i])
+            edge = min(word[0] for word in number)-.25*em if number else r
+            residual = ink((0,t-.65*em,edge,b+.65*em))
+            minimum = .65*em if number else (len(tag[0])+1)*em*.7
+            if residual and residual[2]-residual[0] > minimum:
                 found[i] = residual
             continue
-        if tag and low_math and not anchor:
-            found[i] = box
+        if tag and low_math and not anchor and not ordinary_text(text[:tag.start()]):
+            number = equation_number_words(rows[i])
+            found[i] = _union(rows[i][:-len(number)]) if number else box
             continue
         if anchor:
-            if any(j != i and q[2] < x and abs((q[1]+q[3]-t-b)/2) < .8*em
+            if any(j != i and (not row_cells or row_cells[j] == cell) and q[2] < x and abs((q[1]+q[3]-t-b)/2) < .8*em
                    and len(s.split()) >= 4 and not _MATH.search(s) for j,(s,q) in enumerate(lines)):
                 continue
             # OCR often returns the printed number as the only token in the formula band.
-            same = [q for j,(s,q) in enumerate(lines) if j != i and abs((q[1]+q[3]-t-b)/2) < .8*em
+            same = [q for j,(s,q) in enumerate(lines) if j != i and (not row_cells or row_cells[j] == cell)
+                    and abs((q[1]+q[3]-t-b)/2) < .8*em
                     and q[2] < x and (_MATH.search(s) or _EMPTY_MATH.fullmatch(s))]
-            band = (0,t-.8*em,x-.35*em,b+.8*em)
-            above = [q[3] for s,q in lines if q[3] <= t and len(s.split()) >= 4]
-            below = [q[1] for s,q in lines if q[1] >= b and len(s.split()) >= 4]
+            band = (0,t-1.45*em,x-.35*em,b+1.45*em)
+            above = [q[3] for s,q in lines if q[3] <= t and ordinary_text(s)]
+            below = [q[1] for s,q in lines if q[1] >= b and ordinary_text(s)]
             band = (band[0],max(band[1],max(above,default=0)),band[2],min(band[3],min(below,default=height)))
-            residual = _ink_box(image,size,band,em)
+            residual = ink(band)
             if residual:
                 found[i] = _union([residual,*same])
-        elif low_math:
-            found[i] = box
-        elif _FORMULA_INTRO.search(text) and i+1 < len(lines):
+        elif _FORMULA_INTRO.search(text) and i+1 < len(lines) and (not row_cells or row_cells[i+1] == cell):
             next_text, next_box = lines[i+1]
             if re.match(r'^\s*где\b',next_text,re.I) and 1.4*em < next_box[1]-b < 12*em:
-                residual = _ink_box(image,size,(0,b+.25*em,width,next_box[1]-.25*em),em)
+                residual = ink((0,b+.25*em,width,next_box[1]-.25*em))
                 if residual:
                     found[i] = residual
     return found
@@ -336,17 +461,13 @@ def _candidates(boxes, em, size):
 
 
 def _image_parts(page, entries, box, raster, size):
-    if __package__:
-        from .fast_image_assets import make_image_asset
-    else:
-        from fast_image_assets import make_image_asset
 
     if len(entries) == 1:
         return make_image_asset(page, entries[0], box)
     return ('image/png', _crop(page,raster,box,size), None, None)
 
 
-def _word_anchor(rows, lines, box, *, standalone=False):
+def _word_anchor(rows, lines, box, *, standalone=False, row_cells=()):
     if not rows:
         return None
     # Pick a line in the same column, then the word on the right of an inline picture.
@@ -356,7 +477,9 @@ def _word_anchor(rows, lines, box, *, standalone=False):
         dy = max(0,b[1]-cy,cy-b[3])
         dx = max(0,box[0]-b[2],b[0]-box[2])
         return (dy+dx*.35,abs((b[1]+b[3])/2-cy))
-    row = rows[min(range(len(rows)),key=distance)]
+    cx = (box[0]+box[2])/2
+    candidates = [i for i,cell in enumerate(row_cells) if cell and cell[0]<=cx<=cell[2] and cell[1]<=cy<=cell[3]]
+    row = rows[min(candidates or range(len(rows)),key=distance)]
     if standalone:
         if box[3] <= min(w[1] for w in row):
             return id(row[0]), False
@@ -412,11 +535,24 @@ def _cross_page(page_no, lines, rows, bound, size, context, anchors):
 
 
 def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, scores=None, stats=None,
-                  links=None, cancelled=None):
-    """Return source images anchored before/after existing words or OCR lines."""
+                  links=None, cancelled=None, formula_text=None, render_formulas=None, table_formula_boxes=(),
+                  formula_batches=None, formula_cells=None, horizontal_rules=()):
+    """Return graphic anchors and, when requested, replacements for formula tokens."""
     if not rows:
         return {}
     from pypdfium2 import PdfiumError
+    row_cells = []
+    cell_rows = {}
+    if formula_cells:
+        split = []
+        for row in rows:
+            for cell, group in groupby(row, key=lambda word: formula_cells.get(id(word))):
+                part = list(group)
+                split.append(part)
+                row_cells.append(cell)
+                cell_rows.setdefault(cell, []).append(part)
+        rows = split
+    table_formula_boxes = tuple(table_formula_boxes)
     lines = [(' '.join(w[4] for w in row), _union(row)) for row in rows]
     em = max(1,median(b[3]-b[1] for _,b in lines))
     size = page.get_size()
@@ -424,7 +560,7 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
     boxes = [b for b in objects if (b[2]-b[0])*(b[3]-b[1]) < .82*size[0]*size[1]]
     captions = {i for i,(s,b) in enumerate(lines) if _heading(s)}
     bound = _bind(lines,_candidates(boxes,em,size),em) if captions else {}
-    equations = _equations(rows,boxes,em,size[0]) if boxes else {}
+    equations = _equations(rows,boxes,em,size[0],row_cells) if boxes else {}
     check_math = any((i not in equations and (m := _EQUATION.search(s)) and _EMPTY_MATH.fullmatch(s[:m.start()]))
                      or (_FORMULA_INTRO.search(s) and i+1 < len(lines) and re.match(r'^где\b',lines[i+1][0],re.I))
                      for i,(s,b) in enumerate(lines))
@@ -432,7 +568,7 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
     working = None
     scan_background = len(boxes) != len(objects)
     fractions = []
-    if (captions-bound.keys() or check_math or scan_background) and raster is None:
+    if (captions-bound.keys() or check_math) and raster is None:
         bitmap = page.render(scale=min(1.6,1200/max(size)),grayscale=True)
         try:
             working = bitmap.to_pil().convert('L')
@@ -444,7 +580,7 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
             for i,b in _bind(lines,_raster_bodies(probe,size,lines,em),em).items():
                 bound.setdefault(i,b)
         if probe is not None and (raster is not None or check_math):
-            equations.update(_raster_math(probe,size,rows,scores,em,equations.keys() | bound.keys()))
+            equations.update(_raster_math(probe,size,rows,scores,em,equations.keys() | bound.keys(),row_cells))
         if probe is not None and (raster is not None or scan_background):
             fractions = _unread_fractions(probe, size, rows, em, [*boxes, *bound.values(), *equations.values()])
     finally:
@@ -456,15 +592,87 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
         form = _heading(lines[i][0])[0] == 'form'
         word = rows[i][-1] if form else rows[i][0]
         marked.append((b,_figure_name(lines[i][0]),(id(word),form)))
+    formula_regions = []
     for i,b in equations.items():
         tag = _EQUATION.search(lines[i][0])
         if any(_inside(b,outer) for outer,_,_ in marked):
             continue
-        word = next((w for w in rows[i] if w[0]>=b[2]),rows[i][0])
-        marked.append((b,'Формула'+(' '+tag[0] if tag else ''),(id(word),False)))
-    marked.extend((box, 'Формула', _word_anchor(rows, lines, box, standalone=True)) for box in fractions)
-    owners = [b for b,_,_ in marked]
+        number = equation_number_words(rows[i])
+        word = number[0] if number else next((w for w in rows[i] if w[0]>=b[2]),rows[i][0])
+        number_ids = set(map(id, number))
+        owned = tuple(w for row in rows for w in row
+                      if id(w) not in number_ids and coverage(w, b) >= .80 and not ordinary_text(w[4])
+                      and not _EQUATION.fullmatch(w[4]))
+        label = 'Формула' + (' ' + tag[0] if tag and not number else '')
+        formula_regions.append((b, owned, True, label, (id(word),False)))
+    for box in fractions:
+        formula_regions.append((box, (), True, 'Формула', _word_anchor(rows,lines,box,standalone=True,row_cells=row_cells)))
+    for box, words, display in vector_fractions(rows, horizontal_rules, em, formula_cells or {}):
+        if any(_inside(box, outer) for outer, _, _ in marked):
+            continue
+        for i, (other, owned, old_display, label, anchor) in enumerate(formula_regions):
+            if coverage(box, other) > .50 or coverage(other, box) > .65:
+                combined = tuple({id(word): word for word in (*words, *owned)}.values())
+                formula_regions[i] = (_union((other, box)), combined, old_display, label, anchor)
+                break
+        else:
+            formula_regions.append((box, words, display, 'Формула', None))
+    occupied = [*(b for b,_,_ in marked), *(entry[0] for entry in formula_regions)]
+    if formula_text is not None:
+        for box, words, display in text_regions(rows, bound.keys() | captions, occupied=occupied):
+            if raster is not None:
+                scope = cell_rows[formula_cells.get(id(words[0]))] if formula_cells else rows
+                extended, pieces = attach_fraction_terms(box, words, scope, raster, size, em)
+                if not any(coverage(extended, existing) > .45 for existing in occupied):
+                    box, words = extended, pieces
+            # A formula can be split across RapidOCR lines. A crop already
+            # measured around its number takes priority over partial repeats.
+            if any(coverage(box, existing) > .45 or coverage(existing, box) > .75 for existing in occupied):
+                continue
+            formula_regions.append((box, words, display, 'Формула', None))
+            occupied.append(box)
+
     anchors = {}
+    formula_regions.sort(key=lambda entry: (entry[0][1], entry[0][0]))
+    ready = []
+    claimed = set()
+    formula_owners = []
+
+    def place(crop, words, anchor, markup):
+        if words and formula_text is not None:
+            for index, word in enumerate(words):
+                formula_text[id(word)] = markup if index == 0 else ''
+        else:
+            anchor = anchor or _word_anchor(rows, lines, crop.bbox, standalone=crop.display,row_cells=row_cells)
+            if anchor is not None:
+                anchors.setdefault(anchor, []).append((crop.bbox, markup))
+        formula_owners.append(crop.bbox)
+
+    for box, words, display, label, anchor in formula_regions:
+        if cancelled:
+            cancelled()
+        if any(id(word) in claimed for word in words):
+            continue
+        try:
+            png = _crop(page, raster, box, size)
+        except (PdfiumError, ValueError, OSError):
+            continue
+        claimed.update(map(id, words))
+        text = ' '.join(word[4] for word in words)
+        crop = FormulaCrop(page_no, box, text, display, png)
+        if formula_batches is not None:
+            place(crop, words, anchor, formula_batches.place(crop, label))
+        else:
+            ready.append((crop, words, label, anchor))
+    rendered = render_formulas([entry[0] for entry in ready]) if ready and render_formulas else [None]*len(ready)
+    if rendered is None or len(rendered) != len(ready):
+        rendered = [None]*len(ready)
+    for (crop, words, label, anchor), markup in zip(ready, rendered, strict=True):
+        result, kind = _rendered_formula(image_assets, markup, crop, label, table_formula_boxes)
+        if stats is not None:
+            stats[kind] = stats.get(kind, 0) + 1
+        place(crop, words, anchor, result)
+    owners = [*(b for b,_,_ in marked), *formula_owners]
     bottom = [b for b in boxes if b[3] > .72*size[1] and b[3]-b[1] > .12*size[1]
               and b[2]-b[0] > .19*size[0] and len(objects[b])==1 and not any(_inside(b,area) for area in owners)]
     for box, label, anchor in [*marked,*((b,'Изображение',None) for b in sorted(boxes,key=lambda b:(b[1],b[0]))
@@ -472,7 +680,7 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
         if cancelled:
             cancelled()
         entries = objects.get(box, ())
-        pieces = [b for b in boxes if _inside(b,box)] if len(entries) != 1 and raster is None else []
+        pieces = [b for b in boxes if _inside(b,box)] if len(entries) != 1 else []
         # The composite carries the original geometry. Source components remain
         # downloadable without inserting a second copy of the visible formula.
         originals = []
@@ -497,12 +705,12 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
         if stats is not None and len(entries) == 1 and parts[0] == 'image/png' and parts[3] is None:
             stats['image_original_unavailable'] = stats.get('image_original_unavailable',0)+1
         html = _markup(image_assets,parts,label,box,page_no,originals)
-        if links is not None and not raster and label == 'Изображение' and bottom == [box]:
+        if links is not None and label == 'Изображение' and bottom == [box]:
             graphic_id = f'fast-edge-figure-{page_no}'
             html = html.replace('alt="Изображение"', f'alt="Изображение" id="{graphic_id}"', 1)
             links['next'] = dict(page=page_no,graphic_id=graphic_id,span=(box[0]/size[0],box[2]/size[0]),
                                  edges=_edge_lines(lines,size[1]),following=[s for s,b in lines if b[1]>=box[3]])
-        anchor = anchor or _word_anchor(rows,lines,box)
+        anchor = anchor or _word_anchor(rows,lines,box,row_cells=row_cells)
         if anchor is not None:
             anchors.setdefault(anchor,[]).append((box,html))
     result = {k:''.join(s for b,s in sorted(items,key=lambda item:(item[0][1],item[0][0]))) for k,items in anchors.items()}

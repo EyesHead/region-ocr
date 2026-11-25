@@ -12,7 +12,8 @@ surya-ocr==0.24.0
 torch==2.8.0
 torchvision==0.23.0
 
-# PDF rendering and coordinate-based table recovery.
+# PDF text layers, rendering and coordinate-based table recovery.
+PyMuPDF==1.28.2
 pypdfium2==5.10.1
 pdfplumber==0.11.4
 

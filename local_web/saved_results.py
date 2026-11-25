@@ -20,12 +20,12 @@ import uuid
 if __package__:
     from . import formula_preview
     from .file_paths import native_path, normal_path
-    from .fast_resources import FAST_PATH, served_asset_name
+    from .fast_resources import FAST_PATH, formula_crop_paths, served_asset_name
     from .upload_storage import UploadReservations
 else:
     import formula_preview
     from file_paths import native_path, normal_path
-    from fast_resources import FAST_PATH, served_asset_name
+    from fast_resources import FAST_PATH, formula_crop_paths, served_asset_name
     from upload_storage import UploadReservations
 
 
@@ -406,6 +406,7 @@ class SavedResults:
                     raise ValueError('Некорректный манифест изображений старого результата')
                 assets[path] = digest
             required = {str(image.get('src', '')) for image in soup.find_all('img')}
+            required.update(formula_crop_paths(soup))
             for image in soup.find_all('img'):
                 required.update(path for path in (image.get('data-original-src', ''), *image.get('data-original-srcs', '').split())
                                 if FAST_PATH.fullmatch(path))

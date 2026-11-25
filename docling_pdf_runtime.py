@@ -7,6 +7,11 @@ from pathlib import Path
 from uuid import uuid4
 
 
+PDF_OCR_DPI = 200
+PDF_OCR_SCALE = PDF_OCR_DPI / 72
+FAST_OCR_MAX_SIDE = 3400  # A3 at 200 DPI fits within this limit.
+
+
 def file_hash(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()

@@ -45,8 +45,15 @@ from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
 
 from portable_runtime import configure_runtime
+from docling_pdf_orientation import (
+    ORIENTATION_CONFIDENCE, ORIENTATION_MODEL_REVISION, ORIENTATION_MODEL_SHA256, PageOrientationClassifier,
+)
+from docling_backend_health import (bound_surya_backend, generate_local_ocr_requests, local_request_seconds,
+                                    LOCAL_REQUEST_SECONDS)
+from docling_pdf_deskew import source_bbox
+from docling_pdf_runtime import PDF_OCR_DPI, PDF_OCR_SCALE
 from docling_surya_profile import (
-    SURYA25_VERSION, configure_surya25_backend, configure_surya25_model,
+    SURYA_BACKEND, configure_local_surya, resolve_device, runtime_directory,
 )
 configure_runtime()
 
@@ -124,10 +131,7 @@ PRIMARY_NOTE_MAX_ADJACENT_PARAGRAPHS = 20  # Bound a direct sibling run; never s
 PRIMARY_NOTE_BBOX_MARGIN_EM = .50  # Source font evidence bounds table-edge uncertainty.
 # END table_notes constants
 
-ORIENTATION_SCHEMA = 4
-ORIENTATION_CONFIDENCE = .90
-ORIENTATION_MODEL_REVISION = "7330ab7039123e46af2dc03154b9969aa412c61d"
-ORIENTATION_MODEL_SHA256 = "af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92"
+ORIENTATION_SCHEMA = 5
 BLANK_PAGE_HTML = '<div data-docling-blank="true"></div>'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR
@@ -135,12 +139,10 @@ DATA_DIR = SCRIPT_DIR
 if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-SURYA_INSTALL = 'python -m pip install -r requirements-docling-surya.txt'
 
 
-IMAGE_SCALE = 4.2
+IMAGE_SCALE = PDF_OCR_SCALE
 RETAINED_IMAGE_SCALE = 1.5
-LOCAL_REQUEST_SECONDS = 90.0
 API_IMAGE_SCALE = 2.2
 API_MODEL = "gpt-6-luna"
 API_URL = "https://api.openai.com/v1/chat/completions"
@@ -150,7 +152,6 @@ API_RETRIES = 4
 BLANK_INK_THRESHOLD = 0.00001
 NUM_THREADS = min(8, os.cpu_count() or 1)
 OCR_BATCH_SIZE = 1
-SURYA_BACKEND = "llamacpp"  # Native CUDA / Metal / CPU; no Docker setup required.
 
 _DIAGNOSTICS = None
 _PRIMARY_OCR_ONLY = ContextVar('docling_primary_ocr_only', default=False)
@@ -421,7 +422,7 @@ def diagnostic_startup():
             diagnostic_event('LOADED_CODE',function=name,sha256=digest,line=code.co_firstlineno)
     diagnostic_event('LOADED_MODULE',fingerprint=hashlib.sha256('\n'.join(loaded).encode()).hexdigest())
     for name in ('docling_office.py', 'docling_office_math.py', 'docling_layout.py', 'docling_symbol_evidence.py',
-                 'docling_table_content.py', 'docling_pdf_repairs.py'):
+                 'docling_table_content.py', 'docling_pdf_repairs.py', 'docling_pdf_balanced_math.py'):
         diagnostic_file(SCRIPT_DIR/name, 'converter_module')
     diagnostic_event('LOCAL_RUNTIME', binary=os.environ.get('LLAMA_CPP_BINARY'),
                      backend=SURYA_BACKEND, device=os.environ.get('TORCH_DEVICE'))
@@ -887,139 +888,8 @@ def memory_snapshot(device):
     return "; ".join(details) if details else "memory stats unavailable"
 
 
-def resolve_device():
-    """Automatically select the local accelerator usable by Docling."""
-    import torch
-
-    if torch.cuda.is_available():
-        return "cuda"
-    if (platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
-            and torch.backends.mps.is_available()):
-        return "mps"
-    return "cpu"
-
-
 def configure_surya(args):
-    """Set Surya settings BEFORE plugin discovery imports surya.settings."""
-    for package, expected in (('docling-surya-ocr', '0.2.0'), ('surya-ocr', SURYA25_VERSION)):
-        try:
-            installed = version(package)
-        except PackageNotFoundError:
-            installed = None
-        if installed != expected:
-            raise ValueError(f"Requires {package}=={expected} (installed: {installed}). {SURYA_INSTALL}")
-    configure_surya25_model(SCRIPT_DIR)
-    os.environ["TORCH_DEVICE"] = args.device
-    os.environ["SURYA_INFERENCE_BACKEND"] = SURYA_BACKEND
-    os.environ["SURYA_INFERENCE_PARALLEL"] = str(OCR_BATCH_SIZE)
-    os.environ["SURYA_INFERENCE_KEEP_ALIVE"] = "false"
-    os.environ["SURYA_INFERENCE_STARTUP_TIMEOUT"] = "600"
-    # httpx also reads the Windows system proxy. Loopback must reach the local
-    # server directly, even when the computer uses a VPN/proxy for the internet.
-    bypass = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
-    os.environ["NO_PROXY"] = ",".join(filter(None, (bypass, "localhost", "127.0.0.1", "::1")))
-    name = "llama-server.exe" if os.name == "nt" else "llama-server"
-    candidates = [SCRIPT_DIR / ".runtime" / "llamacpp" / name]
-    cached = runtime_directory(args.device)
-    candidates.extend(cached.rglob(name) if cached.is_dir() else ())
-    on_path = shutil.which(name)
-    if on_path:
-        candidates.append(Path(on_path))
-    # CUDA release archives can also use CUDA 12 DLLs shipped with PyTorch.
-    if os.name == "nt":
-        import torch
-        torch_lib = str(Path(torch.__file__).parent / "lib")
-        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
-    def usable(candidate):
-        try:
-            # On Windows the device probe can exit successfully with both
-            # pipes empty. Retry that inconclusive result before discovery.
-            for flags in ([], ["--log-verbosity", "5"]):
-                probe = subprocess.run([str(candidate), *flags, "--list-devices"], capture_output=True,
-                                       text=True, encoding="utf-8", errors="replace", timeout=30,
-                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                devices = probe.stdout + probe.stderr
-                if os.name != "nt" or probe.returncode or devices.strip() or args.device == "cpu":
-                    break
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return probe.returncode == 0 and (
-            args.device == "cpu"
-            or args.device == "cuda" and bool(re.search(
-                r"CUDA\d*:|ggml_cuda_init:\s+found [1-9]\d* CUDA devices?\b", devices, re.I))
-            or args.device == "mps" and "metal" in devices.lower()
-        )
-
-    binary = next((str(path) for path in candidates if path.is_file() and usable(path)), None)
-    if binary is None:
-        binary = offer_llama_install(args.device)
-        if not usable(binary):
-            raise ValueError("Установленная сборка llama.cpp не запускается на этой системе")
-    os.environ["LLAMA_CPP_BINARY"] = str(binary)
-    os.environ["LLAMA_CPP_NGL"] = "0" if args.device == "cpu" else "99"
-    os.environ["LLAMA_CPP_NO_MMPROJ_OFFLOAD"] = "true" if args.device == "cpu" else "false"
-    # Keep the vision encoder and KV cache within a laptop's memory budget.
-    os.environ["LLAMA_CPP_EXTRA_ARGS"] = f"--threads {NUM_THREADS}"
-    configure_surya25_backend()
-    print(f"Surya 2.5 runtime: {binary}; device: {args.device}", flush=True)
-    if os.name == "nt":
-        from surya.inference.backends import spawn
-
-        def stop_windows_server(pid, name):
-            # POSIX os.kill(pid, 0) polling is not a safe liveness check on
-            # Windows. Surya's atexit owner still decides
-            # which server may be stopped; only the stop primitive differs.
-            # taskkill can hang while waiting for a process tree to exit. Do
-            # not let that escape Surya's atexit callback; terminate the known
-            # server PID directly as a fallback, then report any cleanup issue.
-            try:
-                result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                                        capture_output=True, text=True, encoding="utf-8",
-                                        errors="replace", timeout=15,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-                if result.returncode == 0:
-                    return
-                taskkill_error = f"exit code {result.returncode}: {result.stderr.strip()}"
-            except Exception as exc:
-                taskkill_error = exc
-
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                open_process = kernel32.OpenProcess
-                open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-                open_process.restype = wintypes.HANDLE
-                terminate_process = kernel32.TerminateProcess
-                terminate_process.argtypes = (wintypes.HANDLE, wintypes.UINT)
-                terminate_process.restype = wintypes.BOOL
-                close_handle = kernel32.CloseHandle
-                close_handle.argtypes = (wintypes.HANDLE,)
-                close_handle.restype = wintypes.BOOL
-
-                handle = open_process(0x0001, False, int(pid))  # PROCESS_TERMINATE
-                if not handle:  # taskkill may have finished just before timing out
-                    return
-                try:
-                    if not terminate_process(handle, 1):
-                        raise ctypes.WinError(ctypes.get_last_error())
-                finally:
-                    close_handle(handle)
-            except Exception as exc:
-                print(f"WARNING: Could not stop {name} (pid {pid}); taskkill failed ({taskkill_error}), "
-                      f"and direct termination failed ({exc})", file=sys.stderr)
-
-        spawn._stop_process = stop_windows_server
-
-    from docling_backend_health import guard_managed_process_cleanup
-    from surya.inference.backends import spawn
-    guard_managed_process_cleanup(spawn)
-
-
-def runtime_directory(device):
-    from platformdirs import user_data_path
-    return user_data_path("docling-surya", appauthor=False) / f"llamacpp-{device}"
+    configure_local_surya(args.device, root=SCRIPT_DIR, num_threads=NUM_THREADS, install_missing=offer_llama_install)
 
 
 def offer_llama_install(device):
@@ -1103,103 +973,6 @@ def install_llama(device, destination):
         binary.chmod(binary.stat().st_mode | 0o111)
     print(f"Installed llama.cpp: {binary}", flush=True)
     return str(binary)
-
-
-class PageOrientationClassifier:
-    """Official PP-LCNet four-angle model using the existing CPU ONNX runtime.
-
-    Preprocessing follows the pinned model's inference.yml: RGB, short side
-    256, center crop 224, ImageNet normalization, NCHW. No Paddle dependency.
-    https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx
-    """
-
-    @staticmethod
-    def model_path():
-        from platformdirs import user_cache_path
-        from urllib.request import Request, urlopen
-
-        bundled = SCRIPT_DIR / 'models' / 'orientation' / 'PP-LCNet_x1_0_doc_ori.onnx'
-        path = bundled if bundled.is_file() else user_cache_path("docling-surya", appauthor=False) / "orientation" / "PP-LCNet_x1_0_doc_ori.onnx"
-        if path.is_file():
-            with path.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() == ORIENTATION_MODEL_SHA256:
-                    return path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-        url = ("https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx/resolve/"
-               f"{ORIENTATION_MODEL_REVISION}/inference.onnx")
-        print("Downloading page orientation model PP-LCNet (6.8 MB)...", flush=True)
-        deadline, size, digest = time.monotonic() + 30, 0, hashlib.sha256()
-        try:
-            request = Request(url, headers={"User-Agent": "convert-docling-orientation"})
-            with urlopen(request, timeout=10) as response, temporary.open("wb") as output:
-                while chunk := response.read(256 * 1024):
-                    size += len(chunk)
-                    if size > 8 * 1024**2 or time.monotonic() > deadline:
-                        raise RuntimeError("Page orientation model download exceeded its time/size limit")
-                    digest.update(chunk)
-                    output.write(chunk)
-            if digest.hexdigest() != ORIENTATION_MODEL_SHA256:
-                raise RuntimeError("Page orientation model checksum mismatch")
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return path
-
-    def __init__(self):
-        import onnxruntime as ort
-
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = min(2, NUM_THREADS)
-        options.inter_op_num_threads = 1
-        options.log_severity_level = 3
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # Reserve the GPU for the document models; this 7 MB classifier is
-        # inexpensive on CPU and works with the same backend on every platform.
-        self.session = ort.InferenceSession(str(self.model_path()), sess_options=options,
-                                            providers=["CPUExecutionProvider"])
-        inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
-        if len(inputs) != 1 or inputs[0].shape[1:] != [3, 224, 224] or outputs[0].shape[-1] != 4:
-            raise RuntimeError("Unexpected page orientation model input/output shape")
-        self.input_name = inputs[0].name
-        self.output_name = outputs[0].name
-
-    def predict(self, image):
-        import cv2
-        import numpy as np
-
-        array = np.asarray(image.convert("RGB"))
-        height, width = array.shape[:2]
-        # A very long receipt/PDF must not allocate an enormous resized strip.
-        # Only its center reaches the official 224px crop in either case.
-        if height > width * 4:
-            top = (height - width * 4) // 2
-            array = array[top:top + width * 4]
-        elif width > height * 4:
-            left = (width - height * 4) // 2
-            array = array[:, left:left + height * 4]
-        height, width = array.shape[:2]
-        scale = 256 / min(height, width)
-        array = cv2.resize(array, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_LINEAR)
-        height, width = array.shape[:2]
-        top, left = (height - 224) // 2, (width - 224) // 2
-        array = array[top:top + 224, left:left + 224].astype(np.float32)
-        array *= np.float32(1 / 255)
-        array -= np.array([.485, .456, .406], dtype=np.float32)
-        array /= np.array([.229, .224, .225], dtype=np.float32)
-        batch = np.ascontiguousarray(array.transpose(2, 0, 1)[None])
-        scores = np.asarray(self.session.run([self.output_name], {self.input_name: batch})[0])
-        # The pinned ONNX graph already contains softmax; applying it again
-        # would destroy the confidence threshold.
-        if (scores.shape != (1, 4) or not np.isfinite(scores).all()
-                or np.any(scores < 0) or np.any(scores > 1) or abs(float(scores.sum()) - 1) > .001):
-            raise RuntimeError("Invalid page orientation probabilities")
-        index = int(scores[0].argmax())
-        label = (0, 90, 180, 270)[index]
-        # Paddle corrects this label counterclockwise. PDF /Rotate is clockwise.
-        return (-label) % 360, {"classification_label": label, "confidence": round(float(scores[0, index]), 6),
-                               "probabilities": {str(angle): round(float(score), 6)
-                                                 for angle, score in zip((0, 90, 180, 270), scores[0])}}
 
 
 class DetailedOrientationDetector:
@@ -1325,30 +1098,14 @@ def get_orientation_detector(args):
     return args.orientation_detector
 
 
-def source_bbox(bbox, page_info):
-    """Map normalized display coordinates back to the source display page."""
-    left, top, right, bottom = bbox
-    width, height = page_info["original_size"]
-    rotation = page_info["clockwise"]
-    points = []
-    for x, y in ((left, top), (right, top), (right, bottom), (left, bottom)):
-        if rotation == 90:
-            x, y = y, height - x
-        elif rotation == 180:
-            x, y = width - x, height - y
-        elif rotation == 270:
-            x, y = width - y, x
-        points.append((x, y))
-    return [min(p[0] for p in points), min(p[1] for p in points),
-            max(p[0] for p in points), max(p[1] for p in points)]
-
-
 @contextmanager
 def normalized_pdf(source, args):
-    """Rotate entire pages in a temporary PDF, preserving their original contents."""
+    """Correct the selected pages before running layout, text extraction, and OCR."""
     import pypdfium2 as pdfium
+    from docling_pdf_deskew import DESKEW_STAGE, PageDeskew, estimate_skew
 
     started = time.monotonic()
+    print(DESKEW_STAGE, flush=True)
     with source.open("rb") as stream:
         source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     args.current_source_hash = source_hash
@@ -1356,6 +1113,7 @@ def normalized_pdf(source, args):
     info = {}
     pdf = pdfium.PdfDocument(str(source))
     try:
+        deskew = PageDeskew(source, len(pdf))
         first, last = args.page_range or (1, len(pdf))
         changed = False
         for index in range(max(first - 1, 0), min(last, len(pdf))):
@@ -1368,21 +1126,28 @@ def normalized_pdf(source, args):
                     image = bitmap.to_pil().convert("RGB")
                 finally:
                     bitmap.close()
-                if detector is None:
-                    detector = get_orientation_detector(args)
-                clockwise, evidence = detector.detect(image)
+                with image:
+                    angle = estimate_skew(image)
+                    if detector is None:
+                        detector = get_orientation_detector(args)
+                    clockwise, evidence = detector.detect(image)
+                    ink_fraction = sum(image.convert("L").histogram()[:220]) / (image.width * image.height)
                 if clockwise not in (0, 90, 270):
                     raise RuntimeError(f'Unsupported page orientation: {clockwise}; only quarter turns are allowed')
+                rotation = page.get_rotation()
+                angle = deskew.apply(page, index, angle)
+                aligned_width, aligned_height = page.get_size()
                 info[index + 1] = {"original_size": [width, height], "clockwise": clockwise,
-                                   "pdf_rotation": page.get_rotation(), "evidence": evidence,
-                                   "ink_fraction": sum(image.convert("L").histogram()[:220]) / (image.width * image.height)}
+                                   "deskewed_size": [aligned_width, aligned_height], "deskew_degrees": angle,
+                                   "pdf_rotation": rotation, "evidence": evidence, "ink_fraction": ink_fraction}
                 if clockwise:
-                    page.set_rotation((page.get_rotation() + clockwise) % 360)
+                    page.set_rotation((rotation + clockwise) % 360)
+                if angle or clockwise:
                     changed = True
                 evidence = info[index + 1]["evidence"]
                 backend = evidence.get("backend", "rapidocr")
                 confidence = evidence.get("confidence", (evidence.get("fast_prediction") or {}).get("confidence"))
-                print(f"Orientation: page {index + 1}; clockwise {clockwise} degrees; {backend}"
+                print(f"Orientation: page {index + 1}; clockwise {clockwise} degrees; deskew {angle:+.2f} degrees; {backend}"
                       + (f"; confidence {confidence:.3f}" if confidence is not None else "")
                       , flush=True)
             finally:
@@ -1639,7 +1404,7 @@ class PdfRegions:
             page.close()
 
     def table_geometry(self, page_no, region):
-        """Cheap fallback for scanned rules; cache one deskewed preview per page."""
+        """Reuse the aligned page preview to find scanned table rules."""
         if self.cached_page != page_no:
             image = self.crop(page_no)
             image.close()
@@ -1671,7 +1436,6 @@ class RasterTableRules:
     def __init__(self, image, pdf_scale):
         import cv2
         import numpy as np
-        from statistics import median
 
         ratio = min(1.0, 1400 / max(image.size))
         gray = np.asarray(image.convert("L"))
@@ -1679,18 +1443,6 @@ class RasterTableRules:
             gray = cv2.resize(gray, None, fx=ratio, fy=ratio, interpolation=cv2.INTER_AREA)
         self.scale = pdf_scale * ratio
         mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-        lines = cv2.HoughLinesP(mask, 1, np.pi / 720, threshold=50,
-                                minLineLength=max(60, gray.shape[1] // 5), maxLineGap=8)
-        angles = []
-        if lines is not None:
-            for x0, y0, x1, y1 in lines[:, 0]:
-                angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
-                if abs(angle) <= 4:
-                    angles.append(angle)
-        self.angle = median(angles) if angles else 0.0
-        self.matrix = cv2.getRotationMatrix2D((gray.shape[1] / 2, gray.shape[0] / 2), self.angle, 1)
-        self.inverse = cv2.invertAffineTransform(self.matrix)
-        mask = cv2.warpAffine(mask, self.matrix, (gray.shape[1], gray.shape[0]), flags=cv2.INTER_NEAREST)
         # Close only short scan gaps. Longer gaps between a table and following
         # prose (or another table) are never bridged by these kernels.
         vertical = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 1), np.uint8))
@@ -1706,20 +1458,12 @@ class RasterTableRules:
         self.preview_shape = gray.shape
         grid = cv2.dilate(cv2.bitwise_or(vertical, horizontal), np.ones((3, 3), np.uint8))
         self.grid_components = components(grid)
-        diagnostic_event('RASTER_RULES',scale=self.scale,skew_degrees=self.angle,preview_shape=self.preview_shape,
+        diagnostic_event('RASTER_RULES',scale=self.scale,preview_shape=self.preview_shape,
                          vertical_components=len(self.vertical),horizontal_components=len(self.horizontal),
                          grid_components=len(self.grid_components))
 
-    def transform(self, x, y, inverse=False):
-        matrix = self.inverse if inverse else self.matrix
-        return (float(matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2]),
-                float(matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2]))
-
     def table(self, region):
-        points = [self.transform(x * self.scale, y * self.scale)
-                  for x in (region[0], region[2]) for y in (region[1], region[3])]
-        left, right = min(x for x, _ in points), max(x for x, _ in points)
-        top, bottom = min(y for _, y in points), max(y for _, y in points)
+        left, top, right, bottom = (value * self.scale for value in region)
         width, height = right - left, bottom - top
         if width <= 0 or height <= 0:
             diagnostic_event('RASTER_GRID_REJECT',bbox=region,reason='invalid_region',width=width,height=height)
@@ -1776,9 +1520,7 @@ class RasterTableRules:
             return None
         # Continuous side rails define the open page edge. They end before
         # the following prose, even if the final horizontal rule was omitted.
-        corners = [self.transform(x, y, inverse=True) for x in (a[0], b[0]) for y in (rule_top, rule_bottom)]
-        bounds = [min(x for x, _ in corners) / self.scale, min(y for _, y in corners) / self.scale,
-                  max(x for x, _ in corners) / self.scale, max(y for _, y in corners) / self.scale]
+        bounds = [a[0] / self.scale, rule_top / self.scale, b[0] / self.scale, rule_bottom / self.scale]
         xs = sorted({x for x, y0, y1 in rails if a[0] - 3 <= x <= b[0] + 3
                      and min(y1, rule_bottom) - max(y0, rule_top) >= (rule_bottom - rule_top) * .6}
                     | {x for x,y0,y1 in attached_rails if a[0]+3<x<b[0]-3
@@ -1793,11 +1535,9 @@ class RasterTableRules:
         if len(groups) < 3:
             diagnostic_event('RASTER_GRID_REJECT',bbox=region,reason='fewer_than_two_columns',boundary_groups=len(groups))
             return None
-        grid = [self.transform(sum(group) / len(group), (rule_top + rule_bottom) / 2, inverse=True)[0] / self.scale
-                for group in groups]
+        grid = [sum(group) / len(group) / self.scale for group in groups]
         diagnostic_event('RASTER_GRID_ACCEPT',region=region,bbox=bounds,x_grid=grid,horizontal=len(horizontal),rails=len(rails))
         return {"basis": "raster_parallel_rules", "bbox": bounds, "x_grid": grid,
-                "skew_degrees": round(self.angle, 3),
                 "open_top": not any(abs(y - rule_top) <= 4 for y, _, _ in horizontal),
                 "open_bottom": not any(abs(y - rule_bottom) <= 4 for y, _, _ in horizontal)}
 
@@ -1808,9 +1548,8 @@ class RasterTableRules:
         for x,y,w,h in self.grid_components:
             if w < width*.25 or h < height*.05:
                 continue
-            corners = [self.transform(xx,yy,inverse=True) for xx in (x-2,x+w+2) for yy in (y-2,y+h+2)]
-            region = [max(0,min(a for a,b in corners)/self.scale),max(0,min(b for a,b in corners)/self.scale),
-                      max(a for a,b in corners)/self.scale,max(b for a,b in corners)/self.scale]
+            region = [max(0, x-2) / self.scale, max(0, y-2) / self.scale,
+                      (x+w+2) / self.scale, (y+h+2) / self.scale]
             geometry = self.table(region)
             if geometry and not any(overlap_ratio(geometry['bbox'],old['bbox'])>.9 for old in found):
                 found.append(geometry)
@@ -2144,82 +1883,19 @@ def recover_table_captions(doc, excluded, manifest):
     manifest["recovered_table_captions"] = recovered
 
 
-def local_request_seconds(items):
-    """Allow the declared output to finish before Surya can validate/fallback."""
-    tokens=max((item.max_tokens or 2048 for item in items),default=2048)
-    return max(LOCAL_REQUEST_SECONDS, math.ceil(tokens/80)+15)
-
-
-def generate_local_ocr_requests(batch, request, diagnostic):
-    """Keep Surya's full-page -> layout/block recovery instead of repeating loops."""
-    from docling_pdf_ocr import recovering_generate
-    from surya.inference.prompts import LAYOUT_JSON_SCHEMA
-    outputs=[]
-    for item in batch:
-        if item.prompt_type == 'high_accuracy_bbox':
-            result=request([item])
-            if len(result)!=1:
-                raise RuntimeError('Local full-page inference result count mismatch')
-            if result[0].error:
-                diagnostic('OCR_FULL_PAGE_LAYOUT_FALLBACK',reason='full_page_request_failed',
-                           metadata=item.metadata,image_size=list(item.image.size))
-            # RecognitionPredictor validates repetition and HTML, then uses its
-            # trained layout + block path. Do not retry the identical greedy
-            # full-page request or recursively repeat it on smaller pages.
-            outputs.extend(result)
-        elif item.metadata.get('purpose') == 'layout_graphic_caption':
-            # An unreadable optional caption leaves the regular OCR route in place.
-            outputs.extend(request([item]))
-        elif item.metadata.get('purpose') == 'vector_source_counterread':
-            # This checks an already positioned literal source. The caller
-            # retains that source with REVIEW if the check cannot finish;
-            # repeating the same failed decode adds no source evidence.
-            result = request([item])
-            if len(result) != 1:
-                raise RuntimeError('Vector source counterread result count mismatch')
-            outputs.extend(result)
-        else:
-            if item.prompt_type == 'layout' and item.guided_json is None:
-                item=replace(item,guided_json=LAYOUT_JSON_SCHEMA)
-            outputs.extend(recovering_generate([item],request,diagnostic))
-    return outputs
-
-
 def local_surya_backend(model):
     """Bound local VLM requests, including retries hidden inside Surya's adapter."""
-    from docling_backend_health import request_local_ocr
+    return bound_local_surya_backend(model._get_runtime()._manager.backend)
 
-    backend = model._get_runtime()._manager.backend
-    if not getattr(backend, "_convert_docling_bounded", False):
-        def generate(batch):
-            if backend.handle is None or backend._client is None:
-                backend.start()
-            def request(items):
-                timeout=local_request_seconds(items)
-                if timeout>LOCAL_REQUEST_SECONDS:
-                    diagnostic_event('OCR_REQUEST_TOKEN_TIME_ALLOWANCE',seconds=timeout,
-                        max_tokens=max(item.max_tokens or 2048 for item in items))
-                outputs = request_local_ocr(backend, items, timeout, diagnostic_event)
-                from surya.recognition import _detect_repeat_loop
-                for item, output in zip(items, outputs):
-                    at_limit = (getattr(output, 'finish_reason', None) == 'length'
-                                or item.max_tokens and output.token_count >= item.max_tokens)
-                    reason = ('repeating_output' if _detect_repeat_loop(output.raw)
-                              else 'output_token_limit' if at_limit else None)
-                    if reason:
-                        output.error = True
-                        diagnostic_event('OCR_RESPONSE_REQUIRES_RECOVERY', reason=reason,
-                            prompt_type=item.prompt_type, tokens=output.token_count,
-                            max_tokens=item.max_tokens, metadata=item.metadata)
-                    elif item.prompt_type == 'block' and not output.error and output.raw:
-                        # Some PDF crop readers consume raw block HTML without a predictor.
-                        from surya.inference.parsers import clean_block_html
-                        output.raw = clean_block_html(output.raw)
-                return outputs
-            return generate_local_ocr_requests(batch, request, diagnostic_event)
-        backend.generate = generate
-        backend._convert_docling_bounded = True
-    return backend
+
+def bound_local_surya_backend(backend):
+    return bound_surya_backend(backend, diagnostic_event)
+
+
+def create_balanced_formula_reader(manager_provider=None):
+    from docling_pdf_balanced_math import local_formula_reader
+
+    return local_formula_reader(manager_provider, diagnostic=diagnostic_event, install_missing=offer_llama_install)
 
 
 def surya_pdf_pipeline(args):
@@ -2261,6 +1937,24 @@ def surya_pdf_pipeline(args):
             run_pages = model._run_docling_pages
             args.surya_ocr_model = model
 
+            def record_prediction(work_item, prediction, page_no):
+                rect = work_item.rect
+                blocks = []
+                for block in prediction.blocks:
+                    args.surya_records.append({
+                        "page_no": page_no,
+                        "bbox": [block.bbox[0] / model.scale + rect.l,
+                                 block.bbox[1] / model.scale + rect.t,
+                                 block.bbox[2] / model.scale + rect.l,
+                                 block.bbox[3] / model.scale + rect.t],
+                        "html": block.html or "", "text": block.text,
+                        "label": block.label, "confidence": block.confidence,
+                    })
+                    if block.html and "<math" in block.html:
+                        block = replace(block, text=semantic_ocr_text(block.html))
+                    blocks.append(block)
+                return replace(prediction, blocks=tuple(blocks))
+
             def capture_pages(conv_res, pages):
                 model._quality_pages = pages
                 try:
@@ -2269,6 +1963,7 @@ def surya_pdf_pipeline(args):
                     model._quality_pages = ()
 
             def preserve_math(work_items):
+                from docling_pdf_cell_pipeline import recognize_page
                 from docling_pdf_layout_graphics import captioned_layout_input
                 from docling_pdf_repairs import enabled
                 from docling_pdf_scan_quality import refine_primary_table_blocks, refine_primary_formula_blocks
@@ -2283,33 +1978,18 @@ def surya_pdf_pipeline(args):
                                                         args.layout_graphics, diagnostic_event)
                                  if inspect_graphics else nullcontext(work_item))
                     with candidate as item:
-                        prediction = recognize([item])[0]
+                        prediction, tables = recognize_page(item, page, model.scale, backend,
+                            lambda remaining: recognize([remaining])[0], sys.modules[__name__],
+                            source_pdf=getattr(args, 'current_normalized_pdf', None))
                         prediction = refine_primary_table_blocks(
                             item.image, prediction, model, args, page_no, sys.modules[__name__], work_rect=item.rect)
                     prediction = refine_primary_formula_blocks(
                         prediction, model, args, page_no, work_item.rect, sys.modules[__name__])
+                    if tables:
+                        args.raster_cell_tables.setdefault(page_no, []).extend(tables)
                     predictions.append(prediction)
-                result = []
-                for work_item, prediction in zip(work_items, predictions, strict=True):
-                    page_no = model._quality_pages[work_item.page_index].page_no
-                    rect = work_item.rect
-                    blocks = []
-                    for block in prediction.blocks:
-                        args.surya_records.append({
-                            "page_no": page_no,
-                            "bbox": [block.bbox[0] / model.scale + rect.l,
-                                     block.bbox[1] / model.scale + rect.t,
-                                     block.bbox[2] / model.scale + rect.l,
-                                     block.bbox[3] / model.scale + rect.t],
-                            "html": block.html or "", "text": block.text,
-                            "label": block.label, "confidence": block.confidence,
-                        })
-                        if block.html and "<math" in block.html:
-                            # html_to_text would remove the preserved markers again.
-                            block = replace(block, text=semantic_ocr_text(block.html))
-                        blocks.append(block)
-                    result.append(replace(prediction, blocks=tuple(blocks)))
-                return result
+                return [record_prediction(item, prediction, model._quality_pages[item.page_index].page_no)
+                        for item, prediction in zip(work_items, predictions, strict=True)]
 
             model._recognize_docling_work_items = preserve_math
             model._run_docling_pages = capture_pages
@@ -2533,22 +2213,8 @@ def mathematical_cell_label(cell):
 
 
 def latex_math(latex, display="block"):
-    """Return executable-free MathML, or None if the notation cannot be parsed."""
-    from bs4 import BeautifulSoup
-    from latex2mathml.converter import convert
-
-    latex = latex.strip().strip("$")
-    if (not latex or latex.count("{") != latex.count("}")
-            or re.search(r"formula not|not decoded|unrecognized formula|не распознан|\ufffd", latex, re.I)):
-        return None
-    try:
-        node = BeautifulSoup(convert(latex, display=display), "html.parser").math
-        if node is None:
-            return None
-        node["data-latex"] = latex
-        return str(node)
-    except Exception:
-        return None
+    from docling_office_math import latex_math as render
+    return render(latex, display)
 
 
 @lru_cache(maxsize=1)
@@ -5856,8 +5522,9 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                             for cell in _table_cells(new_head):
                                 cell.name = 'td'
                         else:new_head.decompose()
-                merged_tail = merge_text_row_tail(old_soup.table, soup.table) if continued_data_head else False
-                if (not merged_tail and same_grid
+                measured_cells = 'raster_cell_atlas' in (old_geo.get('basis'), geo.get('basis'))
+                merged_tail = merge_text_row_tail(old_soup.table, soup.table) if continued_data_head and not measured_cells else False
+                if (not measured_cells and not merged_tail and same_grid
                         and old_geo['bbox'][3] > old_size.height * .85
                         and geo['bbox'][1] < size.height * .15):
                     merged_tail = join_description_tail(old_soup.table, soup.table)
@@ -5890,7 +5557,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                     and all(not c.get_text(strip=True) and not c.find(['img','math']) for c in boundary_right[:2])
                     and all(c.get_text(strip=True) for c in boundary_left[:2])
                     and re.match(r'^[а-яё]',boundary_right[2].get_text(' ',strip=True)))
-                if not merged_tail and ((old_geo.get("open_bottom") and geo.get("open_top")) or blank_stub):
+                if not measured_cells and not merged_tail and ((old_geo.get("open_bottom") and geo.get("open_top")) or blank_stub):
                     last_row, first_row = _table_rows(old_soup.table)[-1], soup.table.find("tr")
                     left_cells = last_row.find_all(["td", "th"], recursive=False)
                     right_cells = first_row.find_all(["td", "th"], recursive=False) if first_row else []
@@ -5921,7 +5588,7 @@ def join_page_tables(doc, routes, excluded, manifest, *, repair_boundaries=False
                                     for child in list(right.contents):
                                         left.append(child.extract())
                             first_row.decompose()
-                if (repair_boundaries and same_grid and not old_soup.table.find('table')
+                if (not measured_cells and repair_boundaries and same_grid and not old_soup.table.find('table')
                         and not soup.table.find('table')):
                     from docling_pdf_repairs import merge_source_word_tail
                     if merge_source_word_tail(old_soup.table, soup.table, sys.modules[__name__]):
@@ -6700,6 +6367,7 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
     caption. A chart with a few parallel lines is not sufficient evidence.
     """
     from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel, Size
+    from docling_pdf_cell_pipeline import owns_grid
 
     recovered, repairs = {}, []
     diagnostic_event('SCAN_RECOVERY_BEGIN', pages=diagnostic_summary(page_numbers),
@@ -6733,6 +6401,8 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
             candidates.append((dict(bbox=box, basis='layout_picture_with_positioned_table_caption'), picture))
         for geometry, picture in candidates:
             box = geometry['bbox']
+            if owns_grid(manifest, page_no, box):
+                continue
             from docling_pdf_forms import form_owns_region
             if form_owns_region(manifest, page_no, box):
                 diagnostic_event('SCAN_RECOVERY_REGION_SKIP', page_no=page_no, bbox=box,
@@ -8663,7 +8333,10 @@ def export_local_html(args, result, normalized, orientation, source):
             print(f"PDF geometry reader unavailable; retaining OCR route: {type(exc).__name__}: {exc}", file=sys.stderr)
         from docling_pdf_mixed_page import recover_missing_pages
         recovered_page_routes = recover_missing_pages(doc, records, args, regions, orientation,
-            manifest, sys.modules[__name__], reader=native_reader)
+            manifest, sys.modules[__name__], reader=native_reader, picture_routes=picture_routes,
+            excluded=excluded)
+        source_page_images = {entry['ref'] for entry in manifest.get('recovered_source_page_images', ())}
+        source_image_pages = {entry['page'] for entry in manifest.get('recovered_source_page_images', ())}
         table_records = [record for record in records if '<table' in record.get('html', '').lower()]
         original_table_refs.update(item.self_ref for item in doc.tables)
         from docling_pdf_forms import capture_form_figures, reserve_layout_graphics
@@ -8705,6 +8378,9 @@ def export_local_html(args, result, normalized, orientation, source):
             records = [record for record in records if not any(record.get('page_no') == entry['page']
                 and _captioned_figure_contains(entry['bbox'], record.get('bbox')) for entry in captioned_figures.values())]
             table_records = [record for record in records if '<table' in record.get('html', '').lower()]
+        from docling_pdf_cell_pipeline import install_export_routes
+        raster_cell_refs = install_export_routes(doc, getattr(args, 'raster_cell_tables', {}),
+            routes, excluded, manifest, regions, orientation, sys.modules[__name__])
         # Restore tables/formulas detected by Surya but omitted by the layout assembly.
         for record in table_records:
             if not any((reg := item_region(item, doc)) and reg[0] == record["page_no"]
@@ -8715,8 +8391,8 @@ def export_local_html(args, result, normalized, orientation, source):
             reject_collapsed_table_candidates, table_owns_source_image, restore_ocr_paragraphs)
         image_backed_tables = recover_image_backed_tables(doc, native_reader, regions,
             records, routes, excluded, manifest, sys.modules[__name__])
-        scan_candidates = recover_scanned_table_regions(
-            doc,native_reader,regions,orientation,records,routes,excluded,manifest)
+        scan_candidates = recover_scanned_table_regions(doc, native_reader, regions,
+            [page for page in orientation if page not in source_image_pages], records, routes, excluded, manifest)
         expose_picture_table_children(doc, picture_routes, manifest)
         restore_ocr_formula_blocks(doc, records, picture_routes, manifest)
         if pdf_repair_enabled(args, 'boundaries'):
@@ -8772,6 +8448,8 @@ def export_local_html(args, result, normalized, orientation, source):
                 and _captioned_figure_contains(entry['bbox'], record.get('bbox')) for entry in captioned_figures.values())]
             table_records = [record for record in records if '<table' in record.get('html', '').lower()]
         for item in sorted(doc.tables,key=table_source_order):
+            if item.self_ref in raster_cell_refs:
+                continue
             if item.self_ref in captioned_figures:
                 diagnostic_event('TABLE_EXPORT_AS_CAPTIONED_FIGURE', ref=item.self_ref,
                                  page=captioned_figures[item.self_ref]['page'])
@@ -9759,6 +9437,8 @@ def export_local_html(args, result, normalized, orientation, source):
 
         class SourcePictures(HTMLPictureSerializer):
             def serialize(self, *, item, doc_serializer, doc, **kwargs):
+                if item.self_ref in source_page_images:
+                    return create_ser_result(text=picture_routes[item.self_ref], span_source=item)
                 if item.self_ref in captioned_figures:
                     fragment = serialize_captioned_figure(item, captioned_figures[item.self_ref],
                         captioned_figure_routes[item.self_ref], doc_serializer, **kwargs)
@@ -10104,6 +9784,12 @@ def parse_args(argv=None):
                    help="страницы PDF, например 1-10 (по умолчанию все)")
     p.add_argument("--mode", choices=("ai", "local"), default="local",
                    help="local: локальная Surya 2.5 (по умолчанию); ai: OpenAI")
+    p.add_argument('--pdf-mode', choices=('quality', 'balanced'), default='quality',
+                   help='режим локальной конвертации PDF: точный или сбалансированный')
+    p.add_argument('--no-balanced-tables', dest='balanced_tables', action='store_false', default=None,
+                   help='использовать прежний поиск таблиц в сбалансированном режиме')
+    p.add_argument('--debug-tables', type=Path, metavar='DIR',
+                   help='сохранить разметку таблиц по страницам и решения о склейке в указанную папку')
     p.add_argument("--format", choices=("html",), default="html", help="формат результата (html)")
     p.add_argument("--api-key", default=None, help="ключ OpenAI; в режиме ai при отсутствии запрашивается видимым вводом")
     p.add_argument("--input", dest="selected_inputs", nargs="+", type=Path,
@@ -10152,6 +9838,8 @@ def parse_args(argv=None):
                    help='карта визуально сверенных формул с SHA256 исходного PDF и изображения')
     p.add_argument('--desktop-output', action='store_true', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.pdf_mode == 'balanced' and args.mode != 'local':
+        p.error('Сбалансированный режим доступен только при локальной конвертации PDF')
     if re.search(r'[<>:"/\\|?*\x00-\x1f]', args.output_suffix) or args.output_suffix.endswith(('.', ' ')):
         p.error('--output-suffix must contain only filename characters and cannot end in a dot or space')
     args.primary_ocr_only = args.mode == 'local'
@@ -10246,13 +9934,13 @@ def parse_args(argv=None):
     if args.pages and args.office_files:
         print("WARNING: --pages applies only to PDF; Office files will be converted in full.", file=sys.stderr)
     if args.pending_pdf_files:
-        if args.mode == "local":
+        if args.mode == "local" and args.pdf_mode != 'balanced':
             try:
                 args.device = resolve_device()
                 configure_surya(args)
             except (ImportError, ValueError, OSError, subprocess.SubprocessError) as exc:
                 p.error(str(exc))
-        else:
+        elif args.mode == 'ai':
             args.api_key = (args.api_key or "").strip()
             if not args.api_key:
                 try:
@@ -10369,12 +10057,13 @@ def build_converter(args):
         )
         from docling_surya_ocr import SuryaOcrOptions
 
+        parallel = int(os.environ.get('SURYA_INFERENCE_PARALLEL', '1'))
         ocr = SuryaOcrOptions(
             backend="surya2", document_analysis_backend="surya2_ocr_only",
             ocr_mode="full_page", languages=("ru", "en"), device=args.device,
             recognition_batch_size=OCR_BATCH_SIZE, cpu_threads=NUM_THREADS,
             surya2_inference_backend=SURYA_BACKEND,
-            surya2_inference_parallel=OCR_BATCH_SIZE,
+            surya2_inference_parallel=parallel,
             surya2_startup_timeout_seconds=600,
         )
         ocr.mode = OcrMode.FULL_PAGE
@@ -10723,6 +10412,22 @@ def export_api_html(result, base):
 def convert_document(args, converter, source):
     if source.suffix.lower() in {'.docx', '.docm', '.dotx', '.dotm', '.rtf', '.doc', '.dot'}:
         return export_office_document(args, source)
+    if source.suffix.lower() == '.pdf' and getattr(args, 'pdf_mode', 'quality') == 'balanced':
+        from local_web.fast_pdf import convert_fast_pdf
+
+        debug = getattr(args, 'debug_tables', None)
+        if debug is not None:
+            relative = source.relative_to(DATA_DIR) if source.is_relative_to(DATA_DIR) else Path(source.name)
+            debug = debug / relative.with_suffix('')
+        content, stats = convert_fast_pdf(source, args.pages or '', mode='balanced',
+            balanced_grid=getattr(args, 'balanced_tables', None), debug_tables=debug,
+            formula_reader=create_balanced_formula_reader(),
+            on_progress=lambda percent, stage: print(stage, flush=True))
+        write_atomic(Path(f'{output_base(args, source)}.html'), content)
+        for warning in stats.get('warnings', ()):
+            print(f'WARNING: {warning}', flush=True)
+        return {'status': 'REVIEW' if stats.get('warnings') else 'OK', 'pages': stats['pages']}
+
     from docling.datamodel.base_models import ConversionStatus
     from docling_core.types.doc import ImageRefMode
 
@@ -10735,15 +10440,17 @@ def convert_document(args, converter, source):
         kwargs["page_range"] = args.page_range
     mode = args.mode if is_pdf else "docling-native"
     pages = (args.pages or "all") if is_pdf else "all"
-    diagnostic_event('DOCUMENT_BEGIN',source=source,mode=mode,pages=pages)
+    pdf_mode = getattr(args, 'pdf_mode', 'quality') if is_pdf and mode == 'local' else None
+    diagnostic_event('DOCUMENT_BEGIN', source=source, mode=mode, pdf_mode=pdf_mode, pages=pages)
     diagnostic_file(source,'source_document')
-    print(f"Processing {source} | {mode} | pages {pages}")
+    print(f"Processing {source} | {pdf_mode or mode} | pages {pages}")
     if is_pdf and args.mode == "local":
         from docling_pdf_runtime import file_hash, DiagnosticExportError, write_failure_artifacts
         args.pdf_diagnostics_current = None
         args.pdf_quality_current = {}
         args.pdf_export_context = {'stage': 'ocr'}
         args.surya_records = []
+        args.raster_cell_tables = {}
         args.layout_graphics = []
         args.page_ocr_routes = {}
         args.primary_ocr_page_failures = {}
@@ -10780,7 +10487,8 @@ def convert_document(args, converter, source):
                     diagnostic_source = diagnostics/'normalized.pdf'
                     shutil.copy2(normalized, diagnostic_source)
                 (diagnostics/'input.json').write_text(json.dumps(dict(source=str(source), normalized=str(diagnostic_source),
-                    orientation=orientation, page_range=args.page_range, pdf_repairs=getattr(args, 'pdf_repairs', []),
+                    orientation=orientation, page_range=args.page_range, pdf_mode=pdf_mode,
+                    pdf_repairs=getattr(args, 'pdf_repairs', []),
                     source_sha256=args.current_source_hash), ensure_ascii=False, indent=2), encoding='utf-8')
             print(f"Подготовка HTML: {source}", flush=True)
             content = None
@@ -10794,7 +10502,8 @@ def convert_document(args, converter, source):
                 args.pdf_export_context = {'stage': 'publication'}
                 base = output_base(args, source)
                 base.parent.mkdir(parents=True, exist_ok=True)
-                needs_review = quality.get('table_quality_warnings') or quality.get('formula_source_reviews')
+                page_images = quality.get('recovered_source_page_images', ())
+                needs_review = quality.get('table_quality_warnings') or quality.get('formula_source_reviews') or page_images
                 publication = {'status': 'REVIEW' if needs_review else 'OK'}
                 if not getattr(args, 'desktop_output', False):
                     from docling_pdf_review import write_quality_report
@@ -10814,6 +10523,8 @@ def convert_document(args, converter, source):
                     print(f"WARNING: Страница PDF {issue['page']}. {issue['message']}")
             if quality.get('table_quality_warnings'):
                 print("WARNING: Требуется визуальная проверка таблиц", flush=True)
+            for recovered in page_images:
+                print(f"WARNING: Страница PDF {recovered['page']}. Содержимое сохранено изображением.", flush=True)
             if publication['status'] == 'REVIEW' and 'report' in publication:
                 print(f"Отчёт о проверке: {publication['report']}", flush=True)
             print(f"Saved: {base}.html", flush=True)
@@ -10903,7 +10614,7 @@ def run_conversion(args, report_router, report_lock):
                         f'python={sys.version.split()[0]}; platform={platform.platform()}; '
                         f'cwd={Path.cwd()}; input_dir={args.input_dir}; mode={args.mode}; device={args.device}; '
                         f'pages={args.pages or "all"}; supported_files={len(args.input_files)}; '
-                        f'image_scale={IMAGE_SCALE}; threads={NUM_THREADS}',
+                        f'image_scale={IMAGE_SCALE}; raster_dpi={PDF_OCR_DPI}; threads={NUM_THREADS}',
                     )
                     report_event(report, report_lock, "memory",
                                  f"before document: {source}; {memory_snapshot(args.device)}")

@@ -4,7 +4,8 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from math import inf, isfinite
+from itertools import groupby
+from math import ceil, floor, inf, isfinite
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,8 @@ class Grid:
     cells: tuple[Cell, ...]
     open_top: bool = False
     open_bottom: bool = False
+    double_x: tuple[float, ...] = ()
+    double_y: tuple[float, ...] = ()
 
     @property
     def rows(self):
@@ -46,6 +49,8 @@ class Grid:
         return replace(self, bbox=box(self.bbox),
                        x_grid=tuple(x * sx for x in self.x_grid),
                        y_grid=tuple(y * sy for y in self.y_grid),
+                       double_x=tuple(x * sx for x in self.double_x),
+                       double_y=tuple(y * sy for y in self.double_y),
                        cells=tuple(replace(cell, bbox=box(cell.bbox)) for cell in self.cells))
 
 
@@ -294,7 +299,48 @@ def _grid(horizontal, vertical, tolerance, diagnostics):
     return Grid((xs[0], ys[0], xs[-1], ys[-1]), xs, ys, cells, top[1], bottom[1])
 
 
-def vector_grids(horizontal, vertical, *, tolerance=1.1, diagnostics=None):
+def _collapse_pairs(segments, tolerance, clear_gap, vertical):
+    levels = [list(group) for _, group in groupby(sorted(segments, key=lambda item: item[:3]),
+                                               key=lambda item: item[0])]
+    close = [b[0][0] - a[0][0] <= 3 * tolerance for a, b in zip(levels, levels[1:])]
+    merged, doubled = [], []
+    index = 0
+    while index < len(levels):
+        first = levels[index]
+        if (index < len(close) and close[index]
+                and (index == 0 or not close[index - 1])
+                and (index + 1 == len(close) or not close[index + 1])):
+            second = levels[index + 1]
+            if len(first) == len(second) and all(
+                    abs(a - c) <= tolerance and abs(b - d) <= tolerance and len(hits & other_hits) >= 2
+                    and clear_gap(first[0][0], second[0][0], max(a, c), min(b, d), vertical)
+                    for (_, a, b, hits), (_, c, d, other_hits) in zip(first, second, strict=True)):
+                center = (first[0][0] + second[0][0]) / 2
+                doubled.append(center)
+                merged.extend((center, min(a, c), max(b, d))
+                              for (_, a, b, _), (_, c, d, _) in zip(first, second, strict=True))
+                index += 2
+                continue
+        merged.extend(item[:3] for item in first)
+        index += 1
+    return merged, tuple(doubled)
+
+
+def _double_grid(rows, columns, tolerance, clear_gap):
+    horizontal, double_y = _collapse_pairs(rows, tolerance, clear_gap, False)
+    vertical, double_x = _collapse_pairs(columns, tolerance, clear_gap, True)
+    if not (double_x or double_y):
+        return None
+    regions = list(_intersections(horizontal, vertical, tolerance))
+    if len(regions) != 1:
+        return None
+    grid = _grid(*regions[0], tolerance, [])
+    if grid is None or set(double_x) - set(grid.x_grid) or set(double_y) - set(grid.y_grid):
+        return None
+    return replace(grid, double_x=double_x, double_y=double_y)
+
+
+def vector_grids(horizontal, vertical, *, tolerance=1.1, diagnostics=None, clear_gap=None):
     """Return grids from (axis, start, end) rules in PDF points, or in another shared unit."""
     if not isfinite(tolerance) or tolerance <= 0:
         raise ValueError('tolerance must be finite and positive')
@@ -306,9 +352,15 @@ def vector_grids(horizontal, vertical, *, tolerance=1.1, diagnostics=None):
             _reason(diagnostics, 'no_horizontal_rules' if not h else 'no_vertical_rules')
             return []
         for rows, columns in _intersections(h, v, tolerance):
-            grid = _grid(rows, columns, tolerance, diagnostics)
+            reasons = []
+            grid = _grid(rows, columns, tolerance, reasons)
+            if grid is None and clear_gap is not None and 'indistinct_grid_axes' in reasons:
+                grid = _double_grid(rows, columns, tolerance, clear_gap)
             if grid is not None:
                 grids.append(grid)
+            else:
+                for reason in reasons:
+                    _reason(diagnostics, reason)
     except _TooComplex:
         _reason(diagnostics, 'grid_complexity_limit')
         return []
@@ -433,7 +485,8 @@ def raster_grids(image, *, diagnostics=None):
     scale = min(1.0, 1650 / max(width, height))
     target = max(1, round(width * scale)), max(1, round(height * scale))
     with image.convert('L') as gray:
-        pixels = np.asarray(gray)
+        original = np.asarray(gray)
+        pixels = original
         if target != (width, height):
             pixels = cv2.resize(pixels, target, interpolation=cv2.INTER_AREA)
     w, h = target
@@ -456,6 +509,32 @@ def raster_grids(image, *, diagnostics=None):
     vertical = _snap_dashes(v_solid, v_dashes, horizontal, tolerance)
     horizontal = _snap_dashes(h_solid, h_dashes, vertical, tolerance)
     sx, sy = width / w, height / h
+    residual = {}
+
+    def clear_gap(first, last, start, end, vertical):
+        if not residual:
+            # Check the original raster so small strokes cannot disappear during line detection.
+            window = round(15 * max(sx, sy)) | 1
+            source_ink = cv2.adaptiveThreshold(original, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                               cv2.THRESH_BINARY_INV, window, 9)
+            minimum_rule = 2 * ceil(3 * tolerance) + 1
+            h_rules = cv2.morphologyEx(source_ink, cv2.MORPH_OPEN,
+                                       _kernel(round(max(h_length, minimum_rule) * sx), False))
+            v_rules = cv2.morphologyEx(source_ink, cv2.MORPH_OPEN,
+                                       _kernel(round(max(v_length, minimum_rule) * sy), True))
+            for transposed, parallel, transverse in ((False, h_rules, v_rules), (True, v_rules, h_rules)):
+                # Ragged antialiased edges can be one pixel away from the continuous rule.
+                edges = cv2.dilate(parallel, _kernel(3, not transposed))
+                crossings = cv2.dilate(transverse, _kernel(3, transposed))
+                mask = cv2.bitwise_or(edges, crossings)
+                remaining = cv2.bitwise_and(source_ink, cv2.bitwise_not(mask))
+                residual[transposed] = (remaining.T, mask.T) if transposed else (remaining, mask)
+        rows, rules = residual[vertical]
+        top, bottom = floor(first) + 1, ceil(last)
+        left, right = ceil(start), floor(end) + 1
+        return (top < bottom and left < right and (rules[top:bottom, left:right] == 0).any()
+                and not rows[top:bottom, left:right].any())
+
     return vector_grids(((y * sy, a * sx, b * sx) for y, a, b in horizontal),
                         ((x * sx, a * sy, b * sy) for x, a, b in vertical),
-                        tolerance=tolerance * max(sx, sy), diagnostics=diagnostics)
+                        tolerance=tolerance * max(sx, sy), diagnostics=diagnostics, clear_gap=clear_gap)

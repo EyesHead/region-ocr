@@ -370,6 +370,8 @@ def _merge(base, previous, current, repeat, numbers, split, redirects):
     if not base.title and current.title:
         base.title = current.title
     table['data-source-pages'] = table.get('data-source-pages', str(base.page)) + ',' + str(current.page)
+    if source.has_attr('data-grid-double'):
+        table['data-grid-double'] = '1'
     _redirect(source, table, redirects)
     offset = repeat + numbers
     for i, row in enumerate(current.grid.rows[:offset]):

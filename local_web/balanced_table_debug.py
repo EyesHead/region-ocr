@@ -22,6 +22,7 @@ def write_page(directory, number, page, grids, scale):
         records = []
         for grid in grids:
             record = {'bbox': grid.bbox, 'x_grid': grid.x_grid, 'y_grid': grid.y_grid,
+                      'double_x': grid.double_x, 'double_y': grid.double_y,
                       'open_top': grid.open_top, 'open_bottom': grid.open_bottom, 'cells': []}
             for cell in grid.cells:
                 l, t, r, b = cell.bbox

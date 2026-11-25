@@ -247,8 +247,15 @@ def grid_attributes(grid, scale, page_size):
     sx, sy = scale
     coords = lambda values: ','.join(f'{v:.3f}' for v in values)
     l, t, r, b = grid.bbox
+    double_rules = ''.join(
+        f' data-grid-double-{axis}="{coords(value * factor for value in values)}"'
+        for axis, values, factor in (('x', grid.double_x, sx), ('y', grid.double_y, sy))
+        if values)
+    if double_rules:
+        double_rules = ' data-grid-double="1"' + double_rules
     return (f' data-balanced-grid="1" data-source-bbox="{coords((l*sx,t*sy,r*sx,b*sy))}"'
             f' data-grid-x="{coords(x*sx for x in grid.x_grid)}"'
             f' data-grid-y="{coords(y*sy for y in grid.y_grid)}"'
+            f'{double_rules}'
             f' data-page-width="{page_size[0]:.3f}" data-page-height="{page_size[1]:.3f}"'
             f' data-open-top="{int(grid.open_top)}" data-open-bottom="{int(grid.open_bottom)}"')

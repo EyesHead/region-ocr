@@ -320,7 +320,7 @@ def _page_range(pages, total):
 def _read_text(page, page_no, balanced, detailed_tables, ocr_page, stats):
     if page.text_layer is not None:
         try:
-            bind_tables(page, page.text_layer, balanced=balanced)
+            bind_tables(page, page.text_layer, balanced=balanced, infer_partial=detailed_tables)
         except Exception as error:
             print(f'PDF: страница {page_no}, разметка таблицы ({type(error).__name__}: {error})', flush=True)
             stats['warnings'].append(f'На странице {page_no} не удалось собрать таблицу. Текст сохранён.')

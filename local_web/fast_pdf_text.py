@@ -204,7 +204,7 @@ def raster_table_hint(page, reading):
     return False
 
 
-def bind_tables(page, reading, *, balanced=False):
+def bind_tables(page, reading, *, balanced=False, infer_partial=False):
     """Bind source words to vector grids, or inspect pixels when a bitmap may contain a table."""
     raster_tables = []
     physical = page.grids_for_text(native=True)
@@ -222,6 +222,12 @@ def bind_tables(page, reading, *, balanced=False):
                 if not physical:
                     raise
                 page.reasons.append(f'legacy_grid_error ({type(error).__name__})')
+            if not physical and not raster_tables and infer_partial:
+                from local_web.balanced_table_grid import partial_raster_grids
+
+                word_pixels = [[(text, x/sx, y/sy, w/sx, h/sy) for text, x, y, w, h in row]
+                               for row in reading['word_rows']]
+                physical = [grid.scaled(sx, sy) for grid in partial_raster_grids(image, word_pixels)]
         else:
             raster_tables = [_simple_grid(grid, (sx, sy)) for grid in find_grids(image)]
     if physical or raster_tables:

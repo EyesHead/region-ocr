@@ -359,6 +359,10 @@ def recognize_page_with_layout(image: Image.Image, page_no: int, *, recover_merg
                     cache_layout = False
                     reasons.append(f'legacy_grid_error({type(error).__name__})')
                     _LOG.warning('Резервный поиск таблиц на странице %s завершился ошибкой (%s)', page_no, error)
+            if use_physical and not grids and not legacy and words:
+                from local_web.balanced_table_grid import partial_raster_grids
+
+                grids = partial_raster_grids(image, words)
             if grids or legacy:
                 plain['blocks'] = scan_grid_blocks(lines, words, line_boxes, grids, legacy)
         else:

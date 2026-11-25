@@ -293,7 +293,8 @@ def grid_attributes(grid, scale, page_size):
         if values)
     if double_rules:
         double_rules = ' data-grid-double="1"' + double_rules
-    return (f' data-balanced-grid="1" data-source-bbox="{coords((l*sx,t*sy,r*sx,b*sy))}"'
+    return (f' data-balanced-grid="1" data-grid-evidence="{grid.evidence}"'
+            f' data-source-bbox="{coords((l*sx,t*sy,r*sx,b*sy))}"'
             f' data-grid-x="{coords(x*sx for x in grid.x_grid)}"'
             f' data-grid-y="{coords(y*sy for y in grid.y_grid)}"'
             f'{double_rules}'

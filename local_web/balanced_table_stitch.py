@@ -180,7 +180,7 @@ def _read_page(source, index):
     pieces = {}
     for at in {positions[0], positions[-1]}:
         table = events[at]
-        if not table.has_attr('data-balanced-grid'):
+        if not table.has_attr('data-balanced-grid') or table.get('data-grid-evidence') == 'inferred':
             continue
         page, table_page = _physical_page(section), _physical_page(table)
         page = (page or table_page) if not page or not table_page or page == table_page else None

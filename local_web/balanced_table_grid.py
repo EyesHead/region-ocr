@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from itertools import groupby
 from math import ceil, floor, inf, isfinite
+from statistics import median
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,7 @@ class Grid:
     open_bottom: bool = False
     double_x: tuple[float, ...] = ()
     double_y: tuple[float, ...] = ()
+    evidence: str = 'verified'
 
     @property
     def rows(self):
@@ -383,6 +385,89 @@ def _kernel(size, vertical):
 
     size = max(1, size | 1)  # Centred odd kernels preserve open endpoints.
     return cv2.getStructuringElement(cv2.MORPH_RECT, (1, size) if vertical else (size, 1))
+
+
+def partial_raster_grids(image, word_rows):
+    """Infer an open grid only where printed dividers and positioned rows agree."""
+    import cv2
+    import numpy as np
+
+    words = [(x, y, x+w, y+h) for row in word_rows for text, x, y, w, h in row
+             if text.strip() and w > 0 and h > 0]
+    if not words:
+        return []
+    em = median(b-t for _, t, _, b in words)
+    with image.convert('L') as gray:
+        ink = cv2.adaptiveThreshold(np.asarray(gray), 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                    cv2.THRESH_BINARY_INV, 15, 9)
+    vertical = cv2.morphologyEx(ink, cv2.MORPH_OPEN, _kernel(round(2*em), True))
+    strokes = _mask_segments(vertical, 2*em, max(2, .6*em), True)
+    rails = _segments(strokes, max(1., .4*em))
+    rails = [(x, t, b) for x, t, b in rails if b-t >= 3*em]
+    found = []
+    for axis, start, end in sorted(rails, key=lambda rail: rail[2]-rail[1], reverse=True):
+        group = [(x, t, b) for x, t, b in rails
+                 if min(end, b)-max(start, t) >= .65*max(end-start, b-t)]
+        columns = sorted({x for x, _, _ in group})
+        if len(columns) < 2 or any(b-a < 2*em for a, b in zip(columns, columns[1:])):
+            continue
+        top, bottom = median(t for _, t, _ in group), median(b for _, _, b in group)
+        if any(max(top, box[1]) < min(bottom, box[3]) for box in (grid.bbox for grid in found)):
+            continue
+        grid = _partial_grid(ink, vertical, words, columns, top, bottom, em)
+        if grid is not None:
+            found.append(grid)
+    return found
+
+
+def _partial_grid(ink, vertical, words, columns, top, bottom, em):
+    import cv2
+
+    spacing = median(b-a for a, b in zip(columns, columns[1:]))
+    left, right = columns[0] - 1.5*spacing, columns[-1] + 1.5*spacing
+    rule_length = columns[-1]-columns[0]
+    horizontal = cv2.morphologyEx(ink, cv2.MORPH_OPEN, _kernel(round(rule_length), False))
+    rules = [y for y, a, b in _mask_segments(horizontal, rule_length, max(2, .6*em), False)
+             if a <= columns[0] and b >= columns[-1]]
+    top = min((y for y in rules if top-2*em <= y <= top), default=top-.5*em)
+    candidates = sorted((box for box in words if left < (box[0]+box[2])/2 < right
+                         and top <= (box[1]+box[3])/2 <= bottom+.5*em),
+                        key=lambda box: box[1]+box[3])
+    rows, centers = [], []
+    for box in candidates:
+        y = (box[1]+box[3])/2
+        if not rows or y-centers[-1] > .55*em:
+            rows.append([])
+            centers.append(y)
+        rows[-1].append(box)
+    supported = []
+    for i, row in enumerate(rows):
+        filled = {bisect_right(columns, (l+r)/2) for l, _, r, _ in row}
+        crosses = any(l+.2*em < x < r-.2*em for l, _, r, _ in row for x in columns)
+        if not crosses and len(filled) >= 3 and 0 in filled and len(columns) in filled:
+            supported.append(i)
+    if len(supported) < 3 or 2*len(supported) < supported[-1]-supported[0]+1:
+        return None
+    left = max(0., min(l for row in rows for l, _, _, _ in row)-.5*em)
+    right = min(float(ink.shape[1]), max(r for row in rows for _, _, r, _ in row)+.5*em)
+    xs = (left, *columns, right)
+    mids = [(a+b)/2 for a, b in zip(centers, centers[1:])]
+    splits = [min((r for r in rules if a+.25*em <= r <= b-.25*em),
+                  key=lambda r: abs(r-mid), default=mid)
+              for a, b, mid in zip(centers, centers[1:], mids)]
+    ys = (max(0., min(t for _, t, _, _ in rows[0])-.25*em), *splits,
+          min(float(ink.shape[0]), max(b for _, _, _, b in rows[-1])+.25*em))
+    walls = [[True] * (len(xs)-1) for _ in ys]
+    dividers = [[True]*len(rows)]
+    for x in columns:
+        lo, hi = max(0, round(x-.2*em)), round(x+.2*em)+1
+        dividers.append([
+            not any(l+.2*em < x < r-.2*em for l, _, r, _ in row)
+            and (i in supported or vertical[round(ys[i]):round(ys[i+1]), lo:hi].any())
+            for i, row in enumerate(rows)])
+    dividers.append([True]*len(rows))
+    cells = _make_cells(xs, ys, walls, dividers, [False]*(len(xs)-1), [False]*(len(xs)-1))
+    return Grid((left, ys[0], right, ys[-1]), xs, ys, cells, evidence='inferred') if cells else None
 
 
 def _mask_segments(mask, minimum, thickness, vertical):

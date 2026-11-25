@@ -499,7 +499,9 @@ def convert_fast_pdf(source, pages='', *, mode=None, ocr_page=None, on_progress=
                 previous_figure = links.get('next')
                 if page.source_view:
                     views[number] = page.source_view
-                sections.append(f'<section id="page-{number}" data-source-page="{number}" data-text-method="{method}">'
+                print(f'PDF route: page {number}; {method}; {page.route_reason}; clockwise {page.turn}', flush=True)
+                sections.append(f'<section id="page-{number}" data-source-page="{number}" data-text-method="{method}"'
+                                f' data-text-reason="{page.route_reason}" data-page-turn="{page.turn}">'
                                 + ''.join(blocks) + '</section>')
                 stats[method + '_pages'] += 1
                 stats['pages'] += 1

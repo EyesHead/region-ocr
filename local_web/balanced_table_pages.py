@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 import os
 
-from docling_pdf_deskew import page_skew
+from docling_pdf_deskew import page_skew, source_bbox
 from docling_pdf_runtime import FAST_OCR_MAX_SIDE, PDF_OCR_SCALE
 from local_web.fast_pdf_geometry import _page_geometry, _render, _vector_segments
 from local_web.fast_pdf_text import covers_scanned_body, page_text, raster_table_hint
@@ -36,6 +36,7 @@ class PageContent:
     turn: int = 0
     source_view: dict | None = None
     positioned_read: object = None
+    route_reason: str = 'text_reader_unavailable'
 
     def image(self):
         if self.raster is None:
@@ -69,20 +70,52 @@ class PageContent:
         return tuple(grid.scaled(sx, sy) for grid in self.grids)
 
     def orient_scan(self, page_no, detailed_tables, cancelled):
-        from PIL import Image
         from local_web.fast_ocr import balanced_page_orientation
 
-        self.turn, self.positioned_read = balanced_page_orientation(self.raster, page_no, check_cancel=cancelled)
-        if self.turn:
-            if self.source_view is None:
-                self.source_view = dict(original_size=(self.width, self.height))
-            self.source_view['clockwise'] = self.turn
-            transpose = {90: Image.Transpose.ROTATE_270, 270: Image.Transpose.ROTATE_90}
-            upright = self.raster.transpose(transpose[self.turn])
+        turn, self.positioned_read = balanced_page_orientation(self.raster, page_no, check_cancel=cancelled)
+        if turn:
+            self.rotate(turn, detailed_tables)
+
+    def orient_text_layer(self, detailed_tables):
+        from docling_pdf_orientation import ORIENTATION_CONFIDENCE
+        from local_web.fast_ocr import _orientation_hint
+
+        area = self.width * self.height
+        if not any((r-l) * (b-t) >= .80 * area for l, t, r, b in self.objects):
+            return
+        # PP-LCNet takes a 224 px center crop. Leave room for its resize on a portrait scan.
+        with _render(self.page, 640, PDF_OCR_SCALE) as preview:
+            turn, confidence = _orientation_hint(preview)
+        if turn and confidence >= ORIENTATION_CONFIDENCE:
+            self.rotate(turn, detailed_tables)
+            inverse = dict(original_size=(self.width, self.height), clockwise=(-turn) % 360)
+            reading = self.text_layer
+            reading['words'] = [(*source_bbox(box, inverse), text, score)
+                                for *box, text, score in reading['words']]
+
+            def word_in_reading_space(word):
+                text, x, y, width, height = word
+                l, t, r, b = source_bbox((x, y, x + width, y + height), inverse)
+                return text, l, t, r - l, b - t
+
+            reading['word_rows'] = [[word_in_reading_space(word) for word in row]
+                                    for row in reading['word_rows']]
+
+    def rotate(self, turn, detailed_tables):
+        from PIL import Image
+
+        self.turn = turn
+        if self.source_view is None:
+            self.source_view = dict(original_size=(self.width, self.height))
+        self.source_view['clockwise'] = turn
+        if self.raster is not None:
+            transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+                         270: Image.Transpose.ROTATE_90}
+            upright = self.raster.transpose(transpose[turn])
             self.raster.close()
             self.raster = upright
-            self.page.set_rotation((self.page.get_rotation() + self.turn) % 360)
-            self.measure(detailed_tables)
+        self.page.set_rotation((self.page.get_rotation() + turn) % 360)
+        self.measure(detailed_tables)
 
     def close(self):
         if self.raster is not None:
@@ -90,7 +123,7 @@ class PageContent:
         self.page.close()
 
 
-def read_page(document, page_no, improved, deskew, text_document, on_page=None):
+def read_page(document, page_no, improved, deskew, text_document, on_page=None, *, orient_scans=False):
     page = document[page_no - 1]
     try:
         page._fast_image_page_index = page_no - 1
@@ -99,10 +132,14 @@ def read_page(document, page_no, improved, deskew, text_document, on_page=None):
         current.measure(improved)
         if text_document is not None:
             reading = page_text(text_document, page_no, (width, height))
+            current.route_reason = 'insufficient_text_coverage' if reading else 'unusable_text_layer'
             if reading and covers_scanned_body(reading, current.objects, width, height):
                 if on_page:
                     on_page(page_no, True)
                 current.text_layer = reading
+                current.route_reason = 'covered_text_layer'
+                if orient_scans:
+                    current.orient_text_layer(improved)
                 return current
         if on_page:
             on_page(page_no, False)
@@ -209,11 +246,14 @@ def read_pages(document, first, last, *, improved, deskew, text_document=None, s
                 if cancelled:
                     cancelled()
                 if number <= last:
-                    page = read_page(document, number, improved, deskew, text_document, on_page)
+                    page = read_page(document, number, improved, deskew, text_document, on_page,
+                                     orient_scans=orient_scans)
                     try:
                         if page.text_layer is None:
                             low, high = page.image().getextrema()
                             page.blank = low >= 254 and high - low <= 1
+                            if page.blank:
+                                page.route_reason = 'blank_raster'
                             if orient_scans and not page.blank:
                                 page.orient_scan(number, improved, cancelled)
                         raster_tables = improved and (page.text_layer is None or page.possible_raster_table)

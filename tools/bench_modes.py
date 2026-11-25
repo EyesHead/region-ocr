@@ -178,7 +178,8 @@ def trace_pages(fast_pdf, pages_module, text_module, records):
                 record = records.setdefault(number, dict(usable=None, layer=None, coverage=None))
                 method = "blank" if page.blank else ("native" if page.text_layer is not None else "ocr")
                 record.update(
-                    method=method, turn=page.turn, skew=(page.source_view or {}).get("deskew_degrees", 0),
+                    method=method, route_reason=page.route_reason, turn=page.turn,
+                    skew=(page.source_view or {}).get("deskew_degrees", 0),
                     source=page.source, grids=[(grid.rows, grid.columns, len(grid.cells)) for grid in page.grids],
                     reasons=list(dict.fromkeys(page.reasons)),
                 )
@@ -373,7 +374,8 @@ def page_description(record):
     reasons = ", ".join(record["reasons"])
     layout = " ".join(value for value in (record["source"], grids, reasons) if value) or "—"
     return (
-        f"{record['method']} · {yes_no(record['usable'])}/{yes_no(record['layer'])}/{yes_no(record['coverage'])} · "
+        f"{record['method']} ({record['route_reason']}) · "
+        f"{yes_no(record['usable'])}/{yes_no(record['layer'])}/{yes_no(record['coverage'])} · "
         f"{record['turn']}°/{record['skew']:+.2f}° · {layout}"
     )
 

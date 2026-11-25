@@ -4398,24 +4398,15 @@ class NativeTableReader:
                 elif graphic and 'text' in graphic:
                     content=graphic['text']
                 elif graphic:
-                    b=graphic['bbox'];pixels=graphic.get('source_pixel_bbox') or (
-                        max(0,math.floor((b[0]-region[0])/sx)),max(0,math.floor((b[1]-region[1])/sy)),
-                        min(width,math.ceil((b[2]-region[0])/sx)),min(height,math.ceil((b[3]-region[1])/sy)))
-                    img=BeautifulSoup(image_html(source_image.crop(pixels),b[2]-b[0],'cell'),'html.parser').img
-                    img['data-source-cell']='true'
+                    b=graphic['bbox']
                     remaining=[glyph for glyph in c['glyphs'] if not (b[0]<=(glyph['x0']+glyph['x1'])/2<=b[2]
                                and b[1]<=(glyph['top']+glyph['bottom'])/2<=b[3])]
-                    parts=[(line['y'],line['html']) for line in native_cell_lines(remaining)]
-                    parts.append((b[1],str(img)))
-                    content='<br/>'.join(part for position,part in sorted(parts,key=lambda p:p[0]))
+                    content='<br/>'.join(line['html'] for line in native_cell_lines(remaining))
                     retained.append(dict(row=y,column=c['column'],**graphic))
                 elif peers:
                     content=peers[-1]['html']
-                # A scan with no positioned glyphs must not turn a real data
-                # cell into whitespace merely because graphic detection did
-                # not classify its small numerals. Retain the ORIGINAL cell
-                # pixels; the math stage still checks the grid before OCR.
-                if not c['glyphs'] and not BeautifulSoup(content,'html.parser').get_text(strip=True) and not BeautifulSoup(content,'html.parser').find(['img','math']):
+                # The table render still owns these pixels; store only the cell bounds.
+                if not graphic and not c['glyphs'] and not BeautifulSoup(content,'html.parser').get_text(strip=True) and not BeautifulSoup(content,'html.parser').find(['img','math']):
                     b=[c['bbox'][0]+1,c['bbox'][1]+1,c['bbox'][2]-1,c['bbox'][3]-1]
                     pixels=(max(0,math.floor((b[0]-region[0])/sx)),max(0,math.floor((b[1]-region[1])/sy)),
                             min(width,math.ceil((b[2]-region[0])/sx)),min(height,math.ceil((b[3]-region[1])/sy)))
@@ -4440,12 +4431,9 @@ class NativeTableReader:
                         horizontal=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((1,max(8,round(ink.shape[1]*.7))),np.uint8))
                         vertical=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((max(8,round(ink.shape[0]*.7)),1),np.uint8))
                         non_grid=cv2.bitwise_and(ink,cv2.bitwise_not(cv2.bitwise_or(horizontal,vertical)))
-                    if non_grid.size and cv2.countNonZero(non_grid)>=8:
-                        retained_image=BeautifulSoup(image_html(source_image.crop(pixels),b[2]-b[0],'cell'),'html.parser').img
-                        retained_image['data-source-cell']='true'
-                        content=str(retained_image)
+                    if non_grid.size and non_grid.any():
                         retained.append(dict(row=y,column=c['column'],bbox=b,basis='nonempty_scan_cell_without_positioned_text'))
-                        diagnostic_event('SCAN_NONEMPTY_CELL_RASTER_RETAINED',page=page_no,row=y,column=c['column'],bbox=b)
+                        diagnostic_event('SCAN_CELL_BOUNDS_RETAINED',page=page_no,row=y,column=c['column'],bbox=b)
                 if retained and retained[-1].get('row') == y and retained[-1].get('column') == c['column']:
                     cell_columns = set(range(c['column'],c['column']+c['column_span']))
                     source_headers = [BeautifulSoup(h['html'],'html.parser').get_text(' ',strip=True)
@@ -9591,6 +9579,7 @@ def export_local_html(args, result, normalized, orientation, source):
             +manifest.get('primary_cell_reconciliation_reviews',[])
             +manifest.get('scan_formula_source_reviews',[])
             +manifest.get('typed_cell_ocr_reviews',[])
+            +manifest.get('unresolved_table_cells',[])
             +manifest.get('table_assembly_reviews',[])
             +manifest.get('table_image_provenance_reviews',[])]
         from docling_pdf_review import annotate_primary_reviews

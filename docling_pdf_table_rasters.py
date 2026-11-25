@@ -107,6 +107,8 @@ def _complete_source_cells(entry, api, preview_assets=()):
         return False
     position = lambda c: tuple(c[k] for k in ('row','column','row_span','column_span'))
     physical = geometry.get('cells') or []
+    if any(cell.get('unresolved_typed_content') for cell in physical):
+        return False
     try:
         same_cells = {position(c) for c in physical} == {position(c) for c in profile.get('cells', [])}
     except (KeyError, TypeError):

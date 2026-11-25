@@ -577,7 +577,7 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
 
     def has_payload(key):
         node = nodes[key]
-        return bool(node.get_text(strip=True) or node.find(['img', 'math']))
+        return bool(node.get_text(strip=True) or node.find(['img', 'math']) or physical[key].get('scan_layout_has_ink'))
 
     proposals, unresolved = {}, []
     from docling_pdf_grid_ocr import grid_batch_enabled, read_confirmed_cells, source_cell_ink
@@ -597,8 +597,9 @@ def recover_missing_mixed_text(native, source_image, region, page, args, manifes
                       if (asset.get('row'), asset.get('column')) == key[:2]]
             images = node.find_all('img')
             if images or assets:
-                if (len(images) != 1 or len(assets) != 1
-                        or images[0].get('data-source-cell') != 'true'
+                if (len(assets) != 1 or len(images) > 1
+                        or (images and images[0].get('data-source-cell') != 'true')
+                        or (not images and not cell.get('scan_layout_has_ink'))
                         or node.get_text(strip=True)
                         or assets[0].get('basis') not in {
                             'nonempty_scan_cell_without_positioned_text',

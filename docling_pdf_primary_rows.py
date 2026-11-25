@@ -96,10 +96,8 @@ def _align_primary_header(fragment, geometry, target, api):
 
 
 def quarantine_scan_text(fragment, geometry, image, region, page, api):
-    """A page scan's hidden OCR supplies geometry, never published text."""
+    """Queue original cell bounds for OCR without encoding a picture of each cell."""
     from docling_pdf_table_layout import grid_ink
-    from docling_pdf_table_content import _source_crop
-    import cv2
 
     geometry = deepcopy(geometry)
     geometry['page_scan_transcription_required'] = True
@@ -108,36 +106,35 @@ def quarantine_scan_text(fragment, geometry, image, region, page, api):
     cells = {tuple(cell[k] for k in POSITION): cell for cell in geometry['cells']}
     nodes = [node for node in parsed.table.find_all(['td', 'th']) if node.find_parent('table') is parsed.table]
     ink = grid_ink(image, region, geometry['x_grid'])
+    previous = {(entry['row'], entry['column']): entry for entry in geometry.get('retained_cell_images', [])}
     retained = []
     for node, position in zip(nodes, profile['cells']):
         cell = cells[tuple(position[k] for k in POSITION)]
         # These characters are lookup coordinates only. Every eventual output
         # character must come from primary OCR or a new source-pixel reading.
-        cell['scan_layout_text'] = node.get_text('\n', strip=True)
+        cell['scan_layout_text'] = '' if geometry.get('hidden_ocr_direction_conflict') else node.get_text('\n', strip=True)
         box = cell['bbox']
-        crop = _source_crop(image, region, box)
-        try:
-            if ink is None:
-                visible = True
-            else:
-                left = max(0, math.ceil((box[0]-region[0]+.7)*ink['sx']))
-                top = max(0, math.ceil((box[1]-region[1]+.7)*ink['sy']))
-                right = min(image.width, math.floor((box[2]-region[0]-.7)*ink['sx']))
-                bottom = min(image.height, math.floor((box[3]-region[1]-.7)*ink['sy']))
-                residual = ink['nongrid'][top:bottom, left:right]
-                _, _, components, _ = cv2.connectedComponentsWithStats(residual, 8) if residual.size else (None, None, [], None)
-                visible = any(component[4] >= 3 for component in components[1:])
-            payload = api.image_html(crop, box[2]-box[0], 'cell') if visible else ''
-        finally:
-            crop.close()
+        visible = True
+        if ink is not None:
+            left = max(0, math.floor((box[0]-region[0])*ink['sx']))
+            top = max(0, math.floor((box[1]-region[1])*ink['sy']))
+            right = min(image.width, math.ceil((box[2]-region[0])*ink['sx']))
+            bottom = min(image.height, math.ceil((box[3]-region[1])*ink['sy']))
+            residual = ink['nongrid'][top:bottom, left:right]
+            visible = not residual.size or bool(residual.any())
         node.clear()
-        if payload:
-            picture = BeautifulSoup(payload, 'html.parser').img
-            picture['data-source-cell'] = 'true'
-            node.append(picture)
-            retained.append(dict(row=position['row'], column=position['column'], bbox=list(box),
-                                 basis='visible_scan_pixels_without_hidden_ocr_authority'))
-        cell.update(html=node.decode_contents(), text='', source_text_unreliable=True)
+        asset = previous.get((position['row'], position['column']), {})
+        drawing = asset.get('basis') == 'connected_source_strokes_over_ocr_text'
+        visible = visible or drawing
+        if visible:
+            entry = (dict(asset) if drawing else dict(row=position['row'], column=position['column'],
+                     bbox=list(box), basis='visible_scan_pixels_without_hidden_ocr_authority'))
+            if geometry.get('hidden_ocr_direction_conflict'):
+                entry.pop('source_column_context', None)
+            elif 'source_column_context' in asset:
+                entry['source_column_context'] = asset['source_column_context']
+            retained.append(entry)
+        cell.update(html='', text='', source_text_unreliable=True)
         cell['scan_layout_has_ink'] = visible
         cell.pop('positioned_source_text', None)
     geometry['retained_cell_images'] = retained

@@ -106,9 +106,6 @@ def _text_bands(image):
     return lines
 
 
-UNCONFIRMED_LINE = '<span class="table-cell-review" data-ocr-review="true">[Строка не распознана]</span>'
-
-
 def _line_views(source, bands):
     """Give each band its own source pixels and no neighboring glyphs."""
     import cv2
@@ -213,7 +210,7 @@ def recover_vertical_cell_text(image, args, page, position, box, api):
 
 
 def recover_typed_text_lines(image, args, page, position, api):
-    """Read verified prose bands independently and disclose any unconfirmed lines."""
+    """Publish readable prose bands and record unreadable bands by their source position."""
     if image.height < 60:
         return None
     interior = measured_cell_interior(image)
@@ -241,7 +238,6 @@ def recover_typed_text_lines(image, args, page, position, api):
                 contents.append(html)
                 responses.append(digest)
             else:
-                contents.append(UNCONFIRMED_LINE)
                 responses.append(None)
                 top, bottom = bands[index - 1]
                 unresolved.append(dict(line=index, pixel_band=[top + pixels[1], bottom + pixels[1]],

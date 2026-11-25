@@ -629,7 +629,8 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
                    any((p.get('row'), p.get('column')) == key[:2] for p in local_graphics) or
                    any(owns_graphic(p) for p in protected) or
                    (not cell.get('header') and bool(columns & graphic_columns)) or
-                   any(e.get('source_column_context', {}).get('graphic_column') or
+                   any(e.get('basis') == 'connected_source_strokes_over_ocr_text' or
+                       e.get('source_column_context', {}).get('graphic_column') or
                        e.get('source_column_context', {}).get('dimension_column') for e in entries))
         if len(choices) != 1:
             conflict = dict(page=page, row=key[0], column=key[1], reason='primary_readings_disagree',
@@ -674,6 +675,9 @@ def preserve_primary_cells(fragment, geometry, primary_records, region, page, ma
                                for index, part in enumerate(parts))
             else:
                 mixed_unresolved = 'primary_graphic_placeholders_do_not_match_source_assets'
+        elif graphic and not images and source.get('scan_layout_has_ink') and not source.get('primary_ocr'):
+            # A primary text packet alone does not account for a drawing in the same cell.
+            mixed_unresolved = 'primary_graphic_order_not_proven'
         elif graphic and images:
             # With no OCR placeholder, only exact editable content agreement
             # proves that retaining the existing interleaving is lossless.

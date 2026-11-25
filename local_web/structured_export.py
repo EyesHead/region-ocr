@@ -308,7 +308,7 @@ def _formula_crop_tag(doc, formula):
     return image
 
 
-def _latex_markdown(node, *, display=False):
+def _latex_markdown(node, *, display=False, render_html=str):
     try:
         latex = math_to_latex(node)
         if not latex:
@@ -316,7 +316,7 @@ def _latex_markdown(node, *, display=False):
     except UnsupportedMath:
         if crop := _formula_crop_path(node):
             return '![Формула из PDF](<' + crop + '>)'
-        return str(node)
+        return render_html(node)
     if display:
         return '$$\n' + latex + '\n$$'
     return '$' + re.sub(r'\s*[\r\n]+\s*', ' ', latex) + '$'
@@ -437,16 +437,16 @@ def _escape_markdown(text):
     return text
 
 
-def _inline_md(node):
+def _inline_md(node, render_html=str):
     if isinstance(node, Comment):
         return ''
     if isinstance(node, NavigableString):
         return _escape_markdown(str(node))
     if node.name == 'math':
-        return _latex_markdown(node)
+        return _latex_markdown(node, render_html=render_html)
     if node.name in {'span', 'div'} and node.get('data-formula') and not node.find('math'):
         tex = _without_math_delimiters(node.get('data-latex') or node.get_text().strip())
-        return '$' + tex + '$' if tex else str(node)
+        return '$' + tex + '$' if tex else render_html(node)
     if node.name == 'img':
         alt = _escape_markdown(node.get('alt', ''))
         path = str(node.get('src', '')).replace('>', '%3E').replace('<', '%3C')
@@ -454,9 +454,9 @@ def _inline_md(node):
     if node.name == 'br':
         return '<br>'
     if node.name in {'ol', 'ul'}:
-        return '<br>'.join(marker + ' ' + ''.join(_inline_md(child) for child in item.children).strip()
+        return '<br>'.join(marker + ' ' + ''.join(_inline_md(child, render_html) for child in item.children).strip()
                           for item, _, marker in _list_entries(node))
-    text = ''.join(_inline_md(child) for child in node.children)
+    text = ''.join(_inline_md(child, render_html) for child in node.children)
     if node.name in {'strong', 'b'}:
         return '**' + text + '**'
     if node.name in {'em', 'i'}:
@@ -473,7 +473,7 @@ def _inline_md(node):
         path = str(node['href']).replace('>', '%3E').replace('<', '%3C').replace('\n', '%0A').replace('\r', '%0D')
         return '[' + text + '](<' + path + '>)'
     if node.name == 'table':
-        return _table_md(node)
+        return _table_md(node, render_html)
     if node.name in BLOCK_TAGS:
         return text + '<br>'
     return text
@@ -506,7 +506,7 @@ def _display_parts(node):
             yield False, fragment
 
 
-def _markdown_flow(nodes):
+def _markdown_flow(nodes, render_html=str):
     chunks, inline = [], []
     equation_number = None
 
@@ -525,15 +525,15 @@ def _markdown_flow(nodes):
     for node in nodes:
         for display, part in _display_parts(node):
             if not display:
-                inline.append(_inline_md(part))
+                inline.append(_inline_md(part, render_html))
                 continue
             flush()
             math = part if part.name == 'math' else part.find('math')
             if math is not None:
-                rendered = _latex_markdown(math, display=True)
+                rendered = _latex_markdown(math, display=True, render_html=render_html)
             else:
                 tex = _without_math_delimiters(part.get('data-latex') or part.get_text().strip())
-                rendered = '$$\n' + tex + '\n$$' if tex else str(part)
+                rendered = '$$\n' + tex + '\n$$' if tex else render_html(part)
             chunks.append(rendered)
             number = re.search(r'\\tag\*?\{([\dА-Яа-яA-Za-z.\-]+)\}', rendered)
             equation_number = number[1] if number else None
@@ -541,10 +541,10 @@ def _markdown_flow(nodes):
     return '\n\n'.join(chunks)
 
 
-def _table_md(table):
+def _table_md(table, render_html=str):
     rows, entries, width = _grid(table)
     caption = table.find('caption', recursive=False)
-    prefix = _inline_md(caption).strip() + '\n\n' if caption else ''
+    prefix = _inline_md(caption, render_html).strip() + '\n\n' if caption else ''
     has_header = any(entry['row'] == 0 and entry['node'].name == 'th' for entry in entries)
     # Nested tables have their own layout; a pipe cell cannot represent it.
     complex_table = (table_is_complex(table) or table.find('table') is not None
@@ -574,12 +574,12 @@ def _table_md(table):
                 original = formula.get('data-latex') or formula.get_text().strip()
                 formula.string = _without_math_delimiters(original)
         # Caption remains part of the HTML table, not duplicated before it.
-        return str(clone)
+        return render_html(clone)
     if not rows or not width:
         return prefix
     matrix = [[''] * width for _ in rows]
     for entry in entries:
-        value = _inline_md(entry['node']).strip()
+        value = _inline_md(entry['node'], render_html).strip()
         value = re.sub(r'\s*\n\s*', '<br>', value).replace('|', '\\|')
         value = re.sub(r'(?:<br>)+$', '', value)
         matrix[entry['row']][entry['col']] = value
@@ -590,7 +590,7 @@ def _table_md(table):
     return prefix + '\n'.join([line(header), line(['---'] * width), *(line(row) for row in matrix)])
 
 
-def _markdown_blocks(container, indent=''):
+def _markdown_blocks(container, indent='', render_html=str):
     output = []
     for node in _block_children(container):
         if isinstance(node, Comment):
@@ -602,15 +602,15 @@ def _markdown_blocks(container, indent=''):
         if node.name in {'style', 'title', 'meta', 'head', 'script'}:
             continue
         if node.name == 'details' and node.has_attr('data-pdf-formula-transcript'):
-            output.append(str(node))
+            output.append(render_html(node))
         elif _display_equation(node):
-            output.append(_markdown_flow([node]))
+            output.append(_markdown_flow([node], render_html))
         elif node.name in BLOCK_TAGS and INDENT_STYLE.search(node.get('style', '')):
-            output.append(str(node))
+            output.append(render_html(node))
         elif node.name == 'table':
-            output.append(_table_md(node))
+            output.append(_table_md(node, render_html))
         elif re.fullmatch('h[1-6]', node.name):
-            output.append('#' * int(node.name[1]) + ' ' + _inline_md(node).strip())
+            output.append('#' * int(node.name[1]) + ' ' + _inline_md(node, render_html).strip())
         elif node.name in {'ul', 'ol'}:
             lines = []
             for item, number, marker in _list_entries(node):
@@ -618,10 +618,10 @@ def _markdown_blocks(container, indent=''):
                 content = []
                 for child in item.children:
                     if getattr(child, 'name', None) in {'ul', 'ol'}:
-                        nested.append(_markdown_blocks(BeautifulSoup(str(child), 'html.parser'), indent + '    '))
+                        nested.append(_markdown_blocks(BeautifulSoup(str(child), 'html.parser'), indent + '    ', render_html))
                     else:
                         content.append(child)
-                first, *rest = _markdown_flow(content).split('\n')
+                first, *rest = _markdown_flow(content, render_html).split('\n')
                 continuation = indent + ' ' * max(4, len(marker) + 1)
                 if first == '$$':
                     lines.extend([indent + marker, continuation + first])
@@ -635,24 +635,24 @@ def _markdown_blocks(container, indent=''):
             fence = '`' * max(3, max((len(part)+1 for part in re.findall(r'`+', text)), default=3))
             output.append(fence + '\n' + text + '\n' + fence)
         elif node.name == 'blockquote':
-            output.append('\n'.join('> ' + line for line in _markdown_blocks(node).splitlines()))
+            output.append('\n'.join('> ' + line for line in _markdown_blocks(node, render_html=render_html).splitlines()))
         elif node.name in BLOCK_TAGS - {'p'} or node.name in {'figure', 'figcaption', 'li'}:
             if node.name == 'section' and node.get('data-text-method') in {'native', 'ocr', 'blank'}:
                 page = node.get('data-source-page', '')
                 if re.fullmatch(r'[1-9][0-9]*', page) and node.get('id') == 'page-' + page:
                     output.append(f'<!-- pdf-page: {page} -->')
-            output.append(_markdown_blocks(node, indent))
+            output.append(_markdown_blocks(node, indent, render_html))
         elif node.name == 'hr':
             output.append('---')
         elif node.name == 'p':
-            output.append(_markdown_flow(node.children))
+            output.append(_markdown_flow(node.children, render_html))
         else:
-            output.append(_inline_md(node).strip())
+            output.append(_inline_md(node, render_html).strip())
     return '\n\n'.join(item for item in output if item).strip('\n')
 
 
-def to_markdown(soup):
-    return _markdown_blocks(soup.body or soup) + '\n'
+def to_markdown(soup, *, render_html=str):
+    return _markdown_blocks(soup.body or soup, render_html=render_html) + '\n'
 
 
 def _rich(node):

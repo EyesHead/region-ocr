@@ -339,7 +339,7 @@ def _safe_html(content: str):
 
 def export_formats(content: str, source: Path, destination: Path, *, pages=None,
                    output_format=None, resource_root=None, initial_warnings=(), fast_pdf_stats=None,
-                   fast_assets=None) -> dict:
+                   fast_assets=None, quality_pdf=False) -> dict:
     """Export requested bundles; None retains the explicit library all-formats API."""
     soup, warnings = _safe_html(content)
     if __package__:
@@ -349,7 +349,7 @@ def export_formats(content: str, source: Path, destination: Path, *, pages=None,
     result = build_exports(str(soup), source, destination, pages=pages,
                            output_format=output_format, resource_root=resource_root,
                            initial_warnings=list(initial_warnings) + warnings, fast_pdf_stats=fast_pdf_stats,
-                           fast_assets=fast_assets)
+                           fast_assets=fast_assets, quality_pdf=quality_pdf)
     return result
 
 
@@ -610,7 +610,8 @@ def convert_file(source: Path, destination: Path, *, pages: str = '',
         on_progress(94, 'Подготовка папки результата и изображений')
     result = export_formats(content, source, destination, pages=page_count,
                             output_format=output_format, resource_root=resource_root,
-                            initial_warnings=warnings, fast_pdf_stats=fast_stats, fast_assets=fast_assets)
+                            initial_warnings=warnings, fast_pdf_stats=fast_stats, fast_assets=fast_assets,
+                            quality_pdf=source.suffix.lower() == '.pdf' and pdf_mode == 'quality')
     if technical_status:
         result['technical_status'] = technical_status
     _check_cancel(cancel_event)

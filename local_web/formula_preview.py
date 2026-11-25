@@ -9,9 +9,11 @@ import re
 import shutil
 
 if __package__:
+    from . import quality_html
     from .assets import _read_reference, MAX_IMAGE_PIXELS
     from .file_paths import native_path, normal_path
 else:
+    import quality_html
     from assets import _read_reference, MAX_IMAGE_PIXELS
     from file_paths import native_path, normal_path
 
@@ -58,7 +60,7 @@ class FormulaComparisons:
             elif group.get('data-formula-warning'):
                 self.warnings.append(f'Страница PDF {page}. Проверьте распознавание формулы по оригиналу в предпросмотре.')
 
-    def write(self, soup, replay):
+    def write(self, soup, replay, *, sources=None):
         """Use the externalized ordinary images in both views and retain only math in the canonical."""
         if not self.items:
             return None
@@ -68,7 +70,10 @@ class FormulaComparisons:
             _owned_file(replay, CROP_DIR, digest + '.png').write_bytes(data)
         for group, details in self.items:
             group.append(details)
-        preview = str(soup).encode('utf-8')
+        if sources is None:
+            preview = str(soup).encode('utf-8')
+        else:
+            preview = quality_html.render_quality_html(soup, sources=sources).encode('utf-8')
         _owned_file(replay, PREVIEW_NAME).write_bytes(preview)
         for group, details in self.items:
             details.decompose()
@@ -125,7 +130,7 @@ def copy_preview(canonical, target, info):
         shutil.copyfile(origin, native_path(target / CROP_DIR / origin.name))
 
 
-def migration_content(canonical, info, soup):
+def migration_content(canonical, info, soup, *, preview_sources=None):
     """Carry comparison evidence into another canonical when its document schema changes."""
     from bs4 import BeautifulSoup
 
@@ -133,6 +138,8 @@ def migration_content(canonical, info, soup):
         return str(soup)
     root = normal_path(canonical).parent
     preview = BeautifulSoup(preview_file(root, info).read_text('utf-8'), 'html.parser')
+    if preview_sources is not None:
+        quality_html.restore_quality_sources(preview, preview_sources)
     for image in preview.select('details[data-preview-only="formula-source"] img'):
         match = re.fullmatch(r'formula-src/([a-f0-9]{64})\.png', image.get('src', ''))
         if not match:

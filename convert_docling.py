@@ -9715,7 +9715,7 @@ def discover_files(input_dir):
                 yield path
 
 
-def finalize_published_html(path, content):
+def finalize_published_html(path, content, *, quality_pdf=False):
     """Finalize user-facing HTML only after all source-evidence repairs."""
     from bs4 import BeautifulSoup
     from local_web.assets import externalize_images
@@ -9761,13 +9761,16 @@ def finalize_published_html(path, content):
     diagnostic_event('HTML_PUBLICATION_FINALIZED', path=path, schema=7,
                      images=len(assets.get('assets', [])), warnings=assets.get('warnings', []),
                      table_note_warnings=note_warnings)
+    if quality_pdf:
+        from local_web.quality_html import compact_quality_html
+        compact_quality_html(soup)
     return str(soup)
 
 
-def write_atomic(path, content):
+def write_atomic(path, content, *, quality_pdf=False):
     path = Path(path)
     if path.suffix.lower() == '.html':
-        content = finalize_published_html(path, strip_html_hyperlinks(content))
+        content = finalize_published_html(path, strip_html_hyperlinks(content), quality_pdf=quality_pdf)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         diagnostic_event('OUTPUT_WRITE_BEGIN',path=path,temporary=temporary,characters=len(content))
@@ -10558,7 +10561,8 @@ def convert_document(args, converter, source):
                 if not getattr(args, 'desktop_output', False):
                     from docling_pdf_review import write_quality_report
                     publication = write_quality_report(Path(f'{base}.html'),source,quality,sys.modules[__name__])
-                write_atomic(Path(f"{base}.html"), content)
+                # The desktop packager still needs source ownership for JSON, joins and previews.
+                write_atomic(Path(f"{base}.html"), content, quality_pdf=not getattr(args, 'desktop_output', False))
             except Exception as error:
                 artifacts = write_failure_artifacts(source, args, sys.modules[__name__], error,
                     document=result.document, content=content)

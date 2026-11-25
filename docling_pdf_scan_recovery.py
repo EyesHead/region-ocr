@@ -48,7 +48,7 @@ def join_broken_scan_rules(edges):
     return result, proofs
 
 
-def read_source_scan_grid(reader, regions, page, bounds, reference_fragments=(), api=None):
+def read_source_scan_grid(reader, regions, page, bounds, reference_fragments=(), api=None, *, primary_records=()):
     """Return a source grid and its exact rendered ROI, owned by the caller.
 
     Scanner boxes run through rule centres. Cropping on those centres can cut
@@ -71,15 +71,17 @@ def read_source_scan_grid(reader, regions, page, bounds, reference_fragments=(),
         return None
     image = regions.crop(page, roi)
     try:
+        record_args = {'primary_records': primary_records} if primary_records else {}
         detailed = reader.read_raster_table(page, roi, image, reference_fragments,
-                                            _short_rules=True, source_bounds=bounds)
+                                            _short_rules=True, source_bounds=bounds, **record_args)
         native = None
         if detailed and detailed[1].get('source_grid_verified'):
             profile = api.table_profile(detailed[0]) if api is not None else None
             if profile is None or not profile.get('issues'):
                 native = detailed
         if native is None:
-            native = reader.read_raster_table(page, roi, image, reference_fragments, source_bounds=bounds)
+            native = reader.read_raster_table(page, roi, image, reference_fragments,
+                                              source_bounds=bounds, **record_args)
         if native is None:
             image.close()
             return None

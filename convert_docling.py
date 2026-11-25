@@ -2774,7 +2774,25 @@ def cell_text_key(text):
     return re.sub(r"(?<=[A-Za-zА-Яа-яЁё])[-\u00ad](?=[A-Za-zА-Яа-яЁё])", "", text)
 
 
-def scan_header_direction_evidence(cells, reference_profiles):
+def _quarter_turned_scan_glyph(glyph):
+    matrix = glyph.get('matrix')
+    if matrix is None or len(matrix) < 4:
+        return False
+    a, b, c, d = matrix[:4]
+    return abs(b) > max(abs(a) * 3, 1e-5) and abs(c) > max(abs(d) * 3, 1e-5)
+
+
+def _distributed_scan_turn(cells, fraction):
+    glyphs = [g for cell in cells for g in cell['glyphs'] if g['text'].strip()]
+    if len(glyphs) < 40 or sum(map(_quarter_turned_scan_glyph, glyphs)) < fraction * len(glyphs):
+        return False
+    affected = [c for c in cells if sum(_quarter_turned_scan_glyph(g)
+                for g in c['glyphs'] if g['text'].strip()) >= 3]
+    return (len(affected) >= 4 and len({c['row'] for c in affected}) >= 2
+            and len({c['column'] for c in affected}) >= 2)
+
+
+def scan_header_direction_evidence(cells, reference_profiles, *, direction_conflict=False):
     """Disprove a scan's old text layer on numbered, otherwise blank forms.
 
     This supplements the body-row check: many normative forms consist ONLY
@@ -2801,20 +2819,14 @@ def scan_header_direction_evidence(cells, reference_profiles):
                 blank_form = blank_form or all(c['column'] == 0 and c['column_span'] >= len(values)
                                                and re.search(r'[А-Яа-яЁёA-Za-z]{3}', text(c)) for c in below)
     glyphs = [g for cell in cells for g in cell.get('glyphs', ()) if g['text'].strip()]
-    def turned(g):
-        matrix = g.get('matrix')
-        if matrix is None or len(matrix) < 4:
-            return False
-        a, b, c, d = matrix[:4]
-        return abs(b) > max(abs(a)*3, 1e-5) and abs(c) > max(abs(d)*3, 1e-5)
-    count = sum(turned(g) for g in glyphs)
+    count = sum(map(_quarter_turned_scan_glyph, glyphs))
     affected = []
     for cell in cells:
         local = [g for g in cell.get('glyphs', ()) if g['text'].strip()]
-        rotated = sum(turned(g) for g in local)
+        rotated = sum(map(_quarter_turned_scan_glyph, local))
         if rotated >= 3:
             affected.append(cell)
-    affected_glyphs = sum(sum(turned(g) for g in c.get('glyphs', ()) if g['text'].strip()) for c in affected)
+    affected_glyphs = sum(sum(_quarter_turned_scan_glyph(g) for g in c.get('glyphs', ()) if g['text'].strip()) for c in affected)
     native = cell_text_key(' '.join(text(c) for c in cells))
     anchors = {cell_text_key(text(c)) for p in reference_profiles for c in p['cells']
                if len(text(c).strip()) >= 8 and re.search(r'[А-Яа-яЁёA-Za-z]{3}', text(c))}
@@ -2825,7 +2837,7 @@ def scan_header_direction_evidence(cells, reference_profiles):
     # Ordinary filled-in tables keep the stricter body-row check.
     conflict = bool(numbered and blank_form and affected_glyphs >= 40
                     and len(affected) >= 3 and len({c['column'] for c in affected}) >= 3
-                    and len(different) >= 2 and not mixed)
+                    and (direction_conflict or len(different) >= 2) and not mixed)
     return dict(conflict=conflict, numbered_columns=sorted(set(numbered)), blank_form=blank_form,
                 glyphs=len(glyphs), quarter_turned_glyphs=count, affected_cells=len(affected),
                 different_fresh_text_cells=len(different), mixed_reference_graphics=mixed)
@@ -3968,11 +3980,30 @@ class NativeTableReader:
         Keep evidence across page loads: scan discovery can inspect later pages
         before the exporter returns to the first table of the same document.
         """
-        return any(entry['page']==page_no and overlap_ratio(entry['bbox'],region)>.6
-                   for entry in getattr(self,'raster_text_direction_conflicts',()))
+        area = max(0, region[2] - region[0]) * max(0, region[3] - region[1])
+        for entry in getattr(self, 'raster_text_direction_conflicts', ()):
+            if entry['page'] != page_no:
+                continue
+            box = entry['bbox']
+            width = max(0, min(box[2], region[2]) - max(box[0], region[0]))
+            height = max(0, min(box[3], region[3]) - max(box[1], region[1]))
+            if width * height > .6 * area:
+                return True
+        return False
+
+    def _record_scan_direction_conflict(self, entry):
+        conflicts = getattr(self, 'raster_text_direction_conflicts', None)
+        if conflicts is None:
+            self.raster_text_direction_conflicts = conflicts = []
+        existing = next((old for old in conflicts if old['page'] == entry['page']
+                         and all(abs(a - b) < .1 for a, b in zip(old['bbox'], entry['bbox']))), None)
+        if existing is None:
+            conflicts.append(entry)
+        else:
+            existing.update(entry)
 
     def read_raster_table(self, page_no, region, source_image, reference_fragments=(), *, _header_rules=False,
-                          _short_rules=False, source_bounds=None):
+                          _short_rules=False, source_bounds=None, primary_records=()):
         """Recover scan cells and illustrations without depending on headings."""
         import cv2
         import numpy as np
@@ -4035,7 +4066,8 @@ class NativeTableReader:
                              and abs(e['top']-source_bounds[side]) <= padding+sy]
                     if outer and rails:
                         low, high = sorted((position, min(rails, key=lambda y: abs(y-position))))
-                        if not any(g['text'].strip() and left <= (g['x0']+g['x1'])/2 <= right
+                        if not any(g['text'].strip() and not _quarter_turned_scan_glyph(g)
+                                   and left <= (g['x0']+g['x1'])/2 <= right
                                    and low < (g['top']+g['bottom'])/2 < high for g in self.chars):
                             continue
                 if (min(abs(position-region[1]),abs(position-region[3]))<3
@@ -4043,7 +4075,12 @@ class NativeTableReader:
                                     and e['width'] >= .98*(right-left) for e in edges)):
                     edges.append(dict(x0=left,x1=right,top=position,bottom=position,
                                       width=right-left,height=0,orientation='h'))
-        edges=merge_edges(edges,2,2,3,3)
+        from docling_pdf_scan_axes import remove_text_axes
+        snap_tolerance = 2
+        edges, removed_text_axes = remove_text_axes(edges, mask, region, sx, sy, snap_tolerance)
+        for proof in removed_text_axes:
+            diagnostic_event('SCAN_GLYPH_STEMS_EXCLUDED_FROM_GRID', page=page_no, **proof)
+        edges=merge_edges(edges,snap_tolerance,2,3,3)
         from docling_pdf_scan_recovery import join_broken_scan_rules
         edges, broken_rule_proofs = join_broken_scan_rules(edges)
         for proof in broken_rule_proofs:
@@ -4076,6 +4113,14 @@ class NativeTableReader:
                     if (yy,xx) in source_slots:source_overlap=True
                     source_slots[yy,xx]=True
         complete_source_grid=(not source_overlap and len(source_slots)==(len(xs)-1)*(len(ys)-1))
+        direction_cells = cells
+        hidden_rotated_layer = (_header_rules or self.has_raster_text_direction_conflict(page_no, region)
+                                or _distributed_scan_turn(direction_cells, .6)
+                                or _distributed_scan_turn([c for c in direction_cells if c['row'] >= 1], .75))
+        if hidden_rotated_layer:
+            # Keep the old layer only for direction diagnostics. It cannot
+            # define a header, repair a span or classify the contents of a cell.
+            cells = [dict(c, glyphs=[], html='', source_text_unreliable=True) for c in direction_cells]
         first=[c for c in cells if c['row']==0]
         # An all-height side label spans body records as well as any headings.
         # The other first-row cells still establish ordinary and grouped headers.
@@ -4088,29 +4133,18 @@ class NativeTableReader:
         if (any(c['column']==0 and c['row_span']>=3 for c in head_band)
                 and any(c['column']>0 and c['column_span']>=max(2,(len(xs)-1)/2) for c in first)):
             header_rows=max(header_rows,max(c['row_span'] for c in head_band))
-        def quarter_turned(glyph):
-            matrix=glyph.get('matrix')
-            if matrix is None or len(matrix)<4:return False
-            a,b,c,d=matrix[:4]
-            return abs(b)>max(abs(a)*3,1e-5) and abs(c)>max(abs(d)*3,1e-5)
-        all_glyphs=[g for c in cells for g in c['glyphs'] if g['text'].strip()]
-        rotated_cells=[c for c in cells if sum(quarter_turned(g) for g in c['glyphs'] if g['text'].strip())>=3]
-        hidden_rotated_layer=(len(all_glyphs)>=40 and sum(map(quarter_turned,all_glyphs))>=.6*len(all_glyphs)
-            and len(rotated_cells)>=4 and len({c['row'] for c in rotated_cells})>=2
-            and len({c['column'] for c in rotated_cells})>=2)
-        # A directionally invalid hidden layer must not nominate ink inside
-        # a visibly blank double-rule band. Retain real source pixels as the
-        # deciding evidence, while preserving glyph data for conflict checks.
-        alignment_cells=([dict(c,glyphs=[]) for c in cells] if hidden_rotated_layer else cells)
-        graphic_columns=set()
-        for c in cells:
-            if c['row']<header_rows and re.search(r'изображен|эскиз|схема|чертеж|drawing|sketch|diagram',BeautifulSoup(c['html'],'html.parser').get_text(),re.I):
-                graphic_columns.update(range(c['column'],c['column']+c['column_span']))
-        dimension_columns={c['column'] for c in cells if c['row']<header_rows and graphic_columns
-                           and re.search(r'размер|dimension',BeautifulSoup(c['html'],'html.parser').get_text(),re.I)}
         reference_profiles=[]
-        raw_reference_graphics=False
-        for raw in reference_fragments:
+        raw_reference_graphics=any(re.search(r'<(?:img|svg)\b', raw, re.I) for raw in reference_fragments)
+        grid_references = reference_fragments
+        if hidden_rotated_layer:
+            from docling_pdf_primary import _same_region
+            bounds = [xs[0], ys[0], xs[-1], ys[-1]]
+            grid_references = [r['html'] for r in primary_records if r.get('page_no') == page_no
+                and r.get('label') in {'Table', 'TableOfContents'} and '<table' in r.get('html', '').lower()
+                and isinstance(r.get('bbox'), (list, tuple)) and len(r['bbox']) == 4
+                and all(isinstance(v, (int, float)) and math.isfinite(v) for v in r['bbox'])
+                and _same_region(r['bbox'], bounds)]
+        for raw in grid_references:
             try:
                 ref=clean_table_html(raw)
                 parsed=BeautifulSoup(ref,'html.parser');ref_rows=parsed.table.find_all('tr')
@@ -4123,7 +4157,7 @@ class NativeTableReader:
                     for row in tails:row.decompose()
                     ref=str(parsed.table)
                 from docling_pdf_structure import align_source_reference_grid
-                ref, source_grid_alignment = align_source_reference_grid(ref, alignment_cells, source_image,
+                ref, source_grid_alignment = align_source_reference_grid(ref, cells, source_image,
                     region, xs, ys, sys.modules[__name__])
                 if source_grid_alignment:
                     header_rows = max(header_rows, source_grid_alignment.get('header_rows',0))
@@ -4137,7 +4171,6 @@ class NativeTableReader:
                     if source_grid_alignment:
                         profile['source_grid_alignment'] = source_grid_alignment
                     reference_profiles.append(profile)
-                    raw_reference_graphics=raw_reference_graphics or bool(BeautifulSoup(raw,'html.parser').find('img'))
             except (ValueError,TypeError):
                 pass
         # A page scan can carry a PREVIOUS OCR layer whose writing direction
@@ -4145,12 +4178,28 @@ class NativeTableReader:
         # objects, but native_cell_lines cannot read quarter-turned glyphs as
         # horizontal prose. Do not promote that layer over a fresh OCR table.
         # This is geometric evidence, not a character/noise quality heuristic.
-        ordinary=[c for c in cells if c['row']>=max(1,header_rows)
+        if hidden_rotated_layer:
+            from docling_pdf_primary_scan import measured_header_cells
+            headings = measured_header_cells(cells, len(xs) - 1, reference_profiles)
+            header_rows = max(header_rows, max((c['row'] + 1 for c in headings), default=0))
+        else:
+            headings = [c for c in cells if c['row'] < header_rows]
+        graphic_columns = set()
+        dimension_columns = set()
+        for c in headings:
+            label = BeautifulSoup(c['html'], 'html.parser').get_text(' ', strip=True)
+            if re.search(r'изображен|эскиз|схема|чертеж|drawing|sketch|diagram', label, re.I):
+                graphic_columns.update(range(c['column'], c['column'] + c['column_span']))
+            if re.search(r'размер|dimension', label, re.I):
+                dimension_columns.add(c['column'])
+        if not graphic_columns:
+            dimension_columns.clear()
+        ordinary=[c for c in direction_cells if c['row']>=max(1,header_rows)
                   and c['column'] not in graphic_columns|dimension_columns]
         body_glyphs=[g for cell in ordinary for g in cell['glyphs'] if g['text'].strip()]
-        turned_cells=[cell for cell in ordinary if sum(quarter_turned(g) for g in cell['glyphs']
+        turned_cells=[cell for cell in ordinary if sum(_quarter_turned_scan_glyph(g) for g in cell['glyphs']
                       if g['text'].strip())>=3]
-        turned_count=sum(quarter_turned(g) for g in body_glyphs)
+        turned_count=sum(map(_quarter_turned_scan_glyph, body_glyphs))
         native_key=cell_text_key(' '.join(BeautifulSoup(cell['html'],'html.parser').get_text(' ',strip=True)
                                          for cell in ordinary))
         fresh_text_cells=[cell for profile in reference_profiles for cell in profile['cells']
@@ -4167,7 +4216,8 @@ class NativeTableReader:
                 r'изображен|эскиз|схема|чертеж|drawing|sketch|diagram',cell['text'],re.I))
             for profile in reference_profiles for cell in profile['cells'])
         if reference_profiles and not mixed_reference_graphics and not _header_rules and not _short_rules:
-            detailed=self.read_raster_table(page_no,region,source_image,reference_fragments,_short_rules=True)
+            detailed=self.read_raster_table(page_no,region,source_image,reference_fragments,_short_rules=True,
+                                            source_bounds=source_bounds, primary_records=primary_records)
             if detailed is None and self.has_raster_text_direction_conflict(page_no,region):
                 return None
             if detailed:
@@ -4187,19 +4237,21 @@ class NativeTableReader:
         body_conflict=(len(body_glyphs)>=40 and turned_count>=.75*len(body_glyphs)
                   and len(turned_cells)>=4 and len({c['row'] for c in turned_cells})>=2
                   and len({c['column'] for c in turned_cells})>=2
-                  and len(different_fresh_keys)>=2 and not mixed_reference_graphics)
-        header_evidence=scan_header_direction_evidence(cells,reference_profiles)
+                  and (hidden_rotated_layer or len(different_fresh_keys)>=2) and not mixed_reference_graphics)
+        header_evidence=scan_header_direction_evidence(direction_cells,reference_profiles,
+                                                      direction_conflict=hidden_rotated_layer)
         diagnostic_event('NATIVE_SCAN_HEADER_DIRECTION_CHECK',page_no=page_no,bbox=list(region),**header_evidence)
         conflict=body_conflict or header_evidence['conflict'] or _header_rules
-        conflict_reason=('quarter_turned_hidden_ocr_disagrees_with_fresh_table' if body_conflict
-                         else 'quarter_turned_hidden_ocr_on_numbered_blank_form')
+        conflict_reason=('quarter_turned_hidden_ocr_on_numbered_blank_form' if header_evidence['conflict'] or _header_rules
+                         else 'distributed_quarter_turned_scan_layer' if hidden_rotated_layer
+                         else 'quarter_turned_hidden_ocr_disagrees_with_fresh_table')
         diagnostic_event('NATIVE_SCAN_TEXT_DIRECTION_CHECK',page_no=page_no,bbox=list(region),
                          body_glyphs=len(body_glyphs),quarter_turned_glyphs=turned_count,
                          quarter_turned_fraction=round(turned_count/max(1,len(body_glyphs)),4),
                          affected_cells=len(turned_cells),fresh_candidate_count=len(reference_profiles),
                          different_fresh_text_cells=len(different_fresh_keys),
                          mixed_reference_graphics=bool(mixed_reference_graphics),conflict=conflict)
-        source_text_unreliable=False
+        source_text_unreliable=hidden_rotated_layer
         if body_conflict:
             # Reject the hidden OCR CONTENT, not the independently measured
             # source grid. A complete non-overlapping rectangle of physical
@@ -4218,7 +4270,8 @@ class NativeTableReader:
             # those rails too. The ordinary drawing-preserving route retains
             # its longer-line threshold.
             if header_evidence['conflict'] and not _header_rules:
-                self.read_raster_table(page_no,region,source_image,reference_fragments,_header_rules=True)
+                self.read_raster_table(page_no,region,source_image,reference_fragments,_header_rules=True,
+                                       source_bounds=source_bounds, primary_records=primary_records)
                 return None
             entry=dict(page=page_no,bbox=list(region),
                        reason=conflict_reason,
@@ -4227,12 +4280,7 @@ class NativeTableReader:
                 entry['geometry']=dict(basis='raster_numbered_header_rules',bbox=[xs[0],ys[0],xs[-1],ys[-1]],
                     x_grid=xs,y_grid=ys,header_rows=header_rows,
                     cells=[{k:v for k,v in cell.items() if k!='glyphs'} for cell in cells])
-            conflicts=getattr(self,'raster_text_direction_conflicts',None)
-            if conflicts is None:
-                self.raster_text_direction_conflicts=conflicts=[]
-            if not any(old['page']==page_no and all(abs(a-b)<.1 for a,b in zip(old['bbox'],region))
-                       for old in conflicts):
-                conflicts.append(entry)
+            self._record_scan_direction_conflict(entry)
             diagnostic_event('NATIVE_SCAN_TEXT_DIRECTION_CONFLICT',page_no=page_no,bbox=list(region),
                              reason=conflict_reason,
                              body_glyphs=len(body_glyphs),quarter_turned_glyphs=turned_count,
@@ -4241,6 +4289,16 @@ class NativeTableReader:
                              native_grid=[len(ys)-1,len(xs)-1],
                              fresh_grids=[[p['rows'],p['columns']] for p in reference_profiles])
             return None
+        if source_text_unreliable:
+            self._record_scan_direction_conflict(dict(page=page_no, bbox=[xs[0],ys[0],xs[-1],ys[-1]],
+                reason=conflict_reason, body_glyphs=len(body_glyphs), quarter_turned_glyphs=turned_count))
+        if primary_records and _short_rules and complete_source_grid and not mixed_reference_graphics:
+            from docling_pdf_primary_scan import reuse_scan_primary
+            exact = reuse_scan_primary(cells, xs, ys, source_image, region, page_no, primary_records,
+                                       self, sys.modules[__name__],
+                                       direction_conflict=hidden_rotated_layer or source_text_unreliable)
+            if exact:
+                return exact
         references=[dict(cell,_reference=i,_source_grid_aligned=bool(profile.get('source_grid_alignment')))
                     for i,profile in enumerate(reference_profiles)
                     if profile['rows']==len(ys)-1 and profile['columns']==len(xs)-1
@@ -4498,7 +4556,7 @@ class NativeTableReader:
                              empty_cell_rule_proofs=empty_cell_rule_proofs,
                              pending_cell_ocr=pending,
                              hidden_ocr_direction_conflict=source_text_unreliable,
-                             glyph_coverage=1.0,text_method='positioned_pdf_ocr_layer',
+                             glyph_coverage=0.0 if source_text_unreliable else 1.0,text_method='positioned_pdf_ocr_layer',
                              cells=[{k:v for k,v in cell.items() if k!='glyphs'} for cell in cells])
         from docling_pdf_primary_rows import quarantine_scan_text
         return quarantine_scan_text(fragment,geometry,source_image,region,page_no,sys.modules[__name__])
@@ -6418,14 +6476,15 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
                              matched_refs=[item.self_ref for item in matched], reference_count=len(refs),
                              caption_found=caption_line is not None, geometry=diagnostic_summary(geometry))
             from docling_pdf_scan_recovery import read_source_scan_grid
+            primary_records = records if manifest.get('primary_ocr_only') else ()
             source_grid = read_source_scan_grid(reader, regions, page_no, box, refs,
-                                                sys.modules[__name__])
+                                                sys.modules[__name__], primary_records=primary_records)
             if source_grid is None and picture is not None:
                 # Leave room for outer vertical rails and trim only the
                 # layout padding at the foot before testing actual rules.
                 padded = [box[0]-3, box[1], box[2]+3, box[3]-1]
                 source_grid = read_source_scan_grid(reader, regions, page_no, padded, refs,
-                                                    sys.modules[__name__])
+                                                    sys.modules[__name__], primary_records=primary_records)
             native = source_grid['native'] if source_grid else None
             if source_grid:
                 source_grid['image'].close()
@@ -6486,7 +6545,7 @@ def recover_scanned_table_regions(doc, reader, regions, page_numbers, records, r
     manifest['recovered_scan_tables'] = repairs
     if repairs:
         print(f"Scan table recovery: {len(repairs)} source grids; "
-              f"{sum(entry['cell_images'] for entry in repairs)} illustration cells retained",flush=True)
+              f"{sum(entry['cell_images'] for entry in repairs)} cells retain source pixel bounds",flush=True)
     diagnostic_event('SCAN_RECOVERY_END', recovered_count=len(recovered),
                      replaced_fragment_count=sum(len(entry['replaced_fragments']) for entry in repairs),
                      cell_image_count=sum(entry['cell_images'] for entry in repairs))
@@ -8502,7 +8561,8 @@ def export_local_html(args, result, normalized, orientation, source):
                         else:
                             from docling_pdf_scan_recovery import read_source_scan_grid
                             probe = read_source_scan_grid(native_reader, regions, page_no, bbox,
-                                [raw for _, raw in raw_candidates], sys.modules[__name__])
+                                [raw for _, raw in raw_candidates], sys.modules[__name__],
+                                primary_records=records if args.primary_ocr_only else ())
                             if probe and (probe['native'][1].get('source_grid_verified') or native is None):
                                 image.close()
                                 native, image, bbox = probe['native'], probe['image'], list(probe['region'])
@@ -8555,7 +8615,8 @@ def export_local_html(args, result, normalized, orientation, source):
                                 html_sha256=hashlib.sha256(str(frame_node).encode()).hexdigest()))
                             manifest.setdefault('source_illustration_picture_refs',[]).append(picture.self_ref)
                             sibling=picture
-                    if args.primary_ocr_only and page_scans and native[1].get('source_grid_verified'):
+                    if (args.primary_ocr_only and page_scans and native[1].get('source_grid_verified')
+                            and not native[1].get('primary_scan_grid')):
                         from docling_pdf_logical_rows import restore_primary_logical_rows
                         logical = restore_primary_logical_rows(native, records, page_no, manifest,
                             sys.modules[__name__], reader=native_reader, source_image=image,

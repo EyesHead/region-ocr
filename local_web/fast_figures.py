@@ -12,7 +12,8 @@ import re
 from docling_pdf_forms import FIGURE_CAPTION, FORM_HEADING
 
 from local_web.fast_formulas import (EQUATION_NUMBER, FormulaCrop, attach_fraction_terms, coverage,
-                                     equation_number_words, ordinary_text, text_regions, vector_fractions)
+                                     equation_number_words, ordinary_text, text_confirms_formula,
+                                     text_regions, vector_fractions)
 from local_web.fast_image_assets import crop_png, make_image_asset
 from local_web.fast_resources import FORMULA_CROP_ATTR, register_image
 
@@ -605,6 +606,7 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
                       and not _EQUATION.fullmatch(w[4]))
         label = 'Формула' + (' ' + tag[0] if tag and not number else '')
         formula_regions.append((b, owned, True, label, (id(word),False)))
+    ruled_fractions = set(fractions)
     for box in fractions:
         formula_regions.append((box, (), True, 'Формула', _word_anchor(rows,lines,box,standalone=True,row_cells=row_cells)))
     for box, words, display in vector_fractions(rows, horizontal_rules, em, formula_cells or {}):
@@ -613,10 +615,13 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
         for i, (other, owned, old_display, label, anchor) in enumerate(formula_regions):
             if coverage(box, other) > .50 or coverage(other, box) > .65:
                 combined = tuple({id(word): word for word in (*words, *owned)}.values())
-                formula_regions[i] = (_union((other, box)), combined, old_display, label, anchor)
+                merged_box = _union((other, box))
+                formula_regions[i] = (merged_box, combined, old_display, label, anchor)
+                ruled_fractions.add(merged_box)
                 break
         else:
             formula_regions.append((box, words, display, 'Формула', None))
+            ruled_fractions.add(box)
     occupied = [*(b for b,_,_ in marked), *(entry[0] for entry in formula_regions)]
     if formula_text is not None:
         for box, words, display in text_regions(rows, bound.keys() | captions, occupied=occupied):
@@ -653,12 +658,24 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
             cancelled()
         if any(id(word) in claimed for word in words):
             continue
+        text = ' '.join(word[4] for word in words)
+        if formula_batches is not None:
+            cells = {formula_cells.get(id(word)) for word in words} if formula_cells else set()
+            cell = next(iter(cells)) if len(cells) == 1 else None
+            rejection = None
+            if len(cells) > 1 or cell is not None and not _inside(box, cell):
+                rejection = 'formula_ambiguous_cell'
+            elif box not in ruled_fractions and not text_confirms_formula(text):
+                rejection = 'formula_unconfirmed'
+            if rejection:
+                if stats is not None:
+                    stats[rejection] = stats.get(rejection, 0) + 1
+                continue
         try:
             png = _crop(page, raster, box, size)
         except (PdfiumError, ValueError, OSError):
             continue
         claimed.update(map(id, words))
-        text = ' '.join(word[4] for word in words)
         crop = FormulaCrop(page_no, box, text, display, png)
         if formula_batches is not None:
             place(crop, words, anchor, formula_batches.place(crop, label))

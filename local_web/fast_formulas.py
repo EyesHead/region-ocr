@@ -13,6 +13,10 @@ _STRUCTURE = '∑∫∏√∂∇⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆
 _VARIABLE = r'\w'
 _RELATION = re.compile(_VARIABLE + r'[)\]}]*\s*[' + _OPERATORS + r']\s*[-+−–(\[{]*\s*' + _VARIABLE)
 _BASIC = re.compile(r'[A-Za-zА-Яа-яЁёα-ωΑ-Ω0-9]\s*[+/−⋅]\s*[A-Za-zА-Яа-яЁёα-ωΑ-Ω0-9]')
+_RECOGNITION_EQUATION = re.compile(r'[\w)\]}]\s*[=≈≃≠≤≥∝≡]\s*[-+−–(\[{]*[^\W_]')
+_RECOGNITION_FRACTION = re.compile(r'(?<!\w)\d+\s*/\s*\d+(?!\w)')
+_RECOGNITION_POWER = re.compile(r'(?<!\w)[^\W\d_]\^(?:[-+−]?\d+\b|\{[-+−]?\d+\})')
+_RECOGNITION_SUM = re.compile(r'[^\W\d_]\s*[+−]\s*(?:\d+(?:[.,]\d+)?\s*)?[^\W\d_]')
 _ALPHA = re.compile(r'[^\W\d_]+')
 _MATH_NAMES = {'sin', 'cos', 'tan', 'tg', 'ctg', 'cot', 'arcsin', 'arccos', 'arctg', 'sinh', 'cosh',
                'const', 'ln', 'log', 'lim', 'min', 'max', 'exp', 'mod', 'det', 'град', 'макс', 'мин'}
@@ -61,6 +65,16 @@ def formula_evidence(text, *, standalone=False):
         return True
     return standalone and len(text) <= 42 and bool(_BASIC.search(text)) and (
         any(char.isdecimal() for char in text) or any(char in text for char in '+−⋅'))
+
+
+def text_confirms_formula(text):
+    """Require an expression before sending a crop found by broad OCR heuristics."""
+    text = _PROBLEM.sub('', text).strip()
+    return bool(text and not ordinary_text(text) and (
+        _RECOGNITION_EQUATION.search(text)
+        or _RECOGNITION_FRACTION.search(text)
+        or _RECOGNITION_POWER.search(text)
+        or _RECOGNITION_SUM.search(text)))
 
 
 def vector_fractions(rows, horizontal_rules, em, cells):

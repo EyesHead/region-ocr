@@ -11,6 +11,7 @@ from subprocess import SubprocessError
 
 _CACHE = OrderedDict()
 _CACHE_SIZE = 1024
+_REJECTED = object()
 _LOAD_ERRORS = (OSError, RuntimeError, ImportError, ValueError, SubprocessError)
 _INFERENCE_ERRORS = (OSError, RuntimeError, ValueError)
 _MATH_TAG = re.compile(r'\A<(?:math|chem)(?=[\s>])', re.I)
@@ -20,13 +21,43 @@ _ACTIVE_TEX = re.compile(r'\\(?:href|url|class|style|html(?:class|style|id|data)
 _ACTIVE_ATTRS = {'href', 'xlink:href', 'src', 'class', 'style', 'id'}
 
 
+def _wrapped_formula(nodes):
+    from bs4 import BeautifulSoup, Comment, Tag
+
+    if len(nodes) != 1 or not isinstance(nodes[0], Tag) or nodes[0].name not in {'p', 'div', 'span'}:
+        return None
+    root = nodes[0]
+    math = root.find_all('math')
+    if not math:
+        return None
+    for node in [root, *root.find_all(True)]:
+        if node.name == 'math' or node.find_parent('math') is not None:
+            continue
+        if node is not root and node.name not in {'b', 'strong', 'i', 'em', 'span', 'sub', 'sup'}:
+            return None
+        node.attrs.clear()
+    for node in math:
+        rendered = _format_formula(str(node), inline=True)
+        if not rendered or not rendered.startswith('<math'):
+            return None
+        node.replace_with(BeautifulSoup(rendered, 'html.parser').math)
+    for comment in root.find_all(string=lambda value: isinstance(value, Comment)):
+        comment.extract()
+    root.name = 'span'
+    root['data-formula-fragment'] = 'true'
+    return str(root)
+
+
 def _formula_markup(output, inline):
     """Format the model response, retaining it as text if rendering is unavailable."""
+    return _format_formula((getattr(output, 'raw', None) or '').strip(), inline)
+
+
+def _format_formula(raw, inline):
     from bs4 import BeautifulSoup, Tag
     from docling_office_math import latex_math, parsed_formula
     from local_web.structured_export import _without_math_delimiters
 
-    raw = (getattr(output, 'raw', None) or '').strip()
     if not raw:
         return None
     fenced = _CODE_FENCE.fullmatch(raw)
@@ -42,7 +73,9 @@ def _formula_markup(output, inline):
                 latex = node.get_text().strip()
             else:
                 markup = parsed_formula(value, latex_math)
-    elif not _HTML_TAG.search(value):
+    elif _HTML_TAG.search(value):
+        return _wrapped_formula(BeautifulSoup(value, 'html.parser').contents)
+    else:
         latex = value
     if latex is not None:
         latex = _without_math_delimiters(latex)
@@ -60,7 +93,7 @@ def _formula_markup(output, inline):
         literal = escape(latex)
         kind = 'inline' if inline else 'display'
         return f'<span data-formula="{kind}" data-latex="{literal}">{literal}</span>'
-    return '<code>' + escape(value or raw) + '</code>'
+    return None if _HTML_TAG.search(value) else '<code>' + escape(value or raw) + '</code>'
 
 
 def _request(backend, requests, diagnostic):
@@ -81,11 +114,15 @@ def _predict(entries, backend, diagnostic):
     outputs = _request(backend, requests, diagnostic)
     for index, (_, inline, _) in enumerate(entries):
         output = outputs[index] if index < len(outputs) else None
+        raw = str(getattr(output, 'raw', '') or '').strip()
         try:
-            values.append(_formula_markup(output, inline) if output is not None else None)
+            markup = _format_formula(raw, inline)
         except (TypeError, ValueError, RuntimeError, RecursionError):
-            raw = str(getattr(output, 'raw', '') or '').strip()
-            values.append('<code>' + escape(raw) + '</code>' if raw else None)
+            markup = None
+        if markup is None and raw:
+            diagnostic('BALANCED_FORMULA_RESPONSE_REJECTED', **entries[index][2])
+            markup = _REJECTED
+        values.append(markup)
     return values
 
 
@@ -98,7 +135,8 @@ def _recognize(crops, inline, locations, backend_provider, diagnostic):
         key = (image.mode, image.size, is_inline, sha256(image.tobytes()).digest())
         if key in _CACHE:
             _CACHE.move_to_end(key)
-            results[index] = _CACHE[key]
+            cached = _CACHE[key]
+            results[index] = None if cached is _REJECTED else cached
         else:
             _, positions = pending.setdefault(key, ((image, is_inline, location), []))
             positions.append(index)
@@ -118,7 +156,7 @@ def _recognize(crops, inline, locations, backend_provider, diagnostic):
                 diagnostic('BALANCED_FORMULA_NO_RESPONSE', **locations[index])
             continue
         for index in positions:
-            results[index] = markup
+            results[index] = None if markup is _REJECTED else markup
         _CACHE[key] = markup
         if len(_CACHE) > _CACHE_SIZE:
             _CACHE.popitem(last=False)

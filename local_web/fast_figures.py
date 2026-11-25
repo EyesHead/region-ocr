@@ -209,7 +209,7 @@ def _rendered_formula(assets, rendered, crop, label, table_boxes=()):
     if not rendered:
         source = _markup(assets, ('image/png', crop.png, None, None), label, crop.bbox, crop.page_no)
         return source, 'formula_crops'
-    if rendered.startswith('<math'):
+    if rendered.startswith(('<math', '<span data-formula-fragment="true">')):
         kind = 'formulas_mathml'
     elif rendered.startswith('<span'):
         kind = 'formulas_latex'

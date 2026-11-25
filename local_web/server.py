@@ -47,7 +47,7 @@ else:
     from conversion_logs import append_job_log, archive_engine_logs, assemble_conversion_log
 
 APP_ID = "region-document-converter"
-VERSION = "1.9.4"
+VERSION = "2.0.0"
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 FORMATS = {

@@ -56,6 +56,6 @@ jobs:
           $tag = "v$version"
           gh release view $tag --json tagName 2>$null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to overwrite it" }
-          $notes = "Исправлены сбои экспорта PDF при повреждённом ответе OCR для ячейки таблицы. Конвертер сверяет сетку, вертикальный текст и размерные подписи с исходной страницей, сохраняет формулы и объединения ячеек. Неоднозначные области доступны для визуальной сверки."
+          $notes = "В быстром режиме PDF используется кириллическая модель PP-OCRv6. Конвертер определяет ориентацию сканов, в том числе при наличии текстового слоя, восстанавливает частично разлинованные таблицы и повторно распознаёт ячейки при сбоях OCR. При экспорте сохраняются редактируемый текст и формулы, а JSON содержит привязки к исходным страницам."
           gh release create $tag "release/REGION-OCR-$version-Setup.exe" release/SHA256SUMS --target $env:GITHUB_SHA --title "REGION OCR $version" --notes $notes --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

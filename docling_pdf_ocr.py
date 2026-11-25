@@ -9,6 +9,21 @@ class InvalidLayoutOutput(RuntimeError):
     """The backend responded but the layout could not be decoded reliably."""
 
 
+def physical_cell_layout_blocks(raw):
+    """Decode every region of the cell, including text touching its border."""
+    from surya.inference.parsers import parse_layout
+
+    blocks = parse_layout(raw)
+    raw_array = raw[raw.index('['):raw.rindex(']') + 1]
+    if len(blocks) != len(json.loads(raw_array)):
+        raise ValueError('parser dropped one or more cell regions')
+    for block in blocks:
+        left, top, right, bottom = block.bbox
+        if not (0 <= left < right <= 1000 and 0 <= top < bottom <= 1000):
+            raise ValueError('cell region outside normalized crop bounds')
+    return blocks
+
+
 def _layout_error(item, output):
     if output is None:
         return 'inference_failed_or_empty'
@@ -22,22 +37,17 @@ def _layout_error(item, output):
     if output.error:
         return 'inference_failed_or_empty'
     if not output.raw:
+        if item.metadata.get('purpose') in {'physical_cell_layout', 'physical_cell_block'}:
+            return 'inference_failed_or_empty'
         from surya.common.blank import is_blank_region
         return None if is_blank_region(item.image) else 'inference_failed_or_empty'
     if item.prompt_type == 'layout':
         from surya.inference.parsers import parse_layout
         try:
-            blocks = parse_layout(output.raw)
             if item.metadata.get('purpose') == 'physical_cell_layout':
-                # Surya logs and drops bad boxes. A partial layout can turn a
-                # mixed text/picture cell into an apparently picture-only cell.
-                raw_array = output.raw[output.raw.index('['):output.raw.rindex(']') + 1]
-                if len(blocks) != len(json.loads(raw_array)):
-                    return 'invalid_layout: parser dropped one or more cell regions'
-                for block in blocks:
-                    left, top, right, bottom = block.bbox
-                    if not (0 <= left < right <= 1000 and 0 <= top < bottom <= 1000):
-                        return 'invalid_layout: cell region outside normalized crop bounds'
+                physical_cell_layout_blocks(output.raw)
+            else:
+                parse_layout(output.raw)
         except (ValueError, TypeError, KeyError, OverflowError) as error:
             return f'invalid_layout: {error}'
     elif item.prompt_type == 'high_accuracy_bbox':
@@ -137,7 +147,10 @@ def recovering_generate(batch, request, diagnostic):
         # same prompt and schema on the same crop produces the same bad JSON.
         same_layout = (item.prompt_type == 'layout' and reason.startswith('invalid_layout:')
                        and item.guided_json == LAYOUT_JSON_SCHEMA and item.temperature in (None, 0.0))
-        if (retry.max_tokens == item.max_tokens and not same_layout
+        physical_layout = item.prompt_type == 'layout' and item.metadata.get('purpose') == 'physical_cell_layout'
+        empty_cell_read = (item.prompt_type == 'block' and item.metadata.get('purpose') == 'physical_cell_block'
+                           and output is not None and not output.error and not output.raw)
+        if (retry.max_tokens == item.max_tokens and not (same_layout or physical_layout or empty_cell_read)
                 and reason not in {'output_token_limit', 'repeating_output'}):
             diagnostic('OCR_REQUEST_RETRY', prompt_type=item.prompt_type, reason=reason,
                        image_size=list(item.image.size), metadata=item.metadata)
@@ -151,11 +164,8 @@ def recovering_generate(batch, request, diagnostic):
                        image_size=list(item.image.size), method='single_request_retry')
             recovered.append(output)
             continue
-        # Only the type of content is unknown for an already located cell.
-        # Re-segmenting that same cell cannot establish which source tokens
-        # it owns. Its caller checks positioned readings and retains its pixels.
-        split_page = (item.prompt_type in {'layout', 'high_accuracy_bbox'}
-                      and item.metadata.get('purpose') != 'physical_cell_layout')
+        # A known cell has a complete physical box ready for a BLOCK request.
+        split_page = item.prompt_type in {'layout', 'high_accuracy_bbox'} and not physical_layout
         parts = _layout_parts(item.image) if split_page else []
         if parts:
             from surya.inference.parsers import parse_layout, parse_full_page_html
@@ -201,7 +211,7 @@ def recovering_generate(batch, request, diagnostic):
         invalid_layout = (item.prompt_type == 'layout' and output is not None and bool(output.raw)
                           and (reason.startswith('invalid_layout:') or reason in {
                               'output_token_limit', 'repeating_output'}))
-        if invalid_layout:
+        if physical_layout or invalid_layout:
             error = InvalidLayoutOutput(f'Local layout output could not be recovered: {reason}')
         else:
             error = RuntimeError(f'Local {item.prompt_type} request failed after retry: {reason}')

@@ -16,24 +16,32 @@ class QualityCellTest(unittest.TestCase):
     position = dict(row=0, column=0, row_span=1, column_span=1)
     source_asset = '<img data-source-cell="true" src="data:image/png;base64,YQ=="/>'
 
-    def recognize(self, image, layout, *, failure=None, block='<p>105</p>', verified=True):
+    def recognize(self, image, layout, *, failure=None, block='<p>105</p>', verified=True,
+                  layout_error=False, calls=None):
         from surya.inference.schema import BatchOutputItem
 
         def request(batch):
             replies = []
             for item in batch:
+                if calls is not None:
+                    calls.append(item.prompt_type)
                 if item.prompt_type == 'layout':
                     if isinstance(layout, BaseException):
                         raise layout
                     raw, stop = layout
                 else:
                     self.assertEqual(item.prompt_type, 'block')
-                    self.assertEqual(item.image.size, image.size)
-                    self.assertEqual(item.image.tobytes(), image.tobytes())
                     if failure:
                         raise failure
-                    raw, stop = block, 'stop'
-                replies.append(BatchOutputItem(raw=raw, token_count=12, error=False,
+                    if callable(block):
+                        raw = block(item.image)
+                    else:
+                        self.assertEqual(item.image.size, image.size)
+                        self.assertEqual(item.image.tobytes(), image.tobytes())
+                        raw = block
+                    stop = 'stop'
+                replies.append(BatchOutputItem(raw=raw, token_count=12 if raw else 0,
+                                               error=item.prompt_type == 'layout' and layout_error,
                                                metadata=item.metadata, finish_reason=stop))
             return replies
 
@@ -66,6 +74,110 @@ class QualityCellTest(unittest.TestCase):
             for layout, block in ((failure, None), (('malformed', 'stop'), failure)):
                 with self.subTest(layout=layout), self.assertRaisesRegex(RuntimeError, 'llama-server exited'):
                     self.recognize(image, layout, failure=block)
+
+    def test_empty_layout_response_goes_straight_to_one_whole_cell_block(self):
+        with Image.new('RGB', (120, 50), 'white') as image:
+            image.putpixel((119, 20), (0, 0, 0))
+            for stop, failed in ((None, True), ('length', True), ('stop', False)):
+                with self.subTest(stop=stop, failed=failed):
+                    calls = []
+                    blocks = self.recognize(image, ('', stop), layout_error=failed, calls=calls)
+                    self.assertEqual(calls, ['layout', 'block'])
+                    self.assertEqual([b['html'] for b in blocks], ['<p>105</p>'])
+
+    def test_mixed_layout_transcribes_a_single_edge_pixel_beside_a_figure(self):
+        layout = ('[{"label":"Figure","bbox":"80 100 500 900"},'
+                  '{"label":"Text","bbox":"750 100 1000 900"}]')
+        with Image.new('RGB', (200, 100), 'white') as image:
+            ImageDraw.Draw(image).rectangle((20, 15, 92, 85), fill='black')
+            image.putpixel((199, 50), (0, 0, 0))
+            def digit(crop):
+                with image.crop((146, 6, 200, 94)) as expected:
+                    self.assertEqual((crop.size, crop.tobytes()), (expected.size, expected.tobytes()))
+                return '<p>1</p>'
+            calls = []
+            blocks = self.recognize(image, (layout, 'stop'), block=digit, calls=calls)
+        self.assertEqual([(b['label'], b['html']) for b in blocks], [('Figure', ''), ('Text', '<p>1</p>')])
+        self.assertEqual(calls, ['layout', 'block'])
+
+    def test_bounded_fallback_keeps_text_boxes_even_if_one_contains_a_single_pixel(self):
+        layout = ('[{"label":"Text","bbox":"80 100 500 900"},'
+                  '{"label":"Text","bbox":"750 100 1000 900"}]')
+        with Image.new('RGB', (200, 100), 'white') as image:
+            ImageDraw.Draw(image).rectangle((20, 15, 32, 60), fill='black')
+            image.putpixel((199, 50), (0, 0, 0))
+            def read(crop):
+                if crop.size == image.size:
+                    return '<img/>'
+                return '<p>1</p>' if crop.width == 54 else '<p>номер</p>'
+            calls = []
+            blocks = self.recognize(image, (layout, 'stop'), block=read, calls=calls)
+        self.assertEqual([b['html'] for b in blocks], ['<p>номер</p>', '<p>1</p>'])
+        self.assertEqual(calls, ['layout', 'block', 'block', 'block'])
+
+    def test_one_uncovered_pixel_keeps_a_picture_from_accounting_for_the_entire_cell(self):
+        for x in (145, 199):
+            with self.subTest(x=x), Image.new('RGB', (200, 100), 'white') as image:
+                ImageDraw.Draw(image).rectangle((20, 15, 92, 85), fill='black')
+                image.putpixel((x, 50), (0, 0, 0))
+                with self.assertRaises(content.IncompleteCellCoverage):
+                    content._require_ink_coverage(image, [[80, 100, 500, 900]], physical_cell=True)
+
+    def test_empty_block_leaves_faint_cell_in_diagnostics(self):
+        def recognize(cell_image, *args):
+            return self.recognize(cell_image, ('', 'length'), layout_error=True, block='', calls=calls)
+
+        calls = []
+        with Image.new('RGB', (120, 50), 'white') as image:
+            image.putpixel((119, 20), (0, 0, 0))
+            with patch('surya.common.blank.is_blank_region', side_effect=AssertionError('cell histogram')):
+                td, manifest, physical, encoder = self.normalize(image, '',
+                    cell_data=dict(scan_layout_has_ink=True), recognize=recognize)
+        self.assertEqual(calls, ['layout', 'block'])
+        self.assertEqual(td.decode_contents(), '')
+        self.assertTrue(physical['unresolved_typed_content'])
+        self.assertEqual(manifest['unresolved_table_cells'][0]['source_bbox'], [0, 0, 120, 50])
+        encoder.assert_not_called()
+
+    def test_temporary_block_transport_failure_can_recover(self):
+        from surya.inference.schema import BatchInputItem, BatchOutputItem
+
+        with Image.new('RGB', (80, 30), 'white') as image:
+            item = BatchInputItem(image=image, prompt_type='block', max_tokens=128,
+                                  metadata=dict(purpose='physical_cell_block'))
+            responses = iter([BatchOutputItem(raw='', token_count=0, error=True),
+                              BatchOutputItem(raw='<p>7</p>', token_count=5, error=False)])
+            result = recovering_generate([item], lambda batch: [next(responses)], api.diagnostic_event)
+        self.assertEqual(result[0].raw, '<p>7</p>')
+
+    def test_partial_mixed_cell_keeps_the_localized_figure_and_its_positioned_text_once(self):
+        layout = ('[{"label":"Figure","bbox":"80 100 500 900"},'
+                  '{"label":"Text","bbox":"750 100 1000 900"}]')
+        calls = []
+        def recognize(cell_image, *args):
+            return self.recognize(cell_image, (layout, 'stop'), block=lambda crop: '<b>1</b>', calls=calls)
+
+        with Image.new('RGB', (200, 100), 'white') as image:
+            ImageDraw.Draw(image).rectangle((20, 15, 92, 85), fill='black')
+            image.putpixel((101, 50), (0, 0, 0))
+            image.putpixel((199, 50), (0, 0, 0))
+            td, manifest, physical, encoder = self.normalize(image, '',
+                cell_data=dict(scan_layout_has_ink=True), recognize=recognize)
+        self.assertEqual(calls, ['layout', 'block'])
+        self.assertEqual(td.get_text(strip=True), '1')
+        self.assertEqual(len(td.find_all('img')), 1)
+        self.assertEqual(manifest['typed_table_picture_assets'][0]['source_pixel_bbox'], [16, 10, 100, 90])
+        self.assertTrue(physical['unresolved_typed_content'])
+        self.assertEqual(encoder.call_count, 1)
+
+    def test_picture_only_layout_cannot_use_a_full_cell_text_to_replace_its_figure(self):
+        with Image.new('RGB', (200, 100), 'white') as image:
+            ImageDraw.Draw(image).rectangle((20, 15, 92, 85), fill='black')
+            image.putpixel((199, 50), (0, 0, 0))
+            calls = []
+            blocks = self.recognize(image, ('[{"label":"Figure","bbox":"80 100 500 900"}]', 'stop'), calls=calls)
+        self.assertEqual(calls, ['layout'])
+        self.assertEqual([(b['label'], b['bbox']) for b in blocks], [('Figure', [80, 100, 500, 900])])
 
     def test_unlocated_region_does_not_borrow_physical_cell_coordinates(self):
         with Image.new('RGB', (30, 20), 'white') as image:

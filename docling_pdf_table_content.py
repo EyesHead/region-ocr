@@ -169,42 +169,95 @@ def recognize_typed_crop(image, args, page, cell, api):
     return [dict(label=b.label, bbox=list(b.bbox), html=b.html) for b in blocks]
 
 
+def _physical_cell_layout(manager, image, page, cell):
+    from docling_pdf_ocr import InvalidLayoutOutput, physical_cell_layout_blocks
+    from surya.inference.parsers import denorm_bbox
+    from surya.inference.prompts import LAYOUT_JSON_SCHEMA
+    from surya.inference.schema import BatchInputItem, PROMPT_TYPE_LAYOUT
+    from surya.layout.label import LAYOUT_PRED_RELABEL
+    from surya.layout.schema import LayoutBox, LayoutResult
+    from surya.settings import settings
+
+    item = BatchInputItem(image=image, prompt_type=PROMPT_TYPE_LAYOUT, max_tokens=settings.SURYA_MAX_TOKENS_LAYOUT,
+        guided_json=LAYOUT_JSON_SCHEMA if settings.SURYA_GUIDED_LAYOUT else None,
+        metadata=dict(purpose='physical_cell_layout', page=page, element='source_table_cell',
+                      row=cell['row'], column=cell['column']))
+    replies = manager.generate([item])
+    if len(replies) != 1:
+        raise RuntimeError('Local cell layout result count mismatch')
+    reply = replies[0]
+    if (reply is None or reply.error or not reply.raw or reply.finish_reason == 'length'
+            or reply.token_count >= item.max_tokens):
+        raise InvalidLayoutOutput('No complete physical cell layout')
+    try:
+        regions = physical_cell_layout_blocks(reply.raw)
+    except (ValueError, TypeError, KeyError, OverflowError) as error:
+        raise InvalidLayoutOutput(str(error)) from error
+    # LayoutPredictor drops text boxes using a page-level blankness heuristic.
+    # A tiny source digit can occupy a single pixel of a known physical cell.
+    boxes = [LayoutBox(polygon=denorm_bbox(b.bbox, image.width, image.height, settings.BBOX_SCALE),
+                       label=LAYOUT_PRED_RELABEL.get(b.label, b.label), raw_label=b.label, position=index,
+                       count=b.count, confidence=reply.mean_token_prob if reply.mean_token_prob is not None else 1.0)
+             for index, b in enumerate(regions)]
+    return LayoutResult(image_bbox=[0, 0, image.width, image.height], bboxes=boxes)
+
+
+def _physical_cell_blocks(manager, image, layout, page, cell):
+    from dataclasses import replace
+    from docling_pdf_ocr import output_within_request_budget
+    from surya.inference.util import detect_repeat_token
+    from surya.recognition import RecognitionPredictor
+
+    class CellBlockManager:
+        def generate(self, batch):
+            requests = [replace(item, metadata=dict(item.metadata,
+                purpose='physical_cell_block', page=page, element='source_table_cell',
+                row=cell['row'], column=cell['column'])) for item in batch]
+            outputs = manager.generate(requests)
+            return [replace(out, error=not output_within_request_budget(out, item.max_tokens)
+                            or not out.raw or detect_repeat_token(out.raw))
+                    for item, out in zip(requests, outputs, strict=True)]
+
+    try:
+        predictions = RecognitionPredictor(CellBlockManager())([image], full_page=False, layout_results=[layout])
+    except RuntimeError as error:
+        if not str(error).startswith('Local block request failed after retry:'):
+            raise
+        return []
+    return predictions[0].blocks if len(predictions) == 1 else []
+
+
 def _infer_typed_blocks(image, model, page, cell, api):
     """Classify source graphics without transcription; recover text through Surya."""
-    from dataclasses import replace
     from docling_pdf_ocr import InvalidLayoutOutput
     from surya.layout import LayoutPredictor
     from surya.recognition import RecognitionPredictor
 
     api.local_surya_backend(model)
     manager = model._get_runtime()._manager
-    # A physical grid proves the cell's extent, not that its contents are
-    # prose. Use the existing typed layout path before asking for text.
-    class CellLayoutManager:
-        def generate(self, batch):
-            return manager.generate([replace(item, metadata=dict(item.metadata, purpose='physical_cell_layout',
-                page=page, element='source_table_cell', row=cell['row'], column=cell['column']))
-                if item.prompt_type == 'layout' else item for item in batch])
-
-    layout_manager = CellLayoutManager() if cell.get('source_grid_verified') else manager
-    try:
-        layouts = LayoutPredictor(layout_manager)([image])
-    except InvalidLayoutOutput as error:
-        if not cell.get('physical_cell_proven'):
-            raise
-        # The grid supplies the missing box. Send every source pixel to the
-        # trained block reader below, including glyphs touching a ruling.
-        api.diagnostic_event('TYPED_PHYSICAL_CELL_LAYOUT_TO_BLOCK', page=page, cell=cell,
-                             reason=str(error))
-        layouts = []
-    layout = layouts[0] if len(layouts) == 1 else None
+    physical = cell.get('physical_cell_proven')
+    if physical:
+        try:
+            layout = _physical_cell_layout(manager, image, page, cell)
+        except InvalidLayoutOutput as error:
+            api.diagnostic_event('TYPED_PHYSICAL_CELL_LAYOUT_TO_BLOCK', page=page, cell=cell, reason=str(error))
+            layout = None
+    else:
+        layouts = LayoutPredictor(manager)([image])
+        layout = layouts[0] if len(layouts) == 1 else None
     has_pictures = False
     if layout is not None and not layout.error and layout.bboxes:
         pictures = [dict(label=b.label, bbox=[1000*b.bbox[0]/image.width,
                     1000*b.bbox[1]/image.height, 1000*b.bbox[2]/image.width,
                     1000*b.bbox[3]/image.height], html='') for b in layout.bboxes]
         has_pictures = any(b['label'].casefold() in PICTURE_LABELS for b in pictures)
-        if not cell.get('has_primary_content') and all(b['label'].casefold() in PICTURE_LABELS for b in pictures):
+        pictures_only = all(b['label'].casefold() in PICTURE_LABELS for b in pictures)
+        if physical and pictures_only:
+            # Assembly combines these regions with positioned primary text,
+            # then checks the pixels outside the actual picture crops.
+            api.diagnostic_event('TYPED_SOURCE_PICTURE_CLASSIFIED', page=page, cell=cell, blocks=len(pictures))
+            return pictures
+        if not cell.get('has_primary_content') and pictures_only:
             try:
                 pictures = _refine_picture_bounds(image, pictures)
                 _require_ink_coverage(image, [b['bbox'] for b in pictures],
@@ -215,10 +268,8 @@ def _infer_typed_blocks(image, model, page, cell, api):
                 api.diagnostic_event('TYPED_SOURCE_PICTURE_CLASSIFIED', page=page, cell=cell,
                                      blocks=len(pictures))
                 return pictures
-    if cell.get('physical_cell_proven') and not has_pictures:
+    if physical and not has_pictures:
         from surya.layout.schema import LayoutBox, LayoutResult
-        from surya.inference.util import detect_repeat_token
-        from docling_pdf_ocr import output_within_request_budget
         import cv2
         import numpy as np
 
@@ -231,29 +282,12 @@ def _infer_typed_blocks(image, model, page, cell, api):
         _, _, components, _ = cv2.connectedComponentsWithStats(content, 8)
         glyphs = sum(area >= 3 for _, _, _, _, area in components[1:])
         estimate = max(256, min(3996, glyphs*8))
-        compact_retry = bool(glyphs and glyphs <= 180 and max(image.size) <= 600
+        compact_retry = bool(glyphs <= 180 and max(image.size) <= 600
                              and layout is not None and not layout.error and layout.bboxes)
-        layout = LayoutResult(image_bbox=[0, 0, image.width, image.height], bboxes=[LayoutBox(
+        whole_cell = LayoutResult(image_bbox=[0, 0, image.width, image.height], bboxes=[LayoutBox(
             polygon=[[0, 0], [image.width, 0], [image.width, image.height], [0, image.height]],
             label='Text', raw_label='Text', position=0, count=estimate)])
-        class CellManager:
-            def generate(self, batch):
-                outputs = manager.generate([replace(item, metadata=dict(item.metadata,
-                    purpose='physical_cell_block', page=page, element='source_table_cell',
-                    row=cell['row'], column=cell['column'])) for item in batch])
-                return [replace(out, error=bool(not output_within_request_budget(out, item.max_tokens)
-                    or detect_repeat_token(out.raw))) for item, out in zip(batch, outputs, strict=True)]
-        try:
-            predictions = RecognitionPredictor(CellManager())([image], full_page=False, layout_results=[layout])
-        except RuntimeError as error:
-            if not str(error).startswith('Local block request failed after retry:'):
-                raise  # Allocation/backend failures are not an empty OCR reading.
-            if not compact_retry:
-                failure = TableContentError('Physical cell OCR remained empty or invalid after block recovery')
-                failure.context = dict(stage='typed_table_content', page=page, element=cell)
-                raise failure from error
-            predictions = []
-        blocks = predictions[0].blocks if len(predictions) == 1 else []
+        blocks = _physical_cell_blocks(manager, image, whole_cell, page, cell)
         if len(blocks) == 1 and not blocks[0].error:
             html = blocks[0].html or ''
             parsed = BeautifulSoup(html, 'html.parser')
@@ -267,17 +301,19 @@ def _infer_typed_blocks(image, model, page, cell, api):
             failure = TableContentError('Physical cell OCR returned no complete editable block')
             failure.context = dict(stage='typed_table_content', page=page, element=cell)
             raise failure
-    # RecognitionPredictor owns validation of repeats/HTML and the trained
-    # layout + block recovery. Calling backend.generate directly bypasses it.
-    predictions = RecognitionPredictor(layout_manager)([image], full_page=True,
-        layout_results=layouts if layout is not None and not layout.error and layout.bboxes else None)
-    if len(predictions) != 1 or not predictions[0].blocks or any(b.error for b in predictions[0].blocks):
+    if physical:
+        blocks = _physical_cell_blocks(manager, image, layout, page, cell)
+    else:
+        predictions = RecognitionPredictor(manager)([image], full_page=True,
+            layout_results=[layout] if layout is not None and not layout.error and layout.bboxes else None)
+        blocks = predictions[0].blocks if len(predictions) == 1 else []
+    if not blocks or any(b.error for b in blocks):
         error = TableContentError('Typed table OCR failed after layout/block recovery')
         error.context = dict(stage='typed_table_content', page=page, element=cell)
         raise error
     return [dict(label=b.label, bbox=[1000*b.bbox[0]/image.width, 1000*b.bbox[1]/image.height,
                  1000*b.bbox[2]/image.width, 1000*b.bbox[3]/image.height], html=b.html or '')
-            for b in predictions[0].blocks]
+            for b in blocks]
 
 
 def _unwrap_text_cell_table(parsed, api, *, physical_cell, text_label, source_image=None):
@@ -394,8 +430,9 @@ def _render_typed(image, blocks, width, page, position, manifest, api,
             boxes.append(box)
     if not parts:
         raise TableContentError('Table raster recognition produced no publishable content')
+    picture_boxes = {tuple(b['bbox']) for b in blocks if physical_cell and b['label'].casefold() in PICTURE_LABELS}
     try:
-        _require_ink_coverage(image, boxes, physical_cell=physical_cell)
+        _require_ink_coverage(image, boxes, physical_cell=physical_cell, picture_boxes=picture_boxes)
     except TableContentError as coverage_error:
         anchored = _source_text_coverage(image, blocks, source_reader, source_bbox, page, api, ''.join(parts))
         if anchored is not None:
@@ -409,14 +446,19 @@ def _render_typed(image, blocks, width, page, position, manifest, api,
                     dict(page=page, cell=position, **proof))
                 coverage_error = None
         if coverage_error is not None:
-            if require_coverage:
+            if require_coverage and picture_boxes and isinstance(coverage_error, IncompleteCellCoverage):
+                # Keep independently positioned parts. Missing ink cannot
+                # turn a localized picture into a transcription of the cell.
+                manifest['uncovered_source_ink'] = str(coverage_error)
+            elif require_coverage:
                 raise coverage_error  # Routing proof failed; obtain a source-cell reading instead.
-            warning = dict(page=page, cell=dict(position), bbox=list(source_bbox or ()),
-                reason='ocr_boxes_do_not_cover_all_source_ink',
-                message='Границы OCR не покрывают все пиксели ячейки. Результат сохранён; '
-                        'это диагностическое замечание, а не отказ конвертации.')
-            manifest.setdefault('typed_table_coverage_reviews', []).append(warning)
-            api.diagnostic_event('TYPED_TABLE_COVERAGE_REVIEW', **warning)
+            else:
+                warning = dict(page=page, cell=dict(position), bbox=list(source_bbox or ()),
+                    reason='ocr_boxes_do_not_cover_all_source_ink',
+                    message='Границы OCR не покрывают все пиксели ячейки. Результат сохранён; '
+                            'это диагностическое замечание, а не отказ конвертации.')
+                manifest.setdefault('typed_table_coverage_reviews', []).append(warning)
+                api.diagnostic_event('TYPED_TABLE_COVERAGE_REVIEW', **warning)
     return ''.join(parts)
 
 
@@ -608,7 +650,7 @@ def _coverage_without_enclosing_rules(ink, *, physical_cell=False):
     return result
 
 
-def _require_ink_coverage(image, boxes, *, physical_cell=False):
+def _require_ink_coverage(image, boxes, *, physical_cell=False, picture_boxes=()):
     """Reject a partial answer which omits source text beside a picture."""
     if any(tuple(box) == (0, 0, 1000, 1000) for box in boxes):
         return
@@ -631,14 +673,19 @@ def _require_ink_coverage(image, boxes, *, physical_cell=False):
         ink[:top, :] = ink[bottom:, :] = ink[:, :left] = ink[:, right:] = 0
     covered = np.zeros_like(ink)
     for box in boxes:
-        left = max(0, math.floor(box[0]*image.width/1000)-3)
-        top = max(0, math.floor(box[1]*image.height/1000)-3)
-        right = min(image.width, math.ceil(box[2]*image.width/1000)+3)
-        bottom = min(image.height, math.ceil(box[3]*image.height/1000)+3)
+        margin = 0 if tuple(box) in picture_boxes else 3
+        left = max(0, math.floor(box[0]*image.width/1000)-margin)
+        top = max(0, math.floor(box[1]*image.height/1000)-margin)
+        right = min(image.width, math.ceil(box[2]*image.width/1000)+margin)
+        bottom = min(image.height, math.ceil(box[3]*image.height/1000)+margin)
         covered[top:bottom, left:right] = 255
     missing = cv2.bitwise_and(ink, cv2.bitwise_not(covered))
-    _, _, components, _ = cv2.connectedComponentsWithStats(missing, 8)
-    if any(area >= 3 for _, _, _, _, area in components[1:]):
+    if physical_cell:
+        uncovered = bool(np.any(missing))
+    else:
+        _, _, components, _ = cv2.connectedComponentsWithStats(missing, 8)
+        uncovered = any(area >= 3 for _, _, _, _, area in components[1:])
+    if uncovered:
         raise IncompleteCellCoverage('Typed table OCR omitted visible source content')
 
 
@@ -1869,7 +1916,9 @@ def normalize_table_content(fragment, geometry, source_image, region, page, args
             manifest.setdefault('source_fraction_fragment_grafts', []).append(fragment_graft)
         node.clear()
         node.append(BeautifulSoup(rendered, 'html.parser'))
-        if not unconfirmed_lines:
+        if proof.get('uncovered_source_ink'):
+            _record_cell_review(physical, position, page, ref, proof['uncovered_source_ink'], manifest, api)
+        elif not unconfirmed_lines:
             physical.pop('unresolved_typed_content', None)
         physical.pop('pending_primary_html', None)
         physical.pop('typed_content_recovery_required', None)

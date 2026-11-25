@@ -34,9 +34,7 @@ def measured_cell_interior(image):
     runs = proof['edge_rule_pixel_runs']
 
     rail_count = 0
-    for x, y, width, height, area in components[1:]:
-        if area < 3:
-            continue
+    for x, y, width, height, _ in components[1:]:
         vertical_edge = (runs[0] is not None and x + width <= left
                          or runs[2] is not None and x >= right)
         horizontal_edge = (runs[1] is not None and y + height <= top

@@ -442,11 +442,11 @@ def _source_text_coverage(image, blocks, reader, box, page, api, content, *, for
     lines = api.native_cell_lines(glyphs)
     if any(line.get('source_scripts') for line in lines):
         return None
-    # Source spelling never replaces the OCR answer. Every non-whitespace
-    # character must already be present, in order, in both complete readings.
+    # The source layer supplies coordinates. Preserve the OCR spelling, and
+    # keep mathematical symbol case significant.
     def compact(value):
         value = ''.join(value.split())
-        return value.translate(_FORMULA_SIGNS) if formula_signs else value
+        return value.translate(_FORMULA_SIGNS) if formula_signs else value.casefold()
     if compact(parsed.get_text()) != compact(''.join(line['text'] for line in lines)):
         return None
     import numpy as np
@@ -1614,22 +1614,21 @@ def _review_disputed_letter(rendered, primary, image, box, page, reader, positio
     if any(node.find(['img', 'svg', 'math', 'sup', 'sub', 'table', 'input']) for node in (parsed, prior)):
         return
     page_read, cell_read = prior.get_text(strip=True), parsed.get_text(strip=True)
-    if (len(page_read) != 1 or len(cell_read) != 1 or page_read == cell_read
+    if (len(page_read) != 1 or len(cell_read) != 1 or page_read.casefold() == cell_read.casefold()
             or not page_read.isalpha() or not cell_read.isalpha()):
         return
     if not _source_text_coverage(image, [{'label': 'Text'}], reader, box, page, api, cell_read):
         return
-    message = (f"Строка {position['row']+1}, столбец {position['column']+1}. "
-               f"Текстовый слой и чтение ячейки дают «{cell_read}», первичная таблица — «{page_read}».")
-    warning = dict(page=page, ref=ref, row=position['row'], column=position['column'], source_bbox=list(box),
-                   reason='single_letter_ocr_disagreement', primary=page_read, retained=cell_read, message=message)
-    manifest.setdefault('table_assembly_reviews', []).append(warning)
-    api.diagnostic_event('TYPED_TABLE_CELL_REVIEW', **warning)
+    evidence = dict(page=page, ref=ref, row=position['row'], column=position['column'], source_bbox=list(box),
+                    reason='single_letter_ocr_disagreement', primary=page_read, retained=cell_read)
+    manifest.setdefault('typed_table_text_anchors', []).append(evidence)
+    api.diagnostic_event('TYPED_TABLE_LITERAL_RETAINED', **evidence)
 
 
 def _reconcile_cell_ending(rendered, primary, image, box, page, reader, api):
     """Resolve a disputed final word when both OCR readings agree up to that word."""
     import re
+    from docling_pdf_scan_recovery import close_scan_literals
 
     if not primary or reader is None:
         return None
@@ -1647,7 +1646,7 @@ def _reconcile_cell_ending(rendered, primary, image, box, page, reader, api):
         return None
     word, other = first[1], second[1]
     prefix = ''.join(page_text[:first.start()].split())
-    if (not prefix or not word.isalpha() or word == other or not str(last).rstrip().endswith(other)
+    if (not prefix or not word.isalpha() or close_scan_literals(word, other) or not str(last).rstrip().endswith(other)
             or ''.join(cell_text[:second.start()].split()) != prefix):
         return None
     reader.load_page(page)

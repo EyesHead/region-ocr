@@ -11,6 +11,7 @@ from local_web.fast_formulas import EQUATION_NUMBER, formula_evidence, ordinary_
 
 MIN_TEXT_LENGTH = 30
 MIN_ALNUM_RATIO = 0.60
+_WORD_LETTERS = re.compile(r'[А-Яа-яЁёA-Za-z]{3,}')
 _TABLE_TITLE = re.compile(r'^\s*(?:таблица|табл\.|table)\s*(?:[А-ЯA-Z][.\-]?)?\s*\d', re.I)
 # UTF-8 Cyrillic decoded as Windows-1251 or Latin-1 produces these repeating pairs.
 _CONTINUATIONS = bytes(range(0x80, 0xc0))
@@ -125,7 +126,12 @@ def page_text(document, page_no, page_size):
 
     word_rows = list(_formula_rows(rows.values()))
     lines = [' '.join(word[0] for word in row) for row in word_rows]
-    if not usable_text(' '.join(lines)):
+    # Dot leaders in a table of contents are typography, not damaged glyphs.
+    sample = re.sub(r'\.{3,}', '.', ' '.join(lines))
+    minimum = MIN_TEXT_LENGTH
+    if len(sample) < 2 * MIN_TEXT_LENGTH and sum(bool(_WORD_LETTERS.search(t)) for t in sample.split()) >= 2:
+        minimum = 1
+    if not usable_text(sample, min_text_length=minimum):
         return None
     boxes = [(min(w[1] for w in row), min(w[2] for w in row),
               max(w[1] + w[3] for w in row), max(w[2] + w[4] for w in row), text, 1.0)
@@ -179,6 +185,30 @@ def covers_scanned_body(reading, objects, width, height):
     # A large illustration next to a substantial digital text column is also a native page.
     outside = sum((b & ~a).bit_count() for a, b in zip(raster[5:-5], text[5:-5]))
     return raster_area < .80 * 48**2 and outside >= .12 * raster_area
+
+
+def choose_text_route(page, reading, *, balanced):
+    """Choose the primary text source; partial layers keep their PDF coordinates."""
+    if not reading:
+        return 'ocr', 'unusable_text_layer'
+    if balanced and page.objects:
+        tokens = [word[0] for row in reading['word_rows'] for word in row]
+        count = len(tokens)
+        words = sum(bool(_WORD_LETTERS.search(token)) for token in tokens)
+        fragments = sum(len(token) <= 2 and token.isalpha() for token in tokens)
+        large_scan = any((r-l)*(b-t) >= .5 * page.width * page.height
+                         for l, t, r, b in page.objects)
+        # Single digits and decimal measurements are common in healthy tables.
+        if large_scan and count >= 40 and words < .20 * count and fragments > .50 * count:
+            return 'ocr', 'fragmented_text_layer'
+        readable = words >= 2 and words >= .20 * count
+    else:
+        readable = False
+    if covers_scanned_body(reading, page.objects, page.width, page.height):
+        return 'native', 'covered_text_layer'
+    if readable:
+        return 'partial', 'partial_text_layer'
+    return 'ocr', 'insufficient_text_coverage'
 
 
 def raster_table_hint(page, reading):

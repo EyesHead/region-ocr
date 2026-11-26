@@ -10,11 +10,54 @@ import os
 from docling_pdf_deskew import page_skew, source_bbox
 from docling_pdf_runtime import FAST_OCR_MAX_SIDE, PDF_OCR_SCALE
 from local_web.fast_pdf_geometry import _page_geometry, _render, _vector_segments
-from local_web.fast_pdf_text import covers_scanned_body, page_text, raster_table_hint
+from local_web.fast_pdf_text import choose_text_route, page_text, raster_table_hint
 
 
 def grid_enabled():
     return os.environ.get('REGION_OCR_BALANCED_TABLES', '1').strip().lower() not in {'0', 'false', 'off', 'no'}
+
+
+def _ruled_preview(image):
+    import cv2
+    import numpy as np
+
+    w, h = image.size
+    gray = np.asarray(image)
+    # Sample along each rail, preserving every column/row across its width.
+    # Body prose rarely contains two tall rails, so test those first.
+    for strip, length, minimum in ((gray[::3].T, round(.12*h/3), 2),
+                                   (gray[:, ::3], round(.15*w/3), 3)):
+        pixels = cv2.threshold(strip, 210, 255, cv2.THRESH_BINARY_INV)[1]
+        length = max(3, length)
+        mask = cv2.morphologyEx(pixels, cv2.MORPH_OPEN, np.ones((1, length), np.uint8))
+        indices = np.flatnonzero(np.count_nonzero(mask, axis=1) >= length)
+        if not len(indices) or 1 + np.count_nonzero(np.diff(indices) > 1) < minimum:
+            return False
+    return True
+
+
+def _supports_quarter_turn(page, angle):
+    import pymupdf
+    import re
+
+    flags = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    matrix = page.rotation_matrix
+    votes = []
+    for block in page.get_text('dict', flags=flags)['blocks']:
+        for line in block.get('lines', ()):
+            rect = pymupdf.Rect(line['bbox']) * matrix
+            center = (rect.tl + rect.br) / 2
+            if not (.08*page.rect.width < center.x < .92*page.rect.width
+                    and .08*page.rect.height < center.y < .92*page.rect.height):
+                continue
+            value = ' '.join(span['text'] for span in line['spans'])
+            letters = sum(map(len, re.findall(r'(?<!\w)(?:[А-Яа-яЁё]{3,}|[A-Za-z]{3,})(?!\w)', value)))
+            if letters:
+                dx, dy = line['dir']
+                vertical = dx * matrix.b + dy * matrix.d
+                votes.append((vertical * (-1 if angle == 90 else 1) > .85, letters))
+    aligned = [weight for agrees, weight in votes if agrees]
+    return len(aligned) >= 2 and sum(aligned) >= .7 * sum(weight for _, weight in votes)
 
 
 @dataclass
@@ -36,6 +79,7 @@ class PageContent:
     turn: int = 0
     source_view: dict | None = None
     positioned_read: object = None
+    ruled_preview: bool = False
     route_reason: str = 'text_reader_unavailable'
 
     def image(self):
@@ -45,7 +89,7 @@ class PageContent:
 
     @cached_property
     def possible_raster_table(self):
-        return self.text_layer is not None and raster_table_hint(self, self.text_layer)
+        return self.text_layer is not None and (self.ruled_preview or raster_table_hint(self, self.text_layer))
 
     def measure(self, detailed_tables):
         self.width, self.height = self.page.get_size()
@@ -76,7 +120,7 @@ class PageContent:
         if turn:
             self.rotate(turn, detailed_tables)
 
-    def orient_text_layer(self, detailed_tables):
+    def orient_text_layer(self, detailed_tables, text_page):
         from docling_pdf_orientation import ORIENTATION_CONFIDENCE
         from local_web.fast_ocr import _orientation_hint
 
@@ -86,8 +130,15 @@ class PageContent:
         # PP-LCNet takes a 224 px center crop. Leave room for its resize on a portrait scan.
         with _render(self.page, 640, PDF_OCR_SCALE) as preview:
             turn, confidence = _orientation_hint(preview)
-        if turn and confidence >= ORIENTATION_CONFIDENCE:
+            if detailed_tables and self.route_reason == 'covered_text_layer':
+                self.ruled_preview = _ruled_preview(preview)
+        supported = (detailed_tables and self.text_layer and turn in (90, 270)
+                     and .85 <= confidence < ORIENTATION_CONFIDENCE
+                     and _supports_quarter_turn(text_page, turn))
+        if turn and (confidence >= ORIENTATION_CONFIDENCE or supported):
             self.rotate(turn, detailed_tables)
+            if self.text_layer is None:
+                return
             inverse = dict(original_size=(self.width, self.height), clockwise=(-turn) % 360)
             reading = self.text_layer
             reading['words'] = [(*source_bbox(box, inverse), text, score)
@@ -123,7 +174,8 @@ class PageContent:
         self.page.close()
 
 
-def read_page(document, page_no, improved, deskew, text_document, on_page=None, *, orient_scans=False):
+def read_page(document, page_no, improved, deskew, text_document, on_page=None, *, orient_scans=False,
+              balanced=False):
     page = document[page_no - 1]
     try:
         page._fast_image_page_index = page_no - 1
@@ -132,17 +184,19 @@ def read_page(document, page_no, improved, deskew, text_document, on_page=None, 
         current.measure(improved)
         if text_document is not None:
             reading = page_text(text_document, page_no, (width, height))
-            current.route_reason = 'insufficient_text_coverage' if reading else 'unusable_text_layer'
-            if reading and covers_scanned_body(reading, current.objects, width, height):
+            route, current.route_reason = choose_text_route(current, reading, balanced=balanced)
+            if route != 'ocr':
+                current.text_layer = reading
+            if orient_scans and (current.text_layer or current.route_reason == 'fragmented_text_layer'):
+                current.orient_text_layer(improved, text_document[page_no - 1])
+            if route != 'ocr':
                 if on_page:
                     on_page(page_no, True)
-                current.text_layer = reading
-                current.route_reason = 'covered_text_layer'
-                if orient_scans:
-                    current.orient_text_layer(improved)
                 return current
         if on_page:
             on_page(page_no, False)
+        if current.turn:
+            return current
         measured = page_skew(page)
         angle = deskew.apply(page, page_no - 1, measured)
         current.residual = measured - angle
@@ -228,7 +282,7 @@ _PARALLEL_MIN_PAGES = 6
 
 
 def read_pages(document, first, last, *, improved, deskew, text_document=None, simple_vectors=False,
-               orient_scans=False, cancelled=None, on_page=None):
+               orient_scans=False, balanced=False, cancelled=None, on_page=None):
     """PDFium stays in the parent. Workers receive only axis segments or grayscale pixels."""
     worker_count = min(2, os.cpu_count() or 1)
     parallel = improved and last - first + 1 >= _PARALLEL_MIN_PAGES and worker_count > 1
@@ -247,14 +301,14 @@ def read_pages(document, first, last, *, improved, deskew, text_document=None, s
                     cancelled()
                 if number <= last:
                     page = read_page(document, number, improved, deskew, text_document, on_page,
-                                     orient_scans=orient_scans)
+                                     orient_scans=orient_scans, balanced=balanced)
                     try:
                         if page.text_layer is None:
                             low, high = page.image().getextrema()
                             page.blank = low >= 254 and high - low <= 1
                             if page.blank:
                                 page.route_reason = 'blank_raster'
-                            if orient_scans and not page.blank:
+                            if orient_scans and not page.blank and not page.turn:
                                 page.orient_scan(number, improved, cancelled)
                         raster_tables = improved and (page.text_layer is None or page.possible_raster_table)
                         task = (_start(page, pool, page.residual, raster_tables)

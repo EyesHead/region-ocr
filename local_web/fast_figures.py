@@ -537,7 +537,8 @@ def _cross_page(page_no, lines, rows, bound, size, context, anchors):
 
 def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, scores=None, stats=None,
                   links=None, cancelled=None, formula_text=None, render_formulas=None, table_formula_boxes=(),
-                  formula_batches=None, formula_cells=None, horizontal_rules=()):
+                  formula_batches=None, formula_cells=None, horizontal_rules=(), verified_tables=(),
+                  recovered_tables=()):
     """Return graphic anchors and, when requested, replacements for formula tokens."""
     if not rows:
         return {}
@@ -559,6 +560,9 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
     size = page.get_size()
     # Whole-page image + distributed searchable text is a scan with a hidden OCR layer.
     boxes = [b for b in objects if (b[2]-b[0])*(b[3]-b[1]) < .82*size[0]*size[1]]
+    def duplicates_table(box):
+        from docling_pdf_table_rasters import aligned_table_layout_crop
+        return any(aligned_table_layout_crop(box, grid) for grid in verified_tables)
     captions = {i for i,(s,b) in enumerate(lines) if _heading(s)}
     bound = _bind(lines,_candidates(boxes,em,size),em) if captions else {}
     equations = _equations(rows,boxes,em,size[0],row_cells) if boxes else {}
@@ -579,11 +583,13 @@ def page_graphics(page, page_no, rows, objects, image_assets, *, raster=None, sc
     try:
         if captions-bound.keys() and probe is not None:
             for i,b in _bind(lines,_raster_bodies(probe,size,lines,em),em).items():
-                bound.setdefault(i,b)
+                if not duplicates_table(b):
+                    bound.setdefault(i,b)
         if probe is not None and (raster is not None or check_math):
             equations.update(_raster_math(probe,size,rows,scores,em,equations.keys() | bound.keys(),row_cells))
         if probe is not None and (raster is not None or scan_background):
-            fractions = _unread_fractions(probe, size, rows, em, [*boxes, *bound.values(), *equations.values()])
+            fractions = _unread_fractions(probe, size, rows, em,
+                                          [*boxes, *bound.values(), *equations.values(), *recovered_tables])
     finally:
         if working is not None:
             working.close()

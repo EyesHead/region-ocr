@@ -637,7 +637,7 @@ def _markdown_blocks(container, indent='', render_html=str):
         elif node.name == 'blockquote':
             output.append('\n'.join('> ' + line for line in _markdown_blocks(node, render_html=render_html).splitlines()))
         elif node.name in BLOCK_TAGS - {'p'} or node.name in {'figure', 'figcaption', 'li'}:
-            if node.name == 'section' and node.get('data-text-method') in {'native', 'ocr', 'blank'}:
+            if node.name == 'section' and node.get('data-text-method') in {'native', 'hybrid', 'ocr', 'blank'}:
                 page = node.get('data-source-page', '')
                 if re.fullmatch(r'[1-9][0-9]*', page) and node.get('id') == 'page-' + page:
                     output.append(f'<!-- pdf-page: {page} -->')
@@ -829,7 +829,7 @@ def _json_blocks(container):
             children = _json_blocks(node)
             # The fast PDF reader groups its blocks by physical source page,
             # including empty pages and pages preserved as an image.
-            if node.name == 'section' and node.get('data-text-method') in ('native', 'ocr', 'blank'):
+            if node.name == 'section' and node.get('data-text-method') in ('native', 'hybrid', 'ocr', 'blank'):
                 number = node.get('data-source-page', '')
                 try:
                     physical_page = int(number)

@@ -19,7 +19,7 @@ else:
 
 EXPORT_SCHEMA = 14
 CANONICAL_MANIFEST_SCHEMA = 1
-FAST_PDF_STAT_KEYS = ('native_pages', 'ocr_pages', 'blank_pages', 'image_fallback_pages', 'ocr_error_pages',
+FAST_PDF_STAT_KEYS = ('native_pages', 'hybrid_pages', 'ocr_pages', 'blank_pages', 'image_fallback_pages', 'ocr_error_pages',
                       'orientation_corrected_pages',
                       'vector_tables', 'scan_tables', 'formula_crops', 'formulas_mathml', 'formulas_latex', 'formulas_text')
 EXTENSIONS = {'html': '.html', 'markdown': '.md', 'json': '.json', 'plaintext': '.txt'}

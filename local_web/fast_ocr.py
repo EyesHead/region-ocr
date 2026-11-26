@@ -55,7 +55,8 @@ def _cuda_libraries():
 
 @lru_cache(maxsize=2)
 def _rapid_reader(use_cuda=False):
-    from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+    from rapidocr import LangRec, ModelType, OCRVersion
+    from local_web.fast_ocr_lines import LineAwareRapidOCR
     import rapidocr
 
     detector = Path(rapidocr.__file__).parent / "models" / "PP-OCRv6_det_small.onnx"
@@ -66,7 +67,7 @@ def _rapid_reader(use_cuda=False):
             raise ValueError("Контрольная сумма русской модели OCR не совпадает")
 
     # Explicit paths and the ONNX model's embedded alphabet keep inference offline.
-    return RapidOCR(params={
+    return LineAwareRapidOCR(params={
         "Det.model_path": str(detector),
         "Rec.model_path": str(_REC_MODEL),
         "Rec.lang_type": LangRec.CYRILLIC,
@@ -168,6 +169,76 @@ def _positioned_read(image, page_no, key):
 
 def _image_key(image):
     return image.mode, image.size, hashlib.sha256(image.tobytes()).digest()
+
+
+def supplement_text_layer(page, page_no, ocr_page=None):
+    """OCR uncovered pixels and append positioned lines in the native PDF coordinate space."""
+    reading = page.text_layer
+    image = page.image()
+    sx, sy = page.pixel_scale
+    native_words = []
+    with image.copy() as remaining:
+        for row in reading['word_rows']:
+            previous = None
+            for word, x, y, width, height in row:
+                native_words.append((word.casefold(), x, y, x+width, y+height))
+                pad = .12 * height
+                left = x
+                if previous is not None:
+                    end, top = previous
+                    if 0 <= x-end <= height and abs(top-y) < .3*height:
+                        left = end
+                previous = x+width, y
+                box = (math.floor((left-pad)/sx), math.floor((y-pad)/sy),
+                       math.ceil((x+width+pad)/sx), math.ceil((y+height+pad)/sy))
+                remaining.paste(255, box)
+        for l,t,r,b in reading.get('recovered_tables', ()):
+            remaining.paste(255, (math.floor(l/sx), math.floor(t/sy), math.ceil(r/sx), math.ceil(b/sy)))
+        with remaining.point(lambda value: 255 if value < 210 else 0) as ink:
+            bounds = ink.getbbox()
+        if bounds is None:
+            return 0
+        with remaining.crop(bounds) as crop:
+            if ocr_page is None:
+                _, boxes, word_rows, ids, _ = _positioned_read(crop, page_no, _image_key(crop))
+            else:
+                result = ocr_page(crop, page_no)
+                if isinstance(result, str):
+                    boxes = [(0, 0, crop.width, crop.height, result, 1.)]
+                    ids, word_rows = (0,), ()
+                elif isinstance(result, dict) and 'words' in result:
+                    boxes = result['words']
+                    ids, word_rows = range(len(boxes)), result.get('word_rows', ())
+                else:
+                    raise RuntimeError('Для совмещения с текстом PDF нужны координаты строк OCR')
+
+    added = 0
+    dx, dy = bounds[:2]
+    for index, (l, t, r, b, text, confidence) in zip(ids, boxes, strict=True):
+        if not any(ch.isalnum() for ch in text):
+            continue
+        left, top = (l+dx)*sx, (t+dy)*sy
+        right, bottom = (r+dx)*sx, (b+dy)*sy
+        # A shifted hidden word can leave its first or last letters visible just
+        # across the mask edge. Require matching letters on that same baseline.
+        fragment = text.strip().casefold()
+        if any(len(fragment) >= 3 and len(word) > len(fragment)
+               and y < (top+bottom)/2 < end_y
+               and ((word.startswith(fragment) and abs(right-x) < (end_y-y)/2)
+                    or (word.endswith(fragment) and abs(left-end_x) < (end_y-y)/2))
+               for word, x, y, end_x, end_y in native_words):
+            continue
+        row = [(word, (x+dx)*sx, (y+dy)*sy, w*sx, h*sy)
+               for word, x, y, w, h in (word_rows[index] if word_rows else ())]
+        if not row:
+            row = [(text, left, top, right-left, bottom-top)]
+        line_id = len(reading['source_lines'])
+        reading['source_lines'].append(text)
+        reading['words'].append((left, top, right, bottom, text, confidence))
+        reading['word_rows'].append(row)
+        reading['blocks'].append({'line_id': line_id, 'text': text})
+        added += 1
+    return added
 
 
 @dataclass(frozen=True)

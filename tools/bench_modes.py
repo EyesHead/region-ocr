@@ -152,7 +152,7 @@ def trace_pages(fast_pdf, pages_module, text_module, records):
     read_pages = fast_pdf.read_pages
     page_text = pages_module.page_text
     usable_text = text_module.usable_text
-    covers_body = pages_module.covers_scanned_body
+    covers_body = text_module.covers_scanned_body
     current = {}
 
     def checked_text(*args, **kwargs):
@@ -177,6 +177,8 @@ def trace_pages(fast_pdf, pages_module, text_module, records):
                 yield number, page
                 record = records.setdefault(number, dict(usable=None, layer=None, coverage=None))
                 method = "blank" if page.blank else ("native" if page.text_layer is not None else "ocr")
+                if page.route_reason == "supplemented_text_layer":
+                    method = "hybrid"
                 record.update(
                     method=method, route_reason=page.route_reason, turn=page.turn,
                     skew=(page.source_view or {}).get("deskew_degrees", 0),
@@ -187,7 +189,7 @@ def trace_pages(fast_pdf, pages_module, text_module, records):
     return (
         patch.object(text_module, "usable_text", checked_text),
         patch.object(pages_module, "page_text", checked_layer),
-        patch.object(pages_module, "covers_scanned_body", checked_coverage),
+        patch.object(text_module, "covers_scanned_body", checked_coverage),
         patch.object(fast_pdf, "read_pages", observed_pages),
     )
 

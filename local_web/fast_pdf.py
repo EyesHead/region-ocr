@@ -184,6 +184,10 @@ def _positioned_ocr_blocks(reading, page_no, graphic_lines, width, page_size, sc
         return item.render(start,end) if item is not None else escape(source[index][start:end])
 
     for item in reading['blocks']:
+        if 'source_image' in item:
+            flush()
+            blocks.append(item['source_image'])
+            continue
         if 'text' in item:
             index, line = item['line_id'], item['text']
             start,end = item.get('span',(len(line)-len(line.lstrip()),len(line.rstrip())))
@@ -211,6 +215,10 @@ def _positioned_ocr_blocks(reading, page_no, graphic_lines, width, page_size, sc
         owned = item.get('cell_parts',{})
         rendered = []
         for row,col,rs,cs,value in cells:
+            image = item.get('cell_images', {}).get((row, col))
+            if image:
+                rendered.append((row,col,rs,cs,image))
+                continue
             parts = [source_slice(index,a,b) for index,a,b in owned.get((row,col),())]
             if parts and width is not None:
                 html = join_html_lines(parts)
@@ -319,11 +327,31 @@ def _page_range(pages, total):
 
 def _read_text(page, page_no, balanced, detailed_tables, ocr_page, stats):
     if page.text_layer is not None:
+        partial = page.route_reason == 'partial_text_layer'
+        if detailed_tables and page.grids and page.source == 'raster':
+            from local_web.balanced_table_recovery import repair_table_layer
+            repair_table_layer(page, page_no, ocr_page, stats['warnings'])
+        if partial:
+            from local_web.fast_ocr import supplement_text_layer
+            try:
+                added = supplement_text_layer(page, page_no, ocr_page)
+                if not page.text_layer.get('recovered_tables'):
+                    page.route_reason = 'supplemented_text_layer' if added else 'sparse_text_layer'
+            except RuntimeError as error:
+                if not page.text_layer.get('recovered_tables'):
+                    page.route_reason = 'partial_ocr_failed'
+                stats['warnings'].append(f'Страница {page_no}: сохранили текст PDF. '
+                                         f'Не удалось прочитать непокрытые области: {error}')
         try:
             bind_tables(page, page.text_layer, balanced=balanced, infer_partial=detailed_tables)
         except Exception as error:
             print(f'PDF: страница {page_no}, разметка таблицы ({type(error).__name__}: {error})', flush=True)
-            stats['warnings'].append(f'На странице {page_no} не удалось собрать таблицу. Текст сохранён.')
+            if page.text_layer.get('recovered_tables'):
+                from local_web.balanced_table_recovery import unbound_table_blocks
+                page.text_layer['blocks'] = unbound_table_blocks(page.text_layer)
+                stats['warnings'].append(f'Страница {page_no}. Не удалось собрать таблицу. Сохранён фрагмент PDF.')
+            else:
+                stats['warnings'].append(f'На странице {page_no} не удалось собрать таблицу. Текст сохранён.')
         return page.text_layer
     try:
         if ocr_page is not None:
@@ -331,7 +359,8 @@ def _read_text(page, page_no, balanced, detailed_tables, ocr_page, stats):
         from local_web.fast_ocr import recognize_page_with_layout
         grids = page.grids_for_text(native=False)
         # Orientation has already read the winning raster, including a possible empty read.
-        prepared = {'positioned_read': page.positioned_read} if balanced else {}
+        prepared = ({'positioned_read': page.positioned_read}
+                    if balanced and page.positioned_read is not None else {})
         return recognize_page_with_layout(page.image(), page_no, recover_merged_tables=balanced,
             balanced_grid=detailed_tables, physical_grids=grids if detailed_tables or grids else None,
             physical_grid_reasons=page.reasons, **prepared)
@@ -360,14 +389,23 @@ def _graphics(page, page_no, reading, scale, assets, batches, stats, links, canc
         lines.append((index, line, row, spans))
         scores.update((id(word), confidence) for word in row)
     formulas = {}
-    anchors = page_graphics(page.page, page_no, rows, page.objects, assets, raster=page.raster,
+    recovered = reading.get('recovered_tables', ())
+    graphic_rows = [[word for word in row if not any(coverage(word, box) >= .8 for box in recovered)]
+                    for row in rows] if recovered else rows
+    tables = tuple(tuple(v * factor for v,factor in zip(item['grid'].bbox, (sx,sy,sx,sy)))
+                   for item in reading['blocks'] if item.get('grid') and getattr(item['grid'], 'evidence', '') == 'verified')
+    anchors = page_graphics(page.page, page_no, [row for row in graphic_rows if row], page.objects, assets, raster=page.raster,
         scores=scores, stats=stats, links=links, cancelled=cancelled, formula_text=formulas,
-        formula_batches=batches, formula_cells=cells, horizontal_rules=page.horizontal_rules)
+        formula_batches=batches, formula_cells=cells, horizontal_rules=page.horizontal_rules,
+        verified_tables=tables, recovered_tables=recovered)
     entry = _positioned_scan_graphics if 'source_lines' in reading else _scan_line_graphics
     return [entry(*line, anchors, formulas) for line in lines]
 
 
 def _page_blocks(page, page_no, reading, *, assets, batches, stats, links, cancelled, source_boxes):
+    if isinstance(reading, dict) and reading.get('recovered_tables'):
+        from local_web.balanced_table_recovery import protect_cells
+        protect_cells(page, page_no, reading, assets, stats['warnings'])
     sizes = page.width, page.height
     scale = (1., 1.) if page.text_layer is not None else page.pixel_scale
     graphics = _graphics(page, page_no, reading, scale, assets, batches, stats, links, cancelled)
@@ -460,7 +498,7 @@ def convert_fast_pdf(source, pages='', *, mode=None, ocr_page=None, on_progress=
     if balanced and formula_reader is None:
         from docling_pdf_balanced_math import local_formula_reader
         formula_reader = local_formula_reader()
-    stats = dict(vector_tables=0, scan_tables=0, pages=0, native_pages=0, ocr_pages=0, blank_pages=0,
+    stats = dict(vector_tables=0, scan_tables=0, pages=0, native_pages=0, hybrid_pages=0, ocr_pages=0, blank_pages=0,
                  image_fallback_pages=0, warnings=[])
     batches = FormulaBatches(formula_reader, image_assets, stats, check_cancel) if balanced else None
     sections, fallback, views = [], [], {}
@@ -475,7 +513,8 @@ def convert_fast_pdf(source, pages='', *, mode=None, ocr_page=None, on_progress=
             stage = 'Читаем текстовый слой страницы' if native else 'Выравниваем и распознаём страницу'
             on_progress(percent, f'{stage} {number} из {total}')
         prepared = read_pages(document, first, last, improved=detailed, deskew=PageDeskew(source, total),
-            text_document=text_document, simple_vectors=not balanced, orient_scans=balanced and ocr_page is None,
+            text_document=text_document, simple_vectors=not balanced, balanced=balanced,
+            orient_scans=balanced and ocr_page is None,
             cancelled=check_cancel, on_page=page_progress if on_progress else None)
         with closing(prepared):
             for number, page in prepared:
@@ -486,6 +525,8 @@ def convert_fast_pdf(source, pages='', *, mode=None, ocr_page=None, on_progress=
                 if not page.blank:
                     method = 'native' if page.text_layer is not None else 'ocr'
                     reading = _read_text(page, number, balanced, detailed, ocr_page, stats)
+                    if page.route_reason in ('supplemented_text_layer', 'recovered_table_layer'):
+                        method = 'hybrid'
                     blocks = _page_blocks(page, number, reading, assets=image_assets, batches=batches, stats=stats,
                                           links=links, cancelled=check_cancel, source_boxes=detailed)
                     if not blocks or reading is None:
